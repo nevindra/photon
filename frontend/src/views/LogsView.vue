@@ -56,9 +56,10 @@ function onViewTrace({ traceId, timeHintNs }) {
 // above) and surfaced by the ContextBar mounted in AppShell — this view no longer keeps its own
 // RANGE_MS table or window refs.
 // The query string is the single source of truth for service/severity filters: LogsFilters
-// (pinned sections + fields catalog) derives its checked state from the `query`/`:query="text"`
+// (pinned sections + fields catalog) derives its checked state from the `query`/`:query="debouncedQuery"`
 // prop (single-state model — `facetChecked`, see facet-single-state-model.md) and its clicks
-// rewrite `text`. So the search bar's pills and the panel can never desync.
+// rewrite `text`. So the search bar's pills and the panel can never desync (with the same ~180ms
+// debounce lag the main row search already has — see `debouncedQuery`, below).
 const text = ref("");
 // The attribute columns the user has toggled on in the column picker.
 const columns = ref([]);
@@ -128,6 +129,13 @@ if (typeof route.query.q === "string" && route.query.q) text.value = route.query
 // Debounced query text feeds the search KEY (replaces the old 180ms setTimeout). Created AFTER the
 // seeds above so its initial value is the seeded query — no extra churn on mount.
 const debouncedText = refDebounced(text, 180);
+// Shared trimmed-debounced query for every DERIVED aggregation request (volume histogram, pinned
+// Services/Severity facet counts, and the fields-catalog facet fan-out in LogsFilters). Only the
+// SearchBar itself (`text`, via the toolbar's v-model) should reflect raw per-keystroke input —
+// everything that turns the query into a backend aggregation request must key off this instead, or
+// it fires one request per keystroke (one histogram + one per open/pinned facet field) instead of
+// collapsing to a single request like the main row search already does below.
+const debouncedQuery = computed(() => debouncedText.value.trim());
 
 // Live tail: resolves the mode picker (Manual / 5s / 30s / Live) to either an SSE stream (Live) or
 // a poll cadence fed into searchQuery's `refetchInterval` below via `pollMs`. Constructed AFTER
@@ -150,8 +158,12 @@ const liveTail = useLiveTail({
 // --- services + field catalog (TanStack Query) ---
 const servicesQuery = useServices();
 const servicesList = computed(() => servicesQuery.data.value ?? []);
-// Field catalog for the current window (drives the facet rail + column picker).
-const fieldsQuery = useFields(startNs, endNs);
+// Field catalog (drives the facet rail + column picker). Keyed off the ROUNDED aggregate window
+// (aggStartNs/aggEndNs), NOT the precise startNs/endNs, so it (a) dedupes with LogsFilters' own
+// useFields call — same 60s-bucket key means one shared request, not two — and (b) doesn't churn
+// (refetch + flash the ColumnPicker's list empty) on every idle 12s nowTick advance. Same 60s-bucket
+// rationale as the aggregate window above. The main row SEARCH still uses the precise window.
+const fieldsQuery = useFields(aggStartNs, aggEndNs);
 const fields = computed(() => fieldsQuery.data.value ?? []);
 
 // --- row search (TanStack Query) ---
@@ -255,8 +267,12 @@ watch(displayRows, (rs) => {
 // the fetch lives here instead of inside the panel). `level` itself isn't facetable (a severity
 // bucket, not a stored column — see resolver.rs's `resolve_field_name`), so the Severity facet
 // queries the raw `severity_text` column and folds to the lower-case keys `SEVERITIES` uses.
-const serviceCountQuery = computed(() => removeFieldAll(text.value, "service"));
-const severityCountQuery = computed(() => removeFieldAll(text.value, "level"));
+const serviceCountQuery = computed(() =>
+    removeFieldAll(debouncedQuery.value, "service"),
+);
+const severityCountQuery = computed(() =>
+    removeFieldAll(debouncedQuery.value, "level"),
+);
 const serviceFacetQuery = useFacet(
     "service.name",
     serviceCountQuery,
@@ -422,7 +438,7 @@ const aggregatesAsOfSec = computed(() =>
             >
                 <LogsFilters
                     :services="servicesList"
-                    :query="text"
+                    :query="debouncedQuery"
                     :service-counts="serviceCounts"
                     :severity-counts="severityCounts"
                     :start-ms="aggStartMs"
@@ -462,7 +478,7 @@ const aggregatesAsOfSec = computed(() =>
                     </div>
                     <VolumeHistogram
                         v-if="showChart"
-                        :query="text"
+                        :query="debouncedQuery"
                         :start-ms="aggStartMs"
                         :end-ms="aggEndMs"
                         @zoom="onZoom"
