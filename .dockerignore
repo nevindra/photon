@@ -1,0 +1,22 @@
+# Keep the build context tiny — everything the image needs is rebuilt inside it.
+target/
+**/target/
+frontend/node_modules/
+frontend/dist/
+.git/
+.github/
+data/
+.photon-dev/
+.photon-smoke/
+**/*.snapshot
+docs/
+*.md
+!README.md
+.env
+.env.*
+!.env.example
+photon.toml
+photon.dev.toml
+process-compose.yaml
+.superpowers/
+.claude/

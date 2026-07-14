@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/photon-core",
+    "crates/photon-wal",
+    "crates/photon-index",
+    "crates/photon-storage",
+    "crates/photon-compact",
+    "crates/photon-query",
+    "crates/photon-ingest",
+    "crates/photon-api",
+    "crates/photon-server",
+    "crates/photon-loadgen",
+    "crates/photon-uptime",
+    "crates/photon-agent",
+]
+
+[workspace.dependencies]
+# arrow: default features off (drops unused csv/ipc/json + ~15 transitive crates —
+# "10x lighter"). Crates opt into what they need, e.g. photon-wal adds "ipc".
+arrow = { version = "53", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "io-util"] }
+bytes = "1"
+crc32fast = "1"
+futures = "0.3"
+# object_store 0.11 must match the version datafusion 43 re-exports so Arc<dyn ObjectStore>
+# types unify across storage/compact/query.
+object_store = "0.11"
+# Wave 2: compact writes zstd Parquet; query embeds DataFusion 43 (which pins arrow 53 /
+# object_store 0.11 / parquet 53 — do not bump independently).
+parquet = { version = "53", default-features = false, features = ["arrow", "zstd"] }
+datafusion = "43"
+# Wave 2: ingest OTLP receivers. opentelemetry-proto 0.27 ↔ tonic 0.12 / prost 0.13.
+tonic = "0.12"
+prost = "0.13"
+opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic", "logs", "trace", "metrics"] }
+axum = "0.7"
+# Wave 3: photon-api — REST + session auth + embedded UI.
+axum-extra = { version = "0.9", features = ["cookie", "cookie-signed"] }
+# Cookie Max-Age on the session cookie (Duration). Same 0.3 line the `cookie` crate uses, so
+# it unifies with axum-extra's cookie dependency.
+time = { version = "0.3", default-features = false }
+argon2 = "0.5"
+rust-embed = "8"
+mime_guess = "2"
+# Uptime vertical (M-uptime). Independent of the arrow/datafusion + otlp/tonic clusters.
+async-trait = "0.1"
+# WS1: jemalloc returns freed pages to the OS (glibc retained them — B1 measured post-idle ≈ peak)
+# and speeds the multithreaded, allocation-heavy ingest path.
+tikv-jemallocator = "0.6"
+# Prometheus remote-write (RW 1.0) uses snappy *block* compression. Standalone — not part of
+# the arrow/datafusion or otlp/tonic co-pinned clusters.
+snap = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+surge-ping = "0.8"
+uuid = { version = "1", features = ["v4"] }
+# Dev-only micro-benchmark harness (Phase-A write-path benches). default-features off drops
+# rayon + plotters/gnuplot; cargo_bench_support keeps `cargo bench`. Not a runtime dep.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# Optimize dependencies even in dev/debug builds. Our own crates stay at the default
+# opt-level = 0 (fast incremental rebuilds during `make dev`), but the heavy query stack —
+# DataFusion, Arrow, Parquet — is compiled with full optimizations. Those crates rarely
+# change, so they compile once and are cached; the payoff is that a debug `/api/search`
+# scans/decodes Parquet at near-release speed instead of ~13x slower. `"*"` applies to all
+# dependencies only, never to workspace members.
+[profile.dev.package."*"]
+opt-level = 3

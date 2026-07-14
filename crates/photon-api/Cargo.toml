@@ -1,0 +1,34 @@
+[package]
+name = "photon-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+photon-core = { path = "../photon-core" }
+photon-query = { path = "../photon-query" }
+photon-uptime = { path = "../photon-uptime" }
+async-trait = { workspace = true }
+arrow = { workspace = true }
+axum = { workspace = true }
+# `cookie-key-expansion` toggles the already-present `cookie` crate's `key-expansion`
+# feature so `Key::derive_from` is available. This is a feature flag on an existing
+# dependency, not a new dependency (Cargo.lock records versions, not features).
+axum-extra = { workspace = true, features = ["cookie-key-expansion"] }
+time = { workspace = true }
+argon2 = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+# SSE live-tail: `async-stream` drives the coalescing select-loop stream body.
+async-stream = "0.3"
+# CORS layer scoped to the public `POST /api/rum` beacon route (RUM). 0.5 tracks http 1.0 / axum 0.7.
+tower-http = { version = "0.5", features = ["cors"] }
+
+[dev-dependencies]
+tempfile = "3"
+parquet = { workspace = true }
+tower = "0.5"

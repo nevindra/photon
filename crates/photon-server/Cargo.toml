@@ -1,0 +1,32 @@
+[package]
+name = "photon-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "photon-server"
+path = "src/main.rs"
+
+[dependencies]
+photon-core = { path = "../photon-core" }
+photon-wal = { path = "../photon-wal" }
+photon-storage = { path = "../photon-storage" }
+photon-compact = { path = "../photon-compact" }
+photon-query = { path = "../photon-query" }
+photon-ingest = { path = "../photon-ingest" }
+photon-api = { path = "../photon-api" }
+photon-uptime = { path = "../photon-uptime" }
+argon2 = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tikv-jemallocator = { workspace = true }
+
+[dev-dependencies]
+arrow = { workspace = true }
+opentelemetry-proto = { workspace = true }
+# BE-6 live-tail e2e: real over-the-wire server driven via HTTP (login, OTLP POST, SSE read).
+prost = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+snap = { workspace = true }
+tempfile = "3"

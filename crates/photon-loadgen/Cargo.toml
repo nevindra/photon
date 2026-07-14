@@ -1,0 +1,27 @@
+[package]
+name = "photon-loadgen"
+version = "0.1.0"
+edition = "2021"
+
+# Dev/test tool: an OTLP/HTTP log + trace load generator for stress-testing Photon's ingest path.
+# Not part of the shipped server — `cargo build -p photon-server` does not compile this crate.
+# Structured as lib + bin so the integration test can drive the public API.
+
+[dependencies]
+# Reuse the workspace-pinned OTLP proto + prost so generated payloads match Photon's decoder
+# byte-for-byte.
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+# "signal" for ctrl-c shutdown (on top of the workspace tokio features).
+tokio = { workspace = true, features = ["signal"] }
+clap = { version = "4", features = ["derive", "env"] }
+# Local http:// target — no TLS backend needed.
+reqwest = { version = "0.12", default-features = false }
+hdrhistogram = "7"
+rand = { version = "0.8", features = ["small_rng"] }
+
+[dev-dependencies]
+# Assert generated payloads decode + map exactly the way the real receiver maps them.
+photon-ingest = { path = "../photon-ingest" }
+# Tiny in-process receiver for the request-shape smoke test.
+axum = { workspace = true }

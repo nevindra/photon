@@ -1,0 +1,20 @@
+[package]
+name = "photon-compact"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+photon-core = { path = "../photon-core" }
+photon-wal = { path = "../photon-wal" }
+photon-index = { path = "../photon-index" }
+photon-storage = { path = "../photon-storage" }
+arrow = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+photon-query = { path = "../photon-query" }
+tokio = { workspace = true }

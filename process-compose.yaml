@@ -1,0 +1,39 @@
+version: "0.5"
+
+# Photon local dev stack — launched by `make dev` (which generates photon.dev.toml first).
+#
+#   server  photon-server: OTLP ingest 127.0.0.1:4317 (gRPC) / :4318 (HTTP),
+#           REST + UI API on http://127.0.0.1:8080. Reads photon.dev.toml.
+#   web     Vite dev server on http://localhost:5173 (proxies /api -> :8080).
+#
+# The first `server` start compiles the whole Rust workspace (DataFusion is large), so it can
+# sit "Running / not-ready" for a bit until the readiness probe (GET :8080/) goes green.
+#
+# TUI keys (see the footer): F5 restart · F6 stop · F7 start · Tab/arrows switch pane · F10 quit.
+# Per-process logs are also written under ./.photon-dev/logs/.
+
+log_level: info
+log_location: ./.photon-dev/logs/process-compose.log
+
+processes:
+  server:
+    command: cargo run -p photon-server -- photon.dev.toml
+    log_location: ./.photon-dev/logs/server.log
+    environment:
+      - "PHOTON_API_ADDR=127.0.0.1:8080"
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        scheme: http
+        path: /
+        port: 8080
+      initial_delay_seconds: 3
+      period_seconds: 5
+      timeout_seconds: 3
+      # Tolerate a long first compile before marking the probe failed (does not kill it).
+      failure_threshold: 120
+
+  web:
+    command: bun run dev
+    working_dir: frontend
+    log_location: ./.photon-dev/logs/web.log

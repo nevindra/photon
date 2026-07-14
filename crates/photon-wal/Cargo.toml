@@ -1,0 +1,21 @@
+[package]
+name = "photon-wal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+photon-core = { path = "../photon-core" }
+arrow = { workspace = true, features = ["ipc"] }
+tokio = { workspace = true }
+crc32fast = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "sync", "time", "io-util"] }
+tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "append"
+harness = false

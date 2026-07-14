@@ -1,0 +1,110 @@
+# Photon server example configuration.
+#
+# Copy this to `photon.toml` (or point the server at it explicitly) and edit for your
+# deployment. The server loads its config from, in order of precedence:
+#   1. the path given as the first CLI argument  (`photon-server /etc/photon.toml`)
+#   2. the `PHOTON_CONFIG` environment variable
+#   3. `photon.toml` in the working directory
+#
+# The REST/UI API binds `0.0.0.0:8080` by default; override with the `PHOTON_API_ADDR`
+# environment variable.
+
+# --- OTLP ingestion front end ------------------------------------------------------------
+[ingest]
+# Bearer token required on every OTLP request (gRPC metadata / HTTP `Authorization` header).
+# Treat it like a password; rotate it if leaked.
+token = "change-me-ingest-token"
+# OTLP/HTTP receiver (protobuf `POST /v1/logs`).
+http_addr = "0.0.0.0:4318"
+# OTLP/gRPC receiver.
+grpc_addr = "0.0.0.0:4317"
+# Max concurrently in-flight LOGS requests (HTTP + gRPC combined) before excess requests wait
+# for a permit — bounds peak decoded-batch memory (roughly max_in_flight * max decoded batch
+# size) so a saturation burst can't pile decoded batches on the heap. Optional; defaults to 256.
+max_in_flight = 256
+
+# --- Storage -----------------------------------------------------------------------------
+[storage]
+# Local hot tier: the WAL, compacted Parquet, skip indexes, and the manifest all live here.
+hot_dir = "/var/lib/photon/hot"
+# Shared control-plane SQLite database: UI user accounts and uptime monitors.
+# Always used — required for login and by the always-on uptime subsystem.
+db_path = "/var/lib/photon/photon.db"
+
+# `[storage.durable]` is OPTIONAL. Omit the whole section to run hot-tier only (no
+# replication). When present, compacted objects are replicated hot -> durable to an
+# S3-compatible bucket (AWS S3, MinIO, etc). `access_key_id` / `secret_access_key` are
+# themselves optional — leave them out to rely on IAM roles or environment credentials.
+# [storage.durable]
+# endpoint = "http://minio.internal:9000"
+# bucket = "photon-logs"
+# region = "us-east-1"
+# access_key_id = "..."
+# secret_access_key = "..."
+
+# --- Retention ---------------------------------------------------------------------------
+[retention]
+# Days of logs to keep. Must be > 0.
+days = 30
+
+# --- Schema ------------------------------------------------------------------------------
+[schema]
+# Attributes promoted to their own columns (indexed / fast to filter). Everything else is
+# stored in the long-tail attributes map. `service.name` is required (it is the primary sort
+# key) and each entry must be unique and must not collide with a reserved column name.
+promoted_attributes = ["service.name", "host.name"]
+
+# --- Write-ahead log ---------------------------------------------------------------------
+[wal]
+# Roll to a new segment once the active one exceeds this many bytes (128 MiB here).
+segment_max_bytes = 134217728
+# ...or once it reaches this age, whichever comes first.
+segment_max_age_secs = 60
+# Group-commit window: concurrent appends arriving within this many ms share one fsync.
+group_commit_max_delay_ms = 5
+
+# --- Human (UI) authentication -----------------------------------------------------------
+[auth]
+# Secret used to sign session cookies. Must be non-empty and at least 32 bytes long. Generate
+# a strong random value, e.g.:
+#   openssl rand -hex 32
+# Keep it secret and stable — changing it invalidates all existing sessions.
+session_secret = "replace-with-a-long-random-secret-at-least-32-bytes"
+
+# UI users are stored in the [storage].db_path SQLite database, not in config. On first start,
+# open the UI and complete the one-time "Create your account" onboarding to make the first user.
+# Manage additional users from the in-app Settings dialog.
+
+# --- Uptime monitoring ---------------------------------------------------------------------
+# The uptime subsystem is always on (probes + storage in the shared [storage].db_path SQLite).
+# This whole section is optional TUNING — omit it to accept the defaults shown below.
+[uptime]
+retention_days = 30
+# webhook_url = "https://hooks.example.com/uptime"   # optional global default; per-monitor overrides
+default_interval = "60s"
+default_timeout = "10s"
+worker_concurrency = 32
+
+# --- APM / Services ------------------------------------------------------------------------
+# Default Apdex "satisfied" latency threshold T (milliseconds) for services without a
+# per-service override (set from the Services UI). tolerating = T..4T, frustrated = >4T.
+[apm]
+default_apdex_threshold_ms = 500
+
+# --- Real-User Monitoring (RUM) -----------------------------------------------------------
+# RUM apps are managed in the UI (Frontend → Manage apps), not in config. On a fresh install
+# the registry is empty and the public POST /api/rum beacon rejects everything until you
+# register an app. Apps persist in the control-plane SQLite DB ([storage].db_path).
+
+# --- Infrastructure (host/GPU resource monitoring) ----------------------------------------
+# There is no [infra] config section — host/GPU metrics arrive over the same OTLP /v1/metrics
+# ingest as everything else, via the standalone `photon-agent` binary (run one per host you
+# want to monitor; it is not started by photon-server). `promoted_attributes` above already
+# includes "host.name" so hosts are a prunable dimension. Example:
+#   cargo run -p photon-agent -- \
+#     --endpoint http://<this-server>:4318/v1/metrics \
+#     --token <same as [ingest].token>              # or $PHOTON_INGEST_TOKEN
+#     --interval-secs 15                             # or $PHOTON_AGENT_INTERVAL
+#     --host-name my-gpu-box                         # or $PHOTON_AGENT_HOST; defaults to the OS hostname
+# NVIDIA GPU sampling is on by default (falls back gracefully with no driver present); disable
+# with --no-gpu / $PHOTON_AGENT_NO_GPU=true. See docs/subsystems/infra.md.

@@ -1,0 +1,30 @@
+[package]
+name = "photon-agent"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone host/GPU resource-metrics agent. Samples the machine with `sysinfo` (+ NVIDIA GPU
+# via `nvml-wrapper` behind the `gpu` feature) and POSTs OTLP/HTTP protobuf metrics to Photon's
+# /v1/metrics. Not compiled by `cargo build -p photon-server`.
+
+[dependencies]
+# OTLP proto MUST be workspace-pinned so payloads match Photon's decoder byte-for-byte.
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+# Local http:// target — no TLS backend needed (mirror photon-loadgen).
+reqwest = { version = "0.12", default-features = false }
+clap = { version = "4", features = ["derive", "env"] }
+sysinfo = "0.33"
+nvml-wrapper = { version = "0.10", optional = true }
+
+[features]
+# nvml-wrapper loads NVML dynamically via `libloading` (no link-time dependency on the NVIDIA
+# driver), so it compiles fine on any host including macOS dev machines; `Nvml::init()` simply
+# fails at runtime where no NVIDIA driver/GPU is present and the agent falls back to `NoGpu`.
+default = ["gpu"]
+gpu = ["dep:nvml-wrapper"]
+
+[dev-dependencies]
+# Round-trip: assert the agent's OTLP payloads decode + map the way the real receiver maps them.
+photon-ingest = { path = "../photon-ingest" }

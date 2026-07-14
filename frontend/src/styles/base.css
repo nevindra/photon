@@ -1,0 +1,113 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+}
+
+@layer components {
+  /* Physical "key" (.pk) — the shared tactile detail. A solid control sits on a hard
+     bottom lip (offset bevel) and presses in on click, like a physical key. Ambient +
+     highlight reuse the theme-aware --shadow tokens; --pk-lip is the hard bottom edge,
+     overridable per variant (.pk-brand). Reserved for pressable chrome — NOT data rows. */
+  .pk {
+    --pk-lip: 0 0% 0% / 0.16;
+    box-shadow: 0 3px 0 -1px hsl(var(--pk-lip)), var(--shadow-1);
+    transition:
+      transform var(--motion-press) var(--motion-ease),
+      box-shadow var(--motion-lift) var(--motion-ease),
+      background-color var(--motion-fast) var(--motion-ease),
+      color var(--motion-fast) var(--motion-ease),
+      filter var(--motion-fast) var(--motion-ease);
+  }
+  .pk-brand {
+    --pk-lip: 191 96% 30%;
+  }
+  .dark .pk {
+    --pk-lip: 0 0% 0% / 0.5;
+  }
+  .dark .pk-brand {
+    --pk-lip: 191 96% 22%;
+  }
+  .pk:hover:not(:disabled):not([data-disabled]) {
+    box-shadow: 0 4px 0 -1px hsl(var(--pk-lip)), var(--shadow-2);
+  }
+  .pk:active:not(:disabled):not([data-disabled]) {
+    box-shadow: 0 0 0 0 hsl(var(--pk-lip)), var(--sink);
+  }
+  .pk:disabled,
+  .pk[data-disabled] {
+    box-shadow: none;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .pk:hover:not(:disabled):not([data-disabled]) {
+      transform: translateY(-1px);
+    }
+    .pk:active:not(:disabled):not([data-disabled]) {
+      transform: translateY(3px);
+    }
+  }
+}
+
+/* Thin layout reset (Tailwind preflight handles box-sizing, margins, etc.) */
+html,
+body,
+#app {
+  height: 100%;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Neutral, token-driven scrollbars — works in both light and dark. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--border)) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 9999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground));
+  background-clip: padding-box;
+}
+
+/* Focus ring uses the neutral --ring token. */
+:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+/* Data font helper. */
+.mono {
+  @apply font-mono;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

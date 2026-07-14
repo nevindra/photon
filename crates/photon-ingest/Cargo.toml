@@ -1,0 +1,27 @@
+[package]
+name = "photon-ingest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+photon-core = { path = "../photon-core" }
+photon-wal = { path = "../photon-wal" }
+arrow = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+opentelemetry-proto = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snap = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "logs_ingest"
+harness = false

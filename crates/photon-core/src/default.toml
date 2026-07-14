@@ -1,0 +1,28 @@
+# Baked-in default configuration, embedded via include_str! in config.rs.
+# Used only when the server is started with NO explicit config path and no ./photon.toml
+# on disk (the container case). Secrets are intentionally EMPTY so an unconfigured server
+# fails validation and refuses to boot — set PHOTON_INGEST_TOKEN and PHOTON_SESSION_SECRET
+# (or mount a real config file) to run.
+
+[ingest]
+token = ""
+http_addr = "0.0.0.0:4318"
+grpc_addr = "0.0.0.0:4317"
+
+[storage]
+hot_dir = "/var/lib/photon/hot"
+db_path = "/var/lib/photon/photon.db"
+
+[retention]
+days = 30
+
+[schema]
+promoted_attributes = ["service.name", "host.name"]
+
+[wal]
+segment_max_bytes = 134217728
+segment_max_age_secs = 60
+group_commit_max_delay_ms = 5
+
+[auth]
+session_secret = ""

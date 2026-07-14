@@ -1,0 +1,156 @@
+/* Photon — design tokens (shadcn-vue convention).
+   A near-neutral base with a single Photon Cyan brand accent (--brand, ~190°) used
+   sparingly — the "Reserved" reach: active-nav, focus ring, links, selection, key
+   data highlights, and the explicit `brand` CTA variant. Colours are HSL channel
+   triplets so Tailwind can compose them as `hsl(var(--x) / <alpha>)`; the elevation
+   tokens (--shadow-1/2, --sink, --hi) are full CSS values surfaced via Tailwind's
+   boxShadow.
+
+   Layered surfaces: --surface-1 (cards / panels) and --surface-2 (popovers / drawers /
+   raised) lift off --background; --card maps to --surface-1 and --popover to
+   --surface-2, so chrome reads as elevated. Light is the default; `.dark` on <html>
+   flips to the dark palette (owned by the ThemeToggle). Dark mode sits on a
+   faintly-cool near-black (NOT pure black) so the elevation shadows and surface ramp
+   can read.
+
+   Colour policy: near-neutral base everywhere; the cyan brand accent is functional and
+   spent sparingly. Severity colour (--sev-*) is reserved for warn / error / fatal ONLY
+   and stays visually distinct from the brand — debug/info have NO colour (downstream
+   uses --muted-foreground), so the coloured lines are the signal. --success/--success-soft
+   is the theme-aware green for healthy / up / good — the positive counterpart to severity,
+   kept separate from --sev-* (which stays warn/error/fatal only). */
+
+:root {
+  /* Surfaces & text — cool near-white canvas, cool near-black ink */
+  --background: 240 20% 98%;
+  --foreground: 240 10% 12%;
+
+  /* Layered surfaces — cards/panels lift off the canvas; popovers/drawers sit higher */
+  --surface-1: 0 0% 100%;
+  --surface-2: 0 0% 100%;
+
+  --card: var(--surface-1);
+  --card-foreground: 240 10% 12%;
+
+  --popover: var(--surface-2);
+  --popover-foreground: 240 10% 12%;
+
+  /* Primary / interactive — near-black on white (neutral, Reserved reach) */
+  --primary: 0 0% 9%;
+  --primary-foreground: 0 0% 98%;
+
+  --secondary: 240 14% 96%;
+  --secondary-foreground: 240 10% 12%;
+
+  --muted: 240 14% 96%;
+  --muted-foreground: 240 5% 42%;
+
+  --accent: 240 14% 96%;
+  --accent-foreground: 240 10% 12%;
+
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 0 0% 98%;
+
+  /* Brand — Photon Cyan (~191°). Kept SEPARATE from the neutral shadcn --accent. */
+  --brand: 191 94% 38%;
+  --brand-strong: 191 90% 33%;
+  --brand-foreground: 0 0% 100%;
+  --brand-soft: 190 92% 95%;
+
+  /* Hairlines, inputs, focus ring (ring retargets to brand) */
+  --border: 240 12% 90%;
+  --input: 240 12% 90%;
+  --ring: 191 94% 38%;
+
+  --radius: 0.5rem;
+
+  /* Elevation / sink / highlight — full CSS values (Tailwind boxShadow).
+     The --hi top-highlight is baked into --shadow-1/2 so a single `shadow-1`
+     utility carries both the drop shadow and the inset highlight; --hi stays
+     standalone for elements that want only the highlight (e.g. segmented). */
+  --hi: inset 0 1px 0 rgb(255 255 255 / .8);
+  --shadow-1: 0 6px 20px -8px rgb(20 22 45 / .12), 0 2px 5px -2px rgb(20 22 45 / .08), var(--hi);
+  --shadow-2: 0 16px 34px -12px rgb(20 22 45 / .20), 0 4px 10px -4px rgb(20 22 45 / .12), var(--hi);
+  --sink: inset 0 1px 2px rgb(20 22 45 / .10);
+
+  /* Motion — one vocabulary for every transition. */
+  --motion-fast: 120ms;
+  --motion-base: 200ms;
+  --motion-ease: cubic-bezier(0.2, 0, 0, 1);
+  --motion-lift: 160ms;
+  --motion-press: 90ms;
+
+  /* Severity — colour only for warn / error / fatal.
+     Foregrounds for the level tag / tick; *-soft for tinted row/tag backgrounds. */
+  --sev-error: 0 72% 51%;
+  --sev-warn: 32 81% 35%;
+  --sev-fatal: 262 83% 58%;
+  --sev-error-soft: 0 86% 97%;
+  --sev-warn-soft: 48 96% 95%;
+  --sev-fatal-soft: 258 90% 98%;
+
+  /* Success / healthy / up / good — the positive counterpart to severity
+     (severity stays warn/error/fatal only). Foreground/solid + soft tint. */
+  --success: 152 56% 38%;
+  --success-soft: 152 55% 94%;
+}
+
+.dark {
+  /* Faintly-cool near-black canvas (NOT pure black) so elevation reads */
+  --background: 240 8% 7%;
+  --foreground: 0 0% 96%;
+
+  /* Layered surfaces — raised planes above the near-black canvas */
+  --surface-1: 240 6% 10%;
+  --surface-2: 240 6% 13%;
+
+  --card: var(--surface-1);
+  --card-foreground: 0 0% 96%;
+
+  --popover: var(--surface-2);
+  --popover-foreground: 0 0% 96%;
+
+  --primary: 0 0% 98%;
+  --primary-foreground: 0 0% 9%;
+
+  --secondary: 240 6% 16%;
+  --secondary-foreground: 0 0% 96%;
+
+  --muted: 240 6% 13%;
+  --muted-foreground: 240 5% 64%;
+
+  --accent: 240 6% 16%;
+  --accent-foreground: 0 0% 96%;
+
+  --destructive: 0 62.8% 30.6%;
+  --destructive-foreground: 0 0% 98%;
+
+  /* Brand — brighter cyan for the dark canvas; deep ink on filled cyan. */
+  --brand: 190 90% 44%;
+  --brand-strong: 189 92% 56%;
+  --brand-foreground: 196 100% 7%;
+  --brand-soft: 190 60% 12%;
+
+  --border: 240 5% 17%;
+  --input: 240 5% 17%;
+  --ring: 190 90% 44%;
+
+  /* Elevation / sink / highlight — deeper shadows for the dark canvas. */
+  --hi: inset 0 1px 0 rgb(255 255 255 / .05);
+  --shadow-1: 0 10px 26px -10px rgb(0 0 0 / .60), 0 2px 6px -2px rgb(0 0 0 / .50), var(--hi);
+  --shadow-2: 0 18px 40px -12px rgb(0 0 0 / .72), 0 4px 12px -4px rgb(0 0 0 / .50), var(--hi);
+  --sink: inset 0 1px 3px rgb(0 0 0 / .55);
+
+  /* Brighter severity foregrounds; low-luminance soft tints that read subtly on
+     a near-black surface. */
+  --sev-error: 0 84% 68%;
+  --sev-warn: 38 92% 60%;
+  --sev-fatal: 263 90% 74%;
+  --sev-error-soft: 0 63% 15%;
+  --sev-warn-soft: 38 70% 13%;
+  --sev-fatal-soft: 263 55% 18%;
+
+  /* Success — brighter green for the dark canvas; low-luminance soft tint. */
+  --success: 152 58% 46%;
+  --success-soft: 152 40% 14%;
+}

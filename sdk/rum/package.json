@@ -1,0 +1,20 @@
+{
+  "name": "@photon/rum",
+  "version": "0.1.0",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/photon-rum.js",
+  "module": "./dist/photon-rum.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "import": "./dist/photon-rum.js", "types": "./dist/index.d.ts" },
+    "./iife": "./dist/photon-rum.iife.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "size": "node scripts/size-check.mjs"
+  },
+  "dependencies": { "web-vitals": "^4" },
+  "devDependencies": { "tsup": "^8", "typescript": "^5", "vitest": "^2", "jsdom": "^25" }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "photon-query"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+photon-core = { path = "../photon-core" }
+photon-index = { path = "../photon-index" }
+photon-storage = { path = "../photon-storage" }
+datafusion = { workspace = true }
+arrow = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+parquet = { workspace = true }
+photon-compact = { path = "../photon-compact" }
+photon-wal = { path = "../photon-wal" }

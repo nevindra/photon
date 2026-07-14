@@ -1,0 +1,56 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "preserve",
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "useDefineForClassFields": true,
+
+    // `lib/` source is now all TypeScript (fully type-checked). The remaining
+    // plain-`.js` code — JS-authored `.vue` view/domain scripts and the `.test.js`
+    // files — must be importable but must NOT be type-checked, so `checkJs:false`
+    // keeps the real gate on `.ts` / `lang="ts"` code only.
+    "allowJs": true,
+    "checkJs": false,
+
+    // Match the Vite `@` -> `src` alias exactly (vite.config.js).
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    },
+
+    // vitest/globals: makes describe/it/expect resolve in new `.ts` tests.
+    // node: ambient Node types for tooling/config-adjacent code.
+    "types": ["vitest/globals", "node"]
+  },
+
+  // Relax template strictness so plain-JS `.vue` views (untyped templates) and
+  // any future `lang="ts"` component are not held to unknown-prop/slot rules
+  // that the legacy tree was never written against.
+  "vueCompilerOptions": {
+    "strictTemplates": false
+  },
+
+  // The gate checks ALL `.ts`/`.d.ts` AND every `lang="ts"` SFC under `src/`
+  // (`src/**/*.vue`). Because `checkJs:false`, legacy `.js` and plain-JS `.vue`
+  // scripts stay unchecked, while every new `.ts` module, new `.ts` test, and
+  // new `lang="ts"` component is fully type-checked (all proven with probes).
+  // `.ts` -> `.vue` imports resolve through the `declare module '*.vue'` shim
+  // in env.d.ts. vue-tsc checks `.vue` files reachable by import all-or-nothing,
+  // so the whole component tree must type-check — the two pre-existing
+  // `lang="ts"` primitives that previously errored (Checkbox.vue slot state,
+  // ToggleGroupItem.vue injected union) were fixed at the source to make this
+  // green rather than narrowing the gate around them.
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.d.ts",
+    "src/**/*.vue",
+    "env.d.ts"
+  ]
+}

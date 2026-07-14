@@ -1,0 +1,110 @@
+# Photon — single-node deployment. `docker compose up -d` after copying .env.example -> .env.
+# Durable S3 replication is opt-in: `docker compose --profile durable up -d` (see deploy/README.md).
+
+services:
+  photon:
+    build: .
+    image: photon:latest
+    container_name: photon
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      PHOTON_DURABLE_ENDPOINT: "${PHOTON_DURABLE_ENDPOINT:-}"
+      PHOTON_DURABLE_BUCKET: "${PHOTON_DURABLE_BUCKET:-}"
+      PHOTON_DURABLE_REGION: "${PHOTON_DURABLE_REGION:-}"
+      PHOTON_DURABLE_ACCESS_KEY_ID: "${PHOTON_DURABLE_ACCESS_KEY_ID:-}"
+      PHOTON_DURABLE_SECRET_ACCESS_KEY: "${PHOTON_DURABLE_SECRET_ACCESS_KEY:-}"
+    depends_on:
+      garage-init:
+        condition: service_completed_successfully
+        required: false
+    ports:
+      - "8080:8080"   # UI + REST API
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    volumes:
+      - photon-data:/var/lib/photon
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/photon-server", "healthcheck"]
+      interval: 30s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+
+  garage:
+    image: dxflrs/garage:v1.0.1
+    container_name: photon-garage
+    profiles: [durable]
+    restart: unless-stopped
+    volumes:
+      - ./deploy/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    ports:
+      - "3900:3900"   # S3 API
+      - "3903:3903"   # admin API
+
+  # One-shot: assign a cluster layout, import a deterministic key, create + grant the bucket.
+  # Idempotent — safe to re-run. dxflrs/garage ships `FROM scratch` (just the static `garage`
+  # binary, no shell) so this layers it onto alpine to get a shell for the init script.
+  garage-init:
+    build:
+      dockerfile_inline: |
+        FROM dxflrs/garage:v1.0.1 AS garage
+        FROM alpine:3.20
+        COPY --from=garage /garage /garage
+    container_name: photon-garage-init
+    profiles: [durable]
+    restart: "no"
+    depends_on:
+      garage:
+        condition: service_started
+    volumes:
+      - ./deploy/garage.toml:/etc/garage.toml:ro
+      # Read-only access to the SAME metadata dir as `garage` — lets `garage node id` read
+      # this node's identity locally instead of over RPC (see command script below).
+      - garage-meta:/var/lib/garage/meta:ro
+    environment:
+      # RPC secret MUST equal deploy/garage.toml's rpc_secret (authenticates the RPC calls
+      # below). GARAGE_RPC_HOST is derived at runtime — this node's id@127.0.0.1 (from
+      # `garage node id`, via rpc_public_addr) isn't reachable from this container, so the
+      # script below rewrites it to id@garage:3901 (the `garage` service's Compose DNS name).
+      GARAGE_RPC_SECRET: "0000000000000000000000000000000000000000000000000000000000000001"
+      PHOTON_DURABLE_BUCKET: "${PHOTON_DURABLE_BUCKET:-photon}"
+      # Fallback key id/secret MUST be valid Garage formats (`GK` + 24 hex chars; 64 hex
+      # chars) or `garage key import` rejects them — these are fixed dev-only placeholders.
+      PHOTON_DURABLE_ACCESS_KEY_ID: "${PHOTON_DURABLE_ACCESS_KEY_ID:-GK43ba46c38ae6886c283896c1}"
+      PHOTON_DURABLE_SECRET_ACCESS_KEY: "${PHOTON_DURABLE_SECRET_ACCESS_KEY:-1efa8a1bf2156fa1e93ddc088339993ddf56501970e82e87a0282716237f1d62}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # Wait for this node's identity to be readable from the shared metadata volume,
+        # then point the CLI at the `garage` service over the network (not 127.0.0.1).
+        for i in $$(seq 1 30); do
+          ID=$$(/garage node id -q 2>/dev/null | cut -d@ -f1) && [ -n "$$ID" ] && break
+          echo "waiting for node id... ($$i)"; sleep 1
+        done
+        echo "node: $$ID"
+        export GARAGE_RPC_HOST="$$ID@garage:3901"
+        # Wait for the node's RPC to actually answer over that address.
+        for i in $$(seq 1 30); do
+          if /garage status >/dev/null 2>&1; then break; fi
+          echo "waiting for garage rpc... ($$i)"; sleep 1
+        done
+        # Assign a layout once (ignore error if already assigned/applied).
+        /garage layout assign -z dc1 -c 1G "$$ID" || true
+        /garage layout apply --version 1 || true
+        # Import a deterministic key so PHOTON_DURABLE_* line up (idempotent).
+        /garage key import -n photon-key \
+          "$$PHOTON_DURABLE_ACCESS_KEY_ID" "$$PHOTON_DURABLE_SECRET_ACCESS_KEY" --yes || true
+        # Create + grant the bucket (idempotent).
+        /garage bucket create "$$PHOTON_DURABLE_BUCKET" || true
+        /garage bucket allow --read --write --owner \
+          "$$PHOTON_DURABLE_BUCKET" --key photon-key || true
+        echo "garage-init done"
+
+volumes:
+  photon-data:
+  garage-meta:
+  garage-data:
