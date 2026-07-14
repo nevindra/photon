@@ -34,11 +34,23 @@ pub struct IngestConfig {
     /// (an unbounded conc=128 saturate run OOM-killed the server before this bound existed).
     #[serde(default = "IngestConfig::default_max_in_flight")]
     pub max_in_flight: usize,
+    /// Max request body size, in bytes, accepted by the ingest front doors. Enforced on the
+    /// **decompressed** stream: HTTP applies it as `DefaultBodyLimit::max` sitting *inside* the
+    /// gzip request-decompression layer (so a small gzip bomb can't blow past it), and the gRPC
+    /// side mirrors it via `max_decoding_message_size` so the two front doors agree instead of
+    /// silently disagreeing (axum defaulted to 2 MiB, tonic to 4 MiB — an exporter retries a 413
+    /// forever). The Prometheus remote-write receiver reuses it as a snappy decompress cap.
+    /// Default ~16 MiB. `PHOTON_INGEST_MAX_BODY_BYTES` overrides.
+    #[serde(default = "IngestConfig::default_max_body_bytes")]
+    pub max_body_bytes: usize,
 }
 
 impl IngestConfig {
     fn default_max_in_flight() -> usize {
         256
+    }
+    fn default_max_body_bytes() -> usize {
+        16 * 1024 * 1024
     }
 }
 
@@ -224,6 +236,9 @@ impl Config {
         }
         if let Some(v) = get("PHOTON_INGEST_MAX_IN_FLIGHT") {
             self.ingest.max_in_flight = parse_var("PHOTON_INGEST_MAX_IN_FLIGHT", &v)?;
+        }
+        if let Some(v) = get("PHOTON_INGEST_MAX_BODY_BYTES") {
+            self.ingest.max_body_bytes = parse_var("PHOTON_INGEST_MAX_BODY_BYTES", &v)?;
         }
         if let Some(v) = get("PHOTON_STORAGE_HOT_DIR") {
             self.storage.hot_dir = PathBuf::from(v);
@@ -443,6 +458,20 @@ session_secret = "a-long-random-session-signing-secret"
         );
         let c = Config::from_toml_str(&toml).unwrap();
         assert_eq!(c.ingest.max_in_flight, 64);
+    }
+
+    #[test]
+    fn ingest_max_body_bytes_defaults_when_omitted() {
+        let c = Config::from_toml_str(VALID).unwrap();
+        assert_eq!(c.ingest.max_body_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn ingest_max_body_bytes_env_override_applies() {
+        let mut cfg = Config::parse_unvalidated(include_str!("default.toml")).unwrap();
+        let env = env_of(&[("PHOTON_INGEST_MAX_BODY_BYTES", "1048576")]);
+        cfg.apply_env_overrides(&env).unwrap();
+        assert_eq!(cfg.ingest.max_body_bytes, 1_048_576);
     }
 
     #[test]

@@ -147,7 +147,9 @@ photon-query    three engines: QueryEngine (logs), SpanQueryEngine (traces/APM/R
                 (metrics + RUM vitals). Reassembles Prometheus classic histograms (`le`-bucket →
                 quantile) at query time. Manifest + skip-index pruning, then DataFusion over survivors.
 photon-ingest   OTLP gRPC (tonic) + HTTP (axum) receivers for logs/traces/metrics, mapping, token auth.
-                + Prometheus remote-write 1.0 (/api/v1/write, snappy+protobuf → metrics WAL).
+                + Prometheus remote-write 1.0 (/api/v1/write, snappy+protobuf → metrics WAL). Both
+                front doors accept gzipped requests (stock OTel Collector gzips by default) and share
+                one `[ingest].max_body_bytes` cap (~16 MiB) enforced on the *decompressed* size.
 photon-uptime   always-on synthetic HTTP/TCP/ICMP monitors → embedded SQLite. Trait: UptimeStore.
 photon-api      axum REST + session auth (argon2, signed cookies) + embedded Vue UI. Defines trait
                 seams RumSink/RumAppStore/UserStore/UsageStore/ReplicationStatus/DataAdmin (photon-api

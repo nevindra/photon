@@ -381,6 +381,7 @@ async fn spawn_live_server() -> LiveServer {
         span_schema,
         metric_schema,
         256,
+        16 * 1024 * 1024,
         Arc::new(photon_core::ingest_counters::IngestCounters::new()),
     );
     let grpc_addr = free_addr();

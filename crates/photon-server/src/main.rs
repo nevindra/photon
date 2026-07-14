@@ -309,6 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         span_schema.clone(),
         metric_schema.clone(),
         cfg.ingest.max_in_flight,
+        cfg.ingest.max_body_bytes,
         counters.clone(),
     );
     let span_query = SpanQueryEngine::new(cfg.storage.hot_dir.clone(), span_schema.clone())?;

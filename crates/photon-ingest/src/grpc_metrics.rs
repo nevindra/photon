@@ -1,7 +1,7 @@
 //! tonic `MetricsService`: token check → OTLP→`MetricPoint` mapping → metrics-WAL append.
 
 use crate::auth::check_bearer_token;
-use crate::otlp_metrics_to_points;
+use crate::metrics_mapping::{estimate_rows, otlp_metrics_into_builder};
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     metrics_service_server::MetricsService, ExportMetricsServiceRequest,
     ExportMetricsServiceResponse,
@@ -31,10 +31,9 @@ impl<W: Wal + Send + Sync + 'static> MetricsService for GrpcMetricsService<W> {
         &self,
         request: tonic::Request<ExportMetricsServiceRequest>,
     ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
-        let _permit = self.in_flight.clone().acquire_owned().await.map_err(|e| {
-            tonic::Status::resource_exhausted(format!("ingest temporarily overloaded: {e}"))
-        })?;
-
+        // Cheap token check first so an unauthenticated flood is rejected before it ever
+        // competes for an in-flight permit; the permit exists to bound expensive work
+        // (decode→build→append), not free rejections.
         let auth_header = request
             .metadata()
             .get("authorization")
@@ -45,11 +44,13 @@ impl<W: Wal + Send + Sync + 'static> MetricsService for GrpcMetricsService<W> {
             ));
         }
 
-        let points = otlp_metrics_to_points(request.into_inner());
-        let mut builder = MetricBatchBuilder::new(&self.schema);
-        for point in &points {
-            builder.append(point);
-        }
+        let _permit = self.in_flight.clone().acquire_owned().await.map_err(|e| {
+            tonic::Status::resource_exhausted(format!("ingest temporarily overloaded: {e}"))
+        })?;
+
+        let req = request.into_inner();
+        let mut builder = MetricBatchBuilder::with_capacity(&self.schema, estimate_rows(&req));
+        otlp_metrics_into_builder(req, &mut builder);
         let batch = builder
             .finish()
             .map_err(|e| tonic::Status::internal(e.to_string()))?;

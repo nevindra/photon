@@ -27,7 +27,9 @@ fn effective_timestamp_nanos(time_unix_nano: u64, observed_time_unix_nano: u64) 
     } else {
         observed_time_unix_nano
     };
-    nanos as i64
+    // Untrusted OTLP u64 nanos: clamp instead of `as i64`, which wraps negative for values
+    // above i64::MAX.
+    i64::try_from(nanos).unwrap_or(i64::MAX)
 }
 
 /// Map an OTLP `ExportLogsServiceRequest` into the flat `LogRecord`s Photon stores.
@@ -84,7 +86,7 @@ pub fn otlp_logs_to_records(req: ExportLogsServiceRequest) -> Vec<LogRecord> {
                 let observed_timestamp_nanos = if lr.observed_time_unix_nano == 0 {
                     None
                 } else {
-                    Some(lr.observed_time_unix_nano as i64)
+                    Some(i64::try_from(lr.observed_time_unix_nano).unwrap_or(i64::MAX))
                 };
 
                 out.push(LogRecord {
@@ -151,8 +153,8 @@ pub fn otlp_logs_into_builder(req: ExportLogsServiceRequest, builder: &mut Recor
                 let span_id = bytes_to_hex_opt(&lr.span_id);
                 let severity_text =
                     (!lr.severity_text.is_empty()).then_some(lr.severity_text.as_str());
-                let observed =
-                    (lr.observed_time_unix_nano != 0).then_some(lr.observed_time_unix_nano as i64);
+                let observed = (lr.observed_time_unix_nano != 0)
+                    .then_some(i64::try_from(lr.observed_time_unix_nano).unwrap_or(i64::MAX));
 
                 let fixed = LogFixed {
                     timestamp_nanos: effective_timestamp_nanos(
@@ -395,6 +397,46 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].timestamp_nanos, 0);
         assert_eq!(records[0].observed_timestamp_nanos, None);
+    }
+
+    /// F11: OTLP nanos are an untrusted u64 from the exporter. `as i64` wraps negative for
+    /// values above `i64::MAX`; the hardened cast must clamp to `i64::MAX` instead.
+    #[test]
+    fn huge_nanos_clamp_to_i64_max_instead_of_wrapping_negative() {
+        assert_eq!(effective_timestamp_nanos(u64::MAX, 0), i64::MAX);
+        assert_eq!(effective_timestamp_nanos(0, u64::MAX), i64::MAX);
+    }
+
+    /// F11: the `observed_timestamp_nanos` field goes through its own `as i64` cast
+    /// (independent of `effective_timestamp_nanos`) in both the reference and streaming
+    /// mapping paths — must clamp too, not wrap negative.
+    #[test]
+    fn observed_timestamp_clamps_on_huge_input() {
+        let log_record = OtlpLogRecord {
+            time_unix_nano: 1,
+            observed_time_unix_nano: u64::MAX,
+            severity_number: 0,
+            severity_text: String::new(),
+            body: None,
+            attributes: vec![],
+            dropped_attributes_count: 0,
+            flags: 0,
+            trace_id: vec![],
+            span_id: vec![],
+        };
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![log_record],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let records = otlp_logs_to_records(req);
+        assert_eq!(records[0].observed_timestamp_nanos, Some(i64::MAX));
     }
 
     #[test]

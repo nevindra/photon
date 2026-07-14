@@ -4,10 +4,19 @@
 //! a live server (gRPC metadata and HTTP headers both reduce to `Option<&str>` + the
 //! expected token).
 
+use subtle::ConstantTimeEq;
+
 /// Returns `true` iff `header_value` is exactly `Bearer <token>`.
+///
+/// The token equality check is constant-time (`subtle::ConstantTimeEq`) so a byte-by-byte
+/// `==` scan can't leak a timing side-channel on the shared ingest secret. Everything else
+/// (missing header, missing/incorrect `Bearer ` scheme) is not secret-dependent and stays a
+/// plain, short-circuiting comparison.
 pub(crate) fn check_bearer_token(header_value: Option<&str>, token: &str) -> bool {
     match header_value {
-        Some(v) => v.strip_prefix("Bearer ").is_some_and(|t| t == token),
+        Some(v) => v
+            .strip_prefix("Bearer ")
+            .is_some_and(|t| bool::from(t.as_bytes().ct_eq(token.as_bytes()))),
         None => false,
     }
 }

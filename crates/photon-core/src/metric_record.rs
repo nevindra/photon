@@ -33,6 +33,30 @@ pub struct MetricPoint {
     pub attributes: BTreeMap<String, String>,
 }
 
+/// Borrowed view of a metric row's non-attribute columns, for the streaming append path.
+/// All owned data stays in the caller (the freshly-decoded OTLP request + locally-serialized
+/// JSON payloads); nothing is cloned. The distribution/exemplar JSON columns are
+/// `Option<&'a str>` — the caller owns the serialized `String` locally and lends a `&str` for
+/// the row. `metric_name`/`metric_type`/`timestamp_nanos` are required (mirrors
+/// `MetricBatchBuilder::append`, which `append_value`s them); everything else is optional.
+#[derive(Debug, Default, Clone)]
+pub struct MetricFixed<'a> {
+    pub metric_name: &'a str,
+    pub metric_type: i32,
+    pub type_text: Option<&'a str>,
+    pub temporality: Option<i32>,
+    pub is_monotonic: Option<bool>,
+    pub unit: Option<&'a str>,
+    pub timestamp_nanos: i64,
+    pub start_timestamp_nanos: Option<i64>,
+    pub scope_name: Option<&'a str>,
+    pub value: Option<f64>,
+    pub histogram: Option<&'a str>,
+    pub exp_histogram: Option<&'a str>,
+    pub summary: Option<&'a str>,
+    pub exemplars: Option<&'a str>,
+}
+
 pub struct MetricBatchBuilder {
     schema: Arc<arrow::datatypes::Schema>,
     promoted_names: Vec<String>,
@@ -124,6 +148,47 @@ impl MetricBatchBuilder {
         self.attributes.append(true).expect("map row append");
     }
 
+    /// Append one row straight from borrowed OTLP data — no `MetricPoint`, no per-point
+    /// `BTreeMap`. `attrs` yields the point's merged (resource + point) attributes as borrowed
+    /// key/value pairs. Promoted keys route to their column; the rest go to the map. Same output
+    /// as [`Self::append`] for the equivalent `MetricPoint`, proven byte-identical in tests.
+    pub fn append_streaming<'a, I>(&mut self, fixed: MetricFixed<'a>, attrs: I)
+    where
+        I: Iterator<Item = (&'a str, &'a str)> + Clone,
+    {
+        self.metric_name.append_value(fixed.metric_name);
+        self.metric_type.append_value(fixed.metric_type);
+        self.type_text.append_option(fixed.type_text);
+        self.temporality.append_option(fixed.temporality);
+        self.is_monotonic.append_option(fixed.is_monotonic);
+        self.unit.append_option(fixed.unit);
+        self.timestamp.append_value(fixed.timestamp_nanos);
+        self.start_timestamp
+            .append_option(fixed.start_timestamp_nanos);
+        self.scope_name.append_option(fixed.scope_name);
+        self.value.append_option(fixed.value);
+        self.histogram.append_option(fixed.histogram);
+        self.exp_histogram.append_option(fixed.exp_histogram);
+        self.summary.append_option(fixed.summary);
+        self.exemplars.append_option(fixed.exemplars);
+
+        // Promoted columns: for each promoted name, find its value among the attrs (a handful
+        // of keys; linear scan of a short per-row list, same cost class as the old map .get).
+        for (i, name) in self.promoted_names.iter().enumerate() {
+            let v = attrs.clone().find(|(k, _)| k == name).map(|(_, v)| v);
+            self.promoted[i].append_option(v);
+        }
+        // Long-tail attrs → the map (skip promoted keys).
+        for (k, v) in attrs {
+            if self.promoted_set.contains(k) {
+                continue;
+            }
+            self.attributes.keys().append_value(k);
+            self.attributes.values().append_value(v);
+        }
+        self.attributes.append(true).expect("map row append");
+    }
+
     pub fn finish(mut self) -> Result<RecordBatch, PhotonError> {
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(self.metric_name.finish()),
@@ -201,5 +266,51 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(svc.value(0), "checkout");
+    }
+
+    #[test]
+    fn append_streaming_routes_promoted_and_map_without_a_metricpoint() {
+        use super::MetricFixed;
+        let schema = MetricSchema::new(&["service.name".to_string()]);
+        let mut b = MetricBatchBuilder::with_capacity(&schema, 2);
+        b.append_streaming(
+            MetricFixed {
+                metric_name: "cpu.usage",
+                metric_type: metric_type::GAUGE,
+                timestamp_nanos: 100,
+                value: Some(0.73),
+                ..MetricFixed::default()
+            },
+            [("service.name", "api"), ("region", "us")].into_iter(),
+        );
+        b.append_streaming(
+            MetricFixed {
+                metric_name: "cpu.usage",
+                metric_type: metric_type::GAUGE,
+                timestamp_nanos: 200,
+                value: Some(0.41),
+                ..MetricFixed::default()
+            },
+            [("service.name", "web")].into_iter(),
+        );
+        let batch = b.finish().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        // `service.name` lands in its promoted column, `region` is long-tail (goes to the map).
+        let svc = batch
+            .column_by_name("service.name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(svc.value(0), "api");
+        assert_eq!(svc.value(1), "web");
+        let values = batch
+            .column_by_name(VALUE)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 0.73);
+        assert_eq!(values.value(1), 0.41);
     }
 }

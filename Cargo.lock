@@ -2871,6 +2871,7 @@ dependencies = [
  "axum",
  "bytes",
  "criterion",
+ "flate2",
  "futures",
  "opentelemetry-proto",
  "photon-core",
@@ -2879,9 +2880,12 @@ dependencies = [
  "serde",
  "serde_json",
  "snap",
+ "subtle",
  "tempfile",
  "tokio",
  "tonic",
+ "tower 0.5.3",
+ "tower-http 0.5.2",
 ]
 
 [[package]]
@@ -4195,6 +4199,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "h2",
  "http",
  "http-body",

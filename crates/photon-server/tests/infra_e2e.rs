@@ -241,6 +241,7 @@ async fn spawn_infra_server() -> InfraServer {
         span_schema,
         metric_schema.clone(),
         256,
+        16 * 1024 * 1024,
         Arc::new(photon_core::ingest_counters::IngestCounters::new()),
     );
     let grpc_addr = free_addr();

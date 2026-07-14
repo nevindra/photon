@@ -3,7 +3,7 @@
 //! is touched.
 
 use crate::auth::check_bearer_token;
-use crate::trace_mapping::otlp_traces_to_spans;
+use crate::trace_mapping::{estimate_rows, otlp_traces_into_builder};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -50,6 +50,16 @@ async fn ingest_traces<W: Wal + Send + Sync + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Cheap token check first so an unauthenticated flood is rejected before it ever
+    // competes for an in-flight permit; the permit exists to bound expensive work
+    // (decode→build→append), not free rejections.
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if !check_bearer_token(auth_header, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+
     let _permit = match state.in_flight.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => {
@@ -61,23 +71,13 @@ async fn ingest_traces<W: Wal + Send + Sync + 'static>(
         }
     };
 
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if !check_bearer_token(auth_header, &state.token) {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
-    }
-
     let req = match decode_export_request(&body) {
         Ok(req) => req,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
-    let spans = otlp_traces_to_spans(req);
-    let mut builder = SpanBatchBuilder::new(&state.schema);
-    for span in &spans {
-        builder.append(span);
-    }
+    let mut builder = SpanBatchBuilder::with_capacity(&state.schema, estimate_rows(&req));
+    otlp_traces_into_builder(req, &mut builder);
     let batch = match builder.finish() {
         Ok(batch) => batch,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

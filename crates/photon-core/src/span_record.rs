@@ -25,6 +25,29 @@ pub struct SpanRecord {
     pub attributes: BTreeMap<String, String>,
 }
 
+/// Borrowed view of a span row's non-attribute columns, for the streaming append path.
+/// All owned data stays in the caller (the freshly-decoded OTLP request); nothing is cloned.
+/// `trace_id`/`span_id`/`start_time_nanos` are required (mirrors `SpanBatchBuilder::append`,
+/// which `append_value`s them); everything else is optional.
+#[derive(Debug, Default, Clone)]
+pub struct SpanFixed<'a> {
+    pub trace_id: &'a str,
+    pub span_id: &'a str,
+    pub parent_span_id: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub kind: Option<i32>,
+    pub kind_text: Option<&'a str>,
+    pub start_time_nanos: i64,
+    pub end_time_nanos: Option<i64>,
+    pub duration_nanos: Option<i64>,
+    pub status_code: Option<i32>,
+    pub status_text: Option<&'a str>,
+    pub status_message: Option<&'a str>,
+    pub scope_name: Option<&'a str>,
+    pub events: Option<&'a str>,
+    pub links: Option<&'a str>,
+}
+
 use arrow::array::{
     ArrayRef, Int32Builder, Int64Builder, MapBuilder, StringBuilder, TimestampNanosecondBuilder,
 };
@@ -146,6 +169,46 @@ impl SpanBatchBuilder {
             self.promoted[i].append_option(record.attributes.get(name));
         }
         for (k, v) in &record.attributes {
+            if self.promoted_set.contains(k) {
+                continue;
+            }
+            self.attributes.keys().append_value(k);
+            self.attributes.values().append_value(v);
+        }
+        self.attributes.append(true).expect("map row append");
+    }
+
+    /// Append one row straight from borrowed OTLP data — no `SpanRecord`, no per-span
+    /// `BTreeMap`. `attrs` yields the span's merged (resource + span) attributes as
+    /// borrowed key/value pairs. Promoted keys route to their column; the rest go to the map.
+    pub fn append_streaming<'a, I>(&mut self, fixed: SpanFixed<'a>, attrs: I)
+    where
+        I: Iterator<Item = (&'a str, &'a str)> + Clone,
+    {
+        self.trace_id.append_value(fixed.trace_id);
+        self.span_id.append_value(fixed.span_id);
+        self.parent_span_id.append_option(fixed.parent_span_id);
+        self.name.append_option(fixed.name);
+        self.kind.append_option(fixed.kind);
+        self.kind_text.append_option(fixed.kind_text);
+        self.start_time.append_value(fixed.start_time_nanos);
+        self.end_time.append_option(fixed.end_time_nanos);
+        self.duration.append_option(fixed.duration_nanos);
+        self.status_code.append_option(fixed.status_code);
+        self.status_text.append_option(fixed.status_text);
+        self.status_message.append_option(fixed.status_message);
+        self.scope_name.append_option(fixed.scope_name);
+        self.events.append_option(fixed.events);
+        self.links.append_option(fixed.links);
+
+        // Promoted columns: for each promoted name, find its value among the attrs (a handful
+        // of keys; linear scan of a short per-row list, same cost class as the old map .get).
+        for (i, name) in self.schema.promoted.iter().enumerate() {
+            let v = attrs.clone().find(|(k, _)| k == name).map(|(_, v)| v);
+            self.promoted[i].append_option(v);
+        }
+        // Long-tail attrs → the map (skip promoted keys).
+        for (k, v) in attrs {
             if self.promoted_set.contains(k) {
                 continue;
             }
@@ -372,6 +435,49 @@ mod tests {
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .unwrap();
+        assert_eq!(start.value(1), 200);
+    }
+
+    #[test]
+    fn append_streaming_routes_promoted_and_map_without_a_spanrecord() {
+        let schema = SpanSchema::new(&["service.name".to_string()]);
+        let mut b = SpanBatchBuilder::with_capacity(&schema, 2);
+        b.append_streaming(
+            SpanFixed {
+                trace_id: "t1",
+                span_id: "s1",
+                start_time_nanos: 100,
+                ..SpanFixed::default()
+            },
+            [("service.name", "api"), ("region", "us")].into_iter(),
+        );
+        b.append_streaming(
+            SpanFixed {
+                trace_id: "t2",
+                span_id: "s2",
+                start_time_nanos: 200,
+                ..SpanFixed::default()
+            },
+            [("service.name", "web")].into_iter(),
+        );
+        let batch = b.finish().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        // `service.name` lands in its promoted column, `region` is long-tail (goes to the map).
+        let svc = batch
+            .column_by_name("service.name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(svc.value(0), "api");
+        assert_eq!(svc.value(1), "web");
+        let start = batch
+            .column_by_name("start_time_nanos")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(start.value(0), 100);
         assert_eq!(start.value(1), 200);
     }
 }
