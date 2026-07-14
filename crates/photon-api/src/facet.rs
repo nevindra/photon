@@ -5,7 +5,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::query_params::build_query_request;
+use crate::query_params::{build_query_request, clamp_limit};
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -33,7 +33,7 @@ pub(crate) async fn facet(State(state): State<AppState>, Query(p): Query<FacetPa
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    match state.query.facet(&p.field, req, p.limit).await {
+    match state.query.facet(&p.field, req, clamp_limit(p.limit)).await {
         Ok(r) => Json(json!({
             "values": r.values.iter()
                 .map(|v| json!({ "value": v.value, "count": v.count }))
@@ -86,5 +86,14 @@ mod tests {
     async fn faceting_on_level_is_a_bad_request() {
         let (status, _v) = get("/api/facet?field=level&start=0&end=100").await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn facet_clamps_a_dos_sized_limit() {
+        let (status, v) =
+            get("/api/facet?field=service.name&start=0&end=100&limit=999999999").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v["values"], serde_json::json!([]));
+        assert_eq!(v["capped"], serde_json::json!(false));
     }
 }

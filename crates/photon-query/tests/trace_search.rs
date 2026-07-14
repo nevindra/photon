@@ -615,6 +615,128 @@ async fn root_attributes_surfaces_promoted_columns() {
     assert!(!t.root_attributes.contains_key("db.system"));
 }
 
+#[tokio::test]
+async fn straddling_trace_spans_before_the_window_are_rolled_up_fully() {
+    // F10 regression: a trace whose *matching* span is inside the request window, but one of whose
+    // spans lives in a segment ENTIRELY before the window. The old step 3 re-scanned the original
+    // `[start, end]` window and pruned that segment (min/max miss), undercounting the trace
+    // (span_count 1, error_count 0). The ±1h-padded, narrowed step-3 window now admits the segment,
+    // so the whole trace is rolled up. This dataset makes the fix observable: on the OLD path this
+    // test would see span_count == 1.
+    let tmp = TempDir::new().unwrap();
+    // seg1: T's root span at start 1500 — inside the query window [1000, 2000].
+    let seg1 = write_segment(
+        tmp.path(),
+        SegmentId(1),
+        &[span(
+            "T",
+            "sA",
+            None,
+            "api",
+            "GET /",
+            1500,
+            Some(1600),
+            Some(100),
+            Some(1),
+        )],
+    );
+    // seg2: T's child (error) span at start 500 — a segment whose [min_ts, max_ts] = [500, 500] is
+    // entirely before the window, so the old whole-window step 3 pruned it (the undercount).
+    let seg2 = write_segment(
+        tmp.path(),
+        SegmentId(2),
+        &[span(
+            "T",
+            "sB",
+            Some("sA"),
+            "db",
+            "SELECT",
+            500,
+            Some(600),
+            Some(100),
+            Some(2), // ERROR
+        )],
+    );
+    write_manifest(tmp.path(), vec![seg1, seg2]);
+
+    let r = SpanQueryRequest {
+        start_ts_nanos: 1000,
+        end_ts_nanos: 2000,
+        query: None,
+        sort: SpanSort::Recent,
+        limit: 100,
+        offset: 0,
+        projected_attributes: Vec::new(),
+    };
+    let res = engine(tmp.path()).search_traces(r).await.unwrap();
+
+    assert_eq!(res.matched_count, 1);
+    let t = find(&res.traces, "T");
+    // The straddling child span (in the pre-window segment) is now included.
+    assert_eq!(t.span_count, 2, "the straddling child span must be rolled up");
+    assert_eq!(t.error_count, 1, "the straddling error span must be counted");
+    assert_eq!(t.services, vec!["api".to_string(), "db".to_string()]);
+    // The representative root is unchanged (the in-window parent-less span).
+    assert_eq!(t.root_name.as_deref(), Some("GET /"));
+    assert_eq!(t.start_ts_nanos, 1500);
+}
+
+#[tokio::test]
+async fn ranking_caps_rollup_at_max_candidate_traces_while_matched_count_is_full() {
+    // Bounded-memory boundary: with 2001 distinct traces (> the 2000 cap), `matched_count` still
+    // reports the full distinct total, but only the newest 2000 are ranked/rolled up (DataFusion
+    // `LIMIT` — never an unbounded Rust Vec). `limit` is set above the cap so paging can't be the
+    // limiter; the oldest trace (smallest start) is the one dropped by the cap.
+    let tmp = TempDir::new().unwrap();
+    let count = MAX_TRACES_OVER_CAP;
+    let mut records = Vec::with_capacity(count);
+    for i in 0..count as i64 {
+        records.push(span(
+            &format!("t{i:05}"),
+            &format!("s{i}"),
+            None,
+            "api",
+            "op",
+            1000 + i, // distinct, increasing starts → deterministic newest-2000
+            Some(1000 + i + 10),
+            Some(10),
+            Some(1),
+        ));
+    }
+    let seg = write_segment(tmp.path(), SegmentId(1), &records);
+    write_manifest(tmp.path(), vec![seg]);
+
+    let r = SpanQueryRequest {
+        start_ts_nanos: 0,
+        end_ts_nanos: i64::MAX,
+        query: None,
+        sort: SpanSort::Recent,
+        limit: 5000, // above the cap, so the 2000 ceiling comes from the ranking, not paging
+        offset: 0,
+        projected_attributes: Vec::new(),
+    };
+    let res = engine(tmp.path()).search_traces(r).await.unwrap();
+
+    assert_eq!(
+        res.matched_count, count as u64,
+        "matched_count reports the full distinct total (COUNT(DISTINCT trace_id))"
+    );
+    assert_eq!(
+        res.traces.len(),
+        2000,
+        "only the newest MAX_CANDIDATE_TRACES (2000) are ranked/rolled up"
+    );
+    // The oldest trace (start 1000, id t00000) is the one the cap drops.
+    assert!(
+        res.traces.iter().all(|t| t.trace_id != "t00000"),
+        "the oldest trace must be excluded by the newest-first cap"
+    );
+}
+
+/// One past the `MAX_CANDIDATE_TRACES` (2000) cap — a local mirror so this test needs no access to
+/// the crate-private constant.
+const MAX_TRACES_OVER_CAP: usize = 2001;
+
 // NOTE: These fixtures write the same on-disk artifacts (`data-spans/seg-*.parquet` + `.idx`
 // spans skip index + `manifest/spans-manifest.json`) that `photon_compact::SpanCompactor::run_once`
 // produces — via the exact `write_segment`/`write_parquet`/`write_idx`/`write_manifest` pattern

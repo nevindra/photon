@@ -272,8 +272,8 @@ impl MetricsQueryEngine {
 /// and per bucket answers the aggregation. For DELTA temporality each point's `bucket_counts` are
 /// summed element-wise into the point's time bucket; for CUMULATIVE they are reset-aware-delta'd
 /// across consecutive samples (a `count` decrease, an advanced `start_timestamp`, or a changed
-/// bound-vector length is a reset → the new counts are the contribution; the first sample
-/// contributes 0). Canonical bounds are taken from the first parsed row.
+/// bound vector — length or values — is a reset → the new counts are the contribution; the first
+/// sample contributes 0). Canonical bounds are taken from the first parsed row.
 pub(crate) fn histogram_series(
     rows: &[DistRow],
     cumulative: bool,
@@ -313,16 +313,24 @@ pub(crate) fn histogram_series(
     let mut has = vec![false; buckets];
 
     if cumulative {
-        let mut prev: Option<(Vec<f64>, f64, f64, Option<i64>)> = None;
+        // (prev bucket_counts, prev sum, prev count, prev start_timestamp, prev explicit_bounds)
+        type HistPrev<'a> = (Vec<f64>, f64, f64, Option<i64>, &'a [f64]);
+        let mut prev: Option<HistPrev> = None;
         for (ts, st, p) in &parsed {
             let b = bucket_of(*ts, start, end, buckets);
             let cur: Vec<f64> = p.bucket_counts.iter().map(|&c| c as f64).collect();
             let (inc_counts, inc_sum, inc_count) = match &prev {
                 None => (vec![0f64; cur.len()], 0.0, 0.0),
-                Some((pc, ps, pcnt, pst)) => {
+                Some((pc, ps, pcnt, pst, pbounds)) => {
+                    // A same-length-but-different-value bound change (histogram redefined with
+                    // the same bucket count but different `le` edges) is also a reset: bucket
+                    // counts from incompatible layouts must never be subtracted from each other.
+                    // Bounds are exact stored `le` labels (not recomputed), so exact `!=` is
+                    // correct — no floating-point drift risk.
                     let reset = (p.count as f64) < *pcnt
                         || (st.is_some() && pst.is_some() && *st > *pst)
-                        || cur.len() != pc.len();
+                        || cur.len() != pc.len()
+                        || p.explicit_bounds != *pbounds;
                     if reset {
                         (
                             cur.clone(),
@@ -343,7 +351,13 @@ pub(crate) fn histogram_series(
             hsum[b] += inc_sum;
             hcount[b] += inc_count;
             has[b] = true;
-            prev = Some((cur, p.sum.unwrap_or(0.0), p.count as f64, *st));
+            prev = Some((
+                cur,
+                p.sum.unwrap_or(0.0),
+                p.count as f64,
+                *st,
+                &p.explicit_bounds,
+            ));
         }
     } else {
         for (ts, _st, p) in &parsed {
@@ -879,6 +893,61 @@ mod hist_tests {
         let pts = histogram_series(&rows, true, Agg::P50, 0, 100, 1);
         // delta counts = [2,5,10,3,0] → p50 = 65.
         assert!((pts[0].v.unwrap() - 65.0).abs() < 1e-9);
+    }
+
+    // CUMULATIVE reset detection must compare bucket *bounds* by value, not just bucket-vector
+    // length (audit item 10b). Three consecutive points, one per bucket:
+    //   s0 (bucket 0): baseline, count=10 — first sample, contributes 0.
+    //   s1 (bucket 1): SAME bounds as s0 (stable layout), count=25 — a normal delta, no spurious
+    //                  reset, even though the bucket_counts values themselves differ from s0's.
+    //   s2 (bucket 2): SAME number of bounds as s1 (4 bounds → 5 buckets) but DIFFERENT boundary
+    //                  VALUES (histogram redefined with the same bucket count but different `le`
+    //                  edges), count=40 — must be detected as a reset (fresh baseline = 40), not a
+    //                  delta (which would wrongly yield 40-25=15 by subtracting across incompatible
+    //                  bucket layouts).
+    #[test]
+    fn histogram_series_cumulative_reset_on_same_length_different_bounds() {
+        let s0 =
+            r#"{"count":10,"sum":0,"bucket_counts":[2,3,4,1,0],"explicit_bounds":[10,50,100,500]}"#;
+        let s1 =
+            r#"{"count":25,"sum":0,"bucket_counts":[5,8,9,3,0],"explicit_bounds":[10,50,100,500]}"#;
+        let s2 = r#"{"count":40,"sum":0,"bucket_counts":[7,11,12,10,0],"explicit_bounds":[20,60,120,600]}"#;
+        let rows = vec![
+            DistRow {
+                ts: 10,
+                st: Some(0),
+                json: s0.into(),
+            },
+            DistRow {
+                ts: 110,
+                st: Some(0),
+                json: s1.into(),
+            },
+            DistRow {
+                ts: 210,
+                st: Some(0),
+                json: s2.into(),
+            },
+        ];
+        // window [0,300], 3 buckets of width 100 → s0/s1/s2 land in buckets 0/1/2 respectively.
+        let pts = histogram_series(&rows, true, Agg::Count, 0, 300, 3);
+        assert_eq!(pts.len(), 3);
+        assert_eq!(
+            pts[0].v,
+            Some(0.0),
+            "first sample contributes 0 (no prior baseline)"
+        );
+        assert_eq!(
+            pts[1].v,
+            Some(15.0),
+            "stable bounds → normal delta 25-10=15, no spurious reset"
+        );
+        assert_eq!(
+            pts[2].v,
+            Some(40.0),
+            "same bucket count but different bound VALUES must reset → fresh baseline 40, \
+             not the corrupted delta 40-25=15"
+        );
     }
 
     #[tokio::test]

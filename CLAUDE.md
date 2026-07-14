@@ -198,7 +198,13 @@ token bloom), and only then reads the surviving **local** Parquet with DataFusio
   `timestamp`, sorts DESC, takes `limit`, finds the cutoff; pass 2 re-runs with `timestamp >= cutoff`
   and returns full rows — so the wide `attributes` map is decoded only for surviving rows. Don't
   collapse it to one pass: it regresses broad-window, low-selectivity searches ~5x. Spans use the
-  same trick for `SpanSort::Recent`.
+  same trick for all three `SpanSort`s (`span_search.rs`) — `Recent` on `start_time_nanos`,
+  `Slowest` on nullable `duration_nanos`, `Errors` on the COMPOSITE `(status_code, start_time)`
+  (cutoff `(cs, cts)`, pass 2 filter `(status_code > cs) OR (status_code = cs AND start_time >=
+  cts)`, not a single-column `>=`). All three span sorts also append `(span_id ASC, trace_id ASC)`
+  as the final ORDER BY key in both passes — `span_id` is unique only *within* a trace per OTLP,
+  but the pair is unique per row, giving a genuine total order so exact ties paginate
+  deterministically instead of depending on which physical plan DataFusion picks.
 
 ### The query grammar & UI API
 

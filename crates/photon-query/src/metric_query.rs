@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::DataType;
 use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
-use datafusion::prelude::{cast, col, lit, when, Expr};
+use datafusion::prelude::{cast, col, Expr};
 
 use photon_core::metric_agg::{default_agg, Agg};
 use photon_core::metric_schema;
@@ -60,6 +60,7 @@ pub struct QuerySeriesResult {
     pub capped: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProbeMeta {
     pub metric_type: i32,
     pub temporality: Option<i32>,
@@ -74,27 +75,29 @@ pub(crate) fn bucket_start(start: i64, end: i64, buckets: usize, i: usize) -> i6
     start + (span * i as i128 / buckets as i128) as i64
 }
 
-/// The bucket-index Expr: `((ts - start) * buckets) / span`, clamped so `ts == end` lands in the
-/// last bucket. Same as `histogram.rs`.
+/// The bucket-index Expr: `(ts - start) / step`, divide-first (see `crate::bucket_math`), clamped
+/// so `ts == end` lands in the last bucket. Same as `histogram.rs`/`span_histogram.rs`.
 pub(crate) fn bucket_index_expr(start: i64, end: i64, buckets: usize) -> Result<Expr, PhotonError> {
-    let span = (end - start).max(1);
     let ts_nanos = cast(col_ref(metric_schema::TIMESTAMP), DataType::Int64);
-    let raw = (ts_nanos - lit(start)) * lit(buckets as i64) / lit(span);
-    when(
-        raw.clone().gt_eq(lit(buckets as i64)),
-        lit(buckets as i64 - 1),
-    )
-    .otherwise(raw)
-    .map_err(|e| PhotonError::Query(format!("metric bucket case: {e}")))
+    crate::bucket_math::bucket_index_expr(ts_nanos, start, end, buckets)
+        .map_err(|e| PhotonError::Query(format!("metric bucket case: {e}")))
 }
 
 impl MetricsQueryEngine {
     /// Discover one metric's type/temporality/is_monotonic/unit from the pruned data (LIMIT 1).
-    /// `None` ⇒ the metric has no rows in the window (unknown/empty).
+    /// `None` ⇒ the metric has no rows in the window (unknown/empty). This is the FULL
+    /// prune+`read_parquet`+scan `query_series` used to run unconditionally on every call — callers
+    /// should prefer `metric_meta_probe_cached`, which skips this when the metadata is already
+    /// known for the current manifest generation.
     pub(crate) async fn metric_meta_probe(
         &self,
         req: &MetricRequest,
     ) -> Result<Option<ProbeMeta>, PhotonError> {
+        // Test-only instrument: proves a cache hit in `metric_meta_probe_cached` actually skips
+        // this method, without reaching into cache internals from a test.
+        #[cfg(test)]
+        self.probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let Some(df) = self.survivors_df(req).await? else {
             return Ok(None);
         };
@@ -121,11 +124,43 @@ impl MetricsQueryEngine {
         Ok(Some(read_probe_row(b)))
     }
 
+    /// Cache-then-probe wrapper around `metric_meta_probe`. Every metric chart query
+    /// (`query_series`) needs this metadata at least once, sometimes twice (the classic-histogram
+    /// `_bucket` companion probe) — dashboards multiply that by panel count. A metric's
+    /// type/temporality/monotonicity/unit is stable, so once discovered for the CURRENT manifest
+    /// generation it's safe to reuse without re-running the full prune+open+scan.
+    ///
+    /// A cache miss (`cached_metric_meta` returns `None`) always falls through to the real probe —
+    /// there is no cached "confirmed absent" state, so a brand-new metric, or one with no rows in
+    /// this particular window, is probed exactly as before. Invalidation is manifest `Arc`
+    /// pointer-equality, mirroring `crate::ServicesCache` / `distinct_services`: see
+    /// `MetricsQueryEngine::cached_metric_meta` / `cache_metric_meta` in `metric_engine.rs`.
+    pub(crate) async fn metric_meta_probe_cached(
+        &self,
+        req: &MetricRequest,
+    ) -> Result<Option<ProbeMeta>, PhotonError> {
+        let manifest = self.load_metrics_manifest()?;
+        if let Some(meta) = self.cached_metric_meta(&manifest, &req.metric) {
+            return Ok(Some(meta));
+        }
+        let probed = self.metric_meta_probe(req).await?;
+        if let Some(meta) = &probed {
+            self.cache_metric_meta(&manifest, &req.metric, meta.clone());
+        }
+        Ok(probed)
+    }
+
     pub async fn query_series(
         &self,
         req: MetricSeriesRequest,
     ) -> Result<QuerySeriesResult, PhotonError> {
-        let buckets = req.buckets.max(1);
+        // Defense-in-depth: this is the central engine entry point every metrics aggregation path
+        // (metric_dist.rs, metric_classic_hist.rs) routes through, so it must not trust a caller's
+        // `buckets` even though `photon-api`'s handlers already clamp it — a huge value would
+        // otherwise scale multiple `(0..buckets)` allocations downstream. Mirrors `photon-api`'s
+        // `MAX_BUCKETS` (`crates/photon-api/src/query_params.rs`); `photon-query` can't depend on
+        // `photon-api`, so the value is restated here as a literal.
+        let buckets = req.buckets.clamp(1, 3000);
         let (start, end) = (req.start_ts_nanos, req.end_ts_nanos);
         let step_nanos = ((end - start).max(1) / buckets as i64).max(1);
 
@@ -143,7 +178,7 @@ impl MetricsQueryEngine {
         // Prometheus histogram base (`<base>_bucket` stored as flat cumulative SUM series); route
         // to the query-time reassembly path. Otherwise empty (200). Checked only in the `None` arm
         // so a genuinely-stored metric that happens to have a `_bucket` sibling is never shadowed.
-        let Some(meta) = self.metric_meta_probe(&base).await? else {
+        let Some(meta) = self.metric_meta_probe_cached(&base).await? else {
             use crate::metric_classic_hist::bucket_name;
             let bucket_probe = MetricRequest {
                 metric: bucket_name(&req.metric),
@@ -152,7 +187,11 @@ impl MetricsQueryEngine {
                 filter: req.filter.clone(),
                 host: None,
             };
-            if self.metric_meta_probe(&bucket_probe).await?.is_some() {
+            if self
+                .metric_meta_probe_cached(&bucket_probe)
+                .await?
+                .is_some()
+            {
                 let default = default_agg(metric_schema::metric_type::HISTOGRAM, Some(true)); // P99
                 let chosen = req.agg.unwrap_or(default);
                 return self
@@ -245,7 +284,10 @@ impl MetricsQueryEngine {
         scale_by_step: bool,
     ) -> Result<(Vec<SeriesResult>, bool), PhotonError> {
         let (start, end) = (req.start_ts_nanos, req.end_ts_nanos);
-        let buckets = req.buckets.max(1);
+        // Second, independent binding of `req.buckets` (this helper is reached from
+        // `query_series`'s SQL aggregation path via `&req`, not the already-clamped local) — clamp
+        // again here rather than trust that every caller re-derives from the clamped value.
+        let buckets = req.buckets.clamp(1, 3000);
         let Some(df) = self.survivors_df(base).await? else {
             return Ok((Vec::new(), false));
         };
@@ -520,10 +562,10 @@ pub(crate) struct PointRow {
     pub st: Option<i64>,
 }
 
-/// Bucket index for a timestamp: `((ts - start) * buckets) / span`, clamped to the last bucket.
+/// Bucket index for a timestamp: `(ts - start) / step`, divide-first (see `crate::bucket_math`),
+/// clamped to the last bucket.
 pub(crate) fn bucket_of(ts: i64, start: i64, end: i64, buckets: usize) -> usize {
-    let span = (end - start).max(1);
-    (((ts - start) * buckets as i64) / span).clamp(0, buckets as i64 - 1) as usize
+    crate::bucket_math::bucket_index(ts, start, end, buckets)
 }
 
 /// Reset-aware cumulative rollup for one series. Walks consecutive samples: a counter reset —
@@ -766,6 +808,34 @@ mod tests {
         );
     }
 
+    /// DoS defense-in-depth: an oversized `buckets` must be clamped to `MAX_BUCKETS` (3000) at
+    /// `query_series`, not allocate a 10-million-element `Vec` per series. Also exercises the SQL
+    /// aggregation path (`Agg::Avg` → `series_sql_agg`), which re-derives `buckets` from `req`
+    /// independently of `query_series`'s own local — both bindings must clamp.
+    #[tokio::test]
+    async fn buckets_request_is_clamped_to_max() {
+        let engine = gauge_engine();
+        let res = engine
+            .query_series(MetricSeriesRequest {
+                metric: "g".into(),
+                agg: Some(Agg::Avg),
+                group_by: vec![],
+                filter: None,
+                start_ts_nanos: 0,
+                end_ts_nanos: 200,
+                buckets: 10_000_000,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(res.series.len(), 1);
+        assert_eq!(
+            res.series[0].points.len(),
+            3000,
+            "buckets must clamp to MAX_BUCKETS (3000), not the caller-supplied 10_000_000"
+        );
+    }
+
     #[tokio::test]
     async fn gauge_avg_ungrouped_is_one_series() {
         let engine = gauge_engine();
@@ -790,6 +860,61 @@ mod tests {
         // bucket 0 = avg(10, 5) = 7.5; bucket 1 = avg(30, 7) = 18.5.
         assert_eq!(s.points[0].v, Some(7.5));
         assert_eq!(s.points[1].v, Some(18.5));
+    }
+
+    #[tokio::test]
+    async fn wide_window_series_bucket_index_does_not_overflow() {
+        // Regression for the i64-overflow bug: the old multiply-first `bucket_index_expr`
+        // (`(ts - start) * buckets / span`) overflowed `i64` once the window exceeded ~35 days at
+        // `buckets = 3000` (`span * buckets > i64::MAX`). A 90-day window at the max bucket count
+        // exercises exactly that overflow through the real `query_series` → `series_sql_agg` →
+        // `bucket_index_expr` DataFusion path (not just the pure-Rust `bucket_math` unit tests).
+        const NS_PER_DAY: i64 = 24 * 3600 * 1_000_000_000;
+        let end = 90 * NS_PER_DAY;
+        let buckets = 3000usize;
+        assert!(
+            end.checked_mul(buckets as i64).is_none(),
+            "window must be wide enough to have overflowed the old multiply-first formula"
+        );
+
+        let schema = MetricSchema::new(&["service.name".to_string()]);
+        let mut b = MetricBatchBuilder::new(&schema);
+        for p in [
+            gpoint("g", "a", 0, 10.0),
+            gpoint("g", "a", end / 2, 20.0),
+            gpoint("g", "a", end, 30.0),
+        ] {
+            b.append(&p);
+        }
+        let batch = b.finish().unwrap();
+        let engine = MetricsQueryEngine::from_batch(schema, batch);
+
+        let res = engine
+            .query_series(MetricSeriesRequest {
+                metric: "g".into(),
+                agg: Some(Agg::Avg),
+                group_by: vec![],
+                filter: None,
+                start_ts_nanos: 0,
+                end_ts_nanos: end,
+                buckets,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(res.series.len(), 1);
+        let pts = &res.series[0].points;
+        assert_eq!(pts.len(), buckets);
+        assert_eq!(
+            pts[0].v,
+            Some(10.0),
+            "row at window start lands in bucket 0"
+        );
+        assert_eq!(
+            pts[buckets - 1].v,
+            Some(30.0),
+            "row at window end lands in the last bucket"
+        );
     }
 }
 

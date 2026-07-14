@@ -113,6 +113,14 @@ the per-feature docs in [`subsystems/`](subsystems/).
    bloom-pruned then confirmed with a `strpos(body, text) > 0` substring scan — **there is no
    inverted index.**
 
+Every engine's `SessionContext` (the shared `session()` factory in `photon-query/src/lib.rs`) carries
+a **bounded DataFusion memory pool** (`GreedyMemoryPool`, `QUERY_MEMORY_POOL_BYTES` = 512 MiB). Its
+job is to keep the intrinsically-unbounded query paths — a facet `GROUP BY value` on a
+high-cardinality field (holds every distinct value in a hash table before the `LIMIT`) and the
+metrics pointwise/distribution scans (`filter → sort → collect()` every matching row, then cap at
+`MAX_SERIES`) — **fail-loud** (`ResourcesExhausted`) instead of OOM-killing a low-memory single node.
+It is not a config surface yet; a future change could make it per-deployment tunable.
+
 Per-signal engines:
 
 - **Logs — `QueryEngine`:** `search`/`search_with_count` (two-pass late materialization),
@@ -200,8 +208,11 @@ bodies, so streaming is never buffered.
 
 - **No inverted index.** Pruning is min/max stats + token bloom filters (kilobytes/file). Bloom
   filters may false-**positive** (extra scan) but **never false-negative** — pruning can only add
-  work, never drop a real result. This is a property test; keep pruning conservative (a missing
-  `.idx` or an unknown range means _keep the file_).
+  work, never drop a real result. This is a property test; keep pruning conservative (a missing,
+  unreadable, or corrupt `.idx`, or an unknown range, means _keep the file_ — a torn sidecar can
+  never drop a real result, abort the query, or panic; `idx_binary::decode` rejects the frames
+  that used to divide-by-zero in the bloom, and every `keep_candidate` keeps on any read/decode
+  error, not just `NotFound`).
 - **Local disk is the primary store**; the S3 durable store is an async replica, never on the ack or
   query path. Ingest acks after the local WAL `fsync`, not after durable upload.
 - **Rows are sorted by the signal's sort key before Parquet encoding** (logs `(service.name,

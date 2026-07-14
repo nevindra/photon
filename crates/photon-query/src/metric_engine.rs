@@ -3,6 +3,7 @@
 //! → `read_parquet(surviving, schema)`. Mirrors `QueryEngine::prune`/`survivors_df` and the spans
 //! `trace_id`-bloom path, differing only in the single-token (`metric_name`) bloom check.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -19,6 +20,7 @@ use photon_index::SkipIndex;
 use photon_storage::Storage;
 
 use crate::metric_predicate::metric_resolved_query_to_expr;
+use crate::metric_query::ProbeMeta;
 use crate::{cached_manifest, col_ref, session, ManifestCache};
 
 #[derive(Clone)]
@@ -31,11 +33,30 @@ pub struct MetricsQueryEngine {
     /// `MetricsQueryEngine::clone` — taken to move into `spawn_blocking` — shares the same cache
     /// rather than forking it.
     manifest_cache: Arc<RwLock<Option<ManifestCache>>>,
+    /// See `MetricMetaCache`. Read on every `metric_query::query_series` probe, written only on a
+    /// cache miss; `Arc`-wrapped for the same clone-sharing reason as `manifest_cache`.
+    metric_meta_cache: Arc<RwLock<Option<MetricMetaCache>>>,
+    /// Test-only instrument: counts real `metric_meta_probe` calls, so a test can assert a second
+    /// `query_series` call for the same metric didn't re-probe (cache hit) without reaching into
+    /// cache internals.
+    #[cfg(test)]
+    pub(crate) probe_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// Test-only seam: when set, `survivors_df` serves this in-memory batch (registered as the
     /// `metrics` table) instead of pruning + reading Parquet, so the SQL query path
     /// (`metric_query::query_series`) can be unit-tested without running a compaction.
     #[cfg(test)]
     test_batch: Option<RecordBatch>,
+}
+
+/// Cached per-metric probe metadata (type/temporality/monotonicity/unit), invalidated by manifest
+/// `Arc` pointer-equality — the same rule `crate::ServicesCache` (`lib.rs`) uses for the
+/// distinct-services cache. A metric's type/temporality/monotonicity/unit is stable, so once probed
+/// for a manifest generation it never needs re-probing; there is no "confirmed absent" entry — a
+/// metric not (yet) in `entries` (new/unseen, or a prior probe found no rows for it in that window)
+/// is always probed fresh, never assumed absent.
+struct MetricMetaCache {
+    manifest: Arc<Manifest>,
+    entries: HashMap<String, ProbeMeta>,
 }
 
 /// A pruned metrics read: one metric name, a time window, and an optional compiled label filter.
@@ -79,6 +100,9 @@ impl MetricsQueryEngine {
             hot_dir,
             schema,
             manifest_cache: Arc::new(RwLock::new(None)),
+            metric_meta_cache: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            probe_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             test_batch: None,
         })
@@ -92,6 +116,8 @@ impl MetricsQueryEngine {
             hot_dir: PathBuf::from("/nonexistent-metric-query-test"),
             schema,
             manifest_cache: Arc::new(RwLock::new(None)),
+            metric_meta_cache: Arc::new(RwLock::new(None)),
+            probe_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             test_batch: Some(batch),
         }
     }
@@ -162,6 +188,50 @@ impl MetricsQueryEngine {
         cached_manifest(&path, &self.manifest_cache)
     }
 
+    /// Cached per-metric probe lookup, scoped to the manifest `Arc` passed in — mirrors
+    /// `distinct_services`' use of `ServicesCache` in `lib.rs`. Returns `None` on any miss: either
+    /// the cache is stale (the manifest changed under us — new segments could have introduced or
+    /// changed the metric) or the metric simply hasn't been probed yet this generation. A `None`
+    /// here is never a signal that the metric doesn't exist — callers must run `metric_meta_probe`
+    /// and record a `Some` result with `cache_metric_meta`.
+    pub(crate) fn cached_metric_meta(
+        &self,
+        manifest: &Arc<Manifest>,
+        metric: &str,
+    ) -> Option<ProbeMeta> {
+        let guard = self.metric_meta_cache.read().unwrap();
+        let cache = guard.as_ref()?;
+        if !Arc::ptr_eq(&cache.manifest, manifest) {
+            return None;
+        }
+        cache.entries.get(metric).cloned()
+    }
+
+    /// Record a freshly-probed metric's metadata for `manifest`'s generation. A cache built under
+    /// an earlier manifest `Arc` is replaced wholesale rather than merged into — the same
+    /// generation-replace behavior `distinct_services` uses when it writes a fresh `ServicesCache`.
+    pub(crate) fn cache_metric_meta(
+        &self,
+        manifest: &Arc<Manifest>,
+        metric: &str,
+        meta: ProbeMeta,
+    ) {
+        let mut guard = self.metric_meta_cache.write().unwrap();
+        match guard.as_mut() {
+            Some(cache) if Arc::ptr_eq(&cache.manifest, manifest) => {
+                cache.entries.insert(metric.to_string(), meta);
+            }
+            _ => {
+                let mut entries = HashMap::new();
+                entries.insert(metric.to_string(), meta);
+                *guard = Some(MetricMetaCache {
+                    manifest: manifest.clone(),
+                    entries,
+                });
+            }
+        }
+    }
+
     /// Manifest time-overlap → per-file `metric_name` bloom → surviving absolute Parquet paths.
     /// Conservative: a missing `.idx` keeps the file, so pruning can only ever drop files that
     /// definitely cannot match — never a real result. Runs synchronous `std::fs` I/O (call under
@@ -186,9 +256,10 @@ impl MetricsQueryEngine {
     /// Decide whether a candidate file survives pruning. `manifest.candidates()` already filtered
     /// on time overlap; the extra pruning power is the `metric_name` bloom — a single-token check,
     /// like the spans `trace_id` bloom — plus, when a host is requested, the skip-index `host.name`
-    /// range. A missing `.idx` keeps the file (correctness over pruning); any other I/O error is
-    /// surfaced. Host pruning is conservative: an unknown host range keeps the file, so pruning can
-    /// only ever drop files that provably cannot match — never a real result.
+    /// range. A missing, unreadable, OR corrupt `.idx` keeps the file (correctness over pruning) —
+    /// a torn sidecar never aborts the query or panics. Host pruning is conservative: an unknown
+    /// host range keeps the file, so pruning can only ever drop files that provably cannot match —
+    /// never a real result.
     fn keep_candidate(
         &self,
         entry: &FileEntry,
@@ -202,13 +273,24 @@ impl MetricsQueryEngine {
             Ok(b) => b,
             // No sidecar → cannot bloom-check → keep the file.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            // Any other read error → also keep, never abort the query (log once per bad file).
             Err(e) => {
-                return Err(PhotonError::Query(format!(
-                    "failed to read metrics skip index {idx_path:?}: {e}"
-                )))
+                eprintln!(
+                    "photon-query: warning: keeping {idx_path:?}, metrics skip index unreadable: {e}"
+                );
+                return Ok(true);
             }
         };
-        let index = SkipIndex::from_bytes(&bytes)?;
+        let index = match SkipIndex::from_bytes(&bytes) {
+            Ok(index) => index,
+            // Corrupt/undecodable sidecar → keep the file (same rule as a missing one).
+            Err(e) => {
+                eprintln!(
+                    "photon-query: warning: keeping {idx_path:?}, metrics skip index corrupt: {e}"
+                );
+                return Ok(true);
+            }
+        };
         if !index.might_contain_token(metric) {
             return Ok(false);
         }
@@ -301,14 +383,18 @@ impl MetricsQueryEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
     use object_store::local::LocalFileSystem;
     use photon_compact::MetricsCompactor;
+    use photon_core::metric_agg::Agg;
     use photon_core::metric_record::{MetricBatchBuilder, MetricPoint};
     use photon_core::segment::SegmentId;
     use photon_storage::{Replicator, Storage};
     use photon_wal::Wal;
+
+    use crate::MetricSeriesRequest;
 
     /// Minimal in-memory WAL that hands the compactor pre-built segments, so the test controls
     /// segment ids (and therefore the on-disk `data-metrics/<stem>.{parquet,idx}` stems)
@@ -565,6 +651,143 @@ mod tests {
             engine.prune(&req).unwrap().len(),
             1,
             "missing .idx must keep the file"
+        );
+    }
+
+    /// Direct unit test on the cache primitives (audit item 9 / Task 7): a cached lookup must
+    /// return exactly what a fresh probe would, and a manifest change (new segment compacted) must
+    /// invalidate the cached entry — proven by pointer-inequality between the manifest `Arc` before
+    /// and after, and a subsequent `cached_metric_meta` miss under the new `Arc`.
+    #[tokio::test]
+    async fn cached_metric_meta_matches_fresh_probe_and_invalidates_on_manifest_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().to_path_buf();
+        let schema = MetricSchema::new(&["service.name".to_string(), "host.name".to_string()]);
+        compact(
+            &hot,
+            &schema,
+            vec![(SegmentId(0), vec![batch(&schema, &[point("g", 0)])])],
+        )
+        .await;
+        let engine = MetricsQueryEngine::new(hot.clone(), schema.clone()).unwrap();
+        let req = MetricRequest {
+            metric: "g".to_string(),
+            start_ts_nanos: 0,
+            end_ts_nanos: 200,
+            filter: None,
+            host: None,
+        };
+
+        // First call: cache miss, populates the cache as a side effect.
+        let first = engine
+            .metric_meta_probe_cached(&req)
+            .await
+            .unwrap()
+            .unwrap();
+        // Second call: must be a genuine cache hit (no unseen-metric fallback path involved).
+        let cached = engine
+            .metric_meta_probe_cached(&req)
+            .await
+            .unwrap()
+            .unwrap();
+        // Bypass the cache entirely for a ground-truth comparison.
+        let fresh = engine.metric_meta_probe(&req).await.unwrap().unwrap();
+        assert_eq!(
+            first, fresh,
+            "the first (uncached) probe must match a raw fresh probe"
+        );
+        assert_eq!(
+            cached, fresh,
+            "a cached probe must equal a fresh probe for the same metric+manifest generation"
+        );
+
+        let manifest_before = engine.load_metrics_manifest().unwrap();
+        assert!(
+            engine.cached_metric_meta(&manifest_before, "g").is_some(),
+            "the probe above must have populated the cache for the current manifest generation"
+        );
+
+        // Compact a new segment: the manifest file changes on disk, so the next
+        // `load_metrics_manifest` call must allocate a fresh `Arc<Manifest>`.
+        compact(
+            &hot,
+            &schema,
+            vec![(SegmentId(1), vec![batch(&schema, &[point("g", 150)])])],
+        )
+        .await;
+        let manifest_after = engine.load_metrics_manifest().unwrap();
+        assert!(
+            !Arc::ptr_eq(&manifest_before, &manifest_after),
+            "compacting a new segment must allocate a fresh manifest Arc"
+        );
+        assert!(
+            engine.cached_metric_meta(&manifest_after, "g").is_none(),
+            "a manifest-Arc change must invalidate the cached entry (never serve stale meta)"
+        );
+    }
+
+    /// End-to-end proof that `query_series` (metric_query.rs) actually skips the redundant probe on
+    /// a cache hit, and re-probes once the manifest changes — the behavior audit item 9 asks for.
+    /// Uses the `probe_calls` test instrument (incremented inside `metric_meta_probe` itself) so the
+    /// assertion doesn't depend on cache internals.
+    #[tokio::test]
+    async fn query_series_caches_metric_meta_across_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().to_path_buf();
+        let schema = MetricSchema::new(&["service.name".to_string(), "host.name".to_string()]);
+        compact(
+            &hot,
+            &schema,
+            vec![(
+                SegmentId(0),
+                vec![batch(&schema, &[point("g", 0), point("g", 100)])],
+            )],
+        )
+        .await;
+        let engine = MetricsQueryEngine::new(hot.clone(), schema.clone()).unwrap();
+
+        let req = || MetricSeriesRequest {
+            metric: "g".to_string(),
+            agg: Some(Agg::Avg),
+            group_by: vec![],
+            filter: None,
+            start_ts_nanos: 0,
+            end_ts_nanos: 200,
+            buckets: 2,
+        };
+
+        let first = engine.query_series(req()).await.unwrap();
+        assert_eq!(
+            engine.probe_calls.load(Ordering::SeqCst),
+            1,
+            "the first query_series call must probe exactly once"
+        );
+
+        let second = engine.query_series(req()).await.unwrap();
+        assert_eq!(
+            engine.probe_calls.load(Ordering::SeqCst),
+            1,
+            "a second call for the same metric within the same manifest generation must hit the \
+             cache, not re-probe"
+        );
+        assert_eq!(
+            first.series, second.series,
+            "caching the probe must never change the query result"
+        );
+
+        // Compacting a new segment rewrites the manifest, allocating a fresh `Arc<Manifest>` — the
+        // cache's pointer-equality guard must treat that as a new generation and probe again.
+        compact(
+            &hot,
+            &schema,
+            vec![(SegmentId(1), vec![batch(&schema, &[point("g", 150)])])],
+        )
+        .await;
+        engine.query_series(req()).await.unwrap();
+        assert_eq!(
+            engine.probe_calls.load(Ordering::SeqCst),
+            2,
+            "a manifest change must invalidate the cache and probe again"
         );
     }
 

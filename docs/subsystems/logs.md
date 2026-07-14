@@ -57,7 +57,13 @@ DataFusion) and compiled two ways — to an in-memory predicate (`eval`) and to 
 
 Terms are **AND**-ed. Parse errors carry a byte `offset` so the UI can underline the bad token. Free-
 text is bloom-pruned then confirmed with a `strpos(body, text) > 0` substring scan — **no inverted
-index**. The frontend has a display-only mirror in `frontend/src/lib/queryLang.js` (never validates).
+index**. Because the row match is *substring*, only the **interior** tokens of the search string —
+those with a delimiter on **both** sides *within the query* (`photon_index::interior_tokens`, shared
+by the logs `text_tokens` and the spans `span_text_tokens`) — may drive bloom pruning: an edge token
+could be a fragment of a longer body word (`tim` ⊂ `timeout`), so bloom-testing it would false-
+*negative*. A single-word search therefore contributes no bloom token and is confirmed entirely by the
+row predicate — correctness (never drop a real result) over pruning power. The frontend has a
+display-only mirror in `frontend/src/lib/queryLang.js` (never validates).
 
 ## UI
 

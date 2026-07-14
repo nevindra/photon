@@ -47,7 +47,12 @@ impl SpanQueryEngine {
         req: SpanQueryRequest,
         buckets: usize,
     ) -> Result<LatencyHistogram, PhotonError> {
-        let buckets = buckets.max(1);
+        // Defense-in-depth: this is THE [P1 · DoS] repro (`GET /api/traces/latency?buckets=…`) —
+        // a huge `buckets` here would otherwise drive `vec![0u64; buckets]` below to a
+        // multi-gigabyte allocation. Mirrors `photon-api`'s `MAX_BUCKETS`
+        // (`crates/photon-api/src/query_params.rs`); `photon-query` can't depend on `photon-api`,
+        // so the value is restated here as a literal.
+        let buckets = buckets.clamp(1, 3000);
         let df = match self.span_survivors_df(&req).await? {
             None => return Ok(empty_latency_histogram()),
             Some(df) => df,
@@ -343,5 +348,126 @@ mod tests {
         assert_eq!(out.p50, 0);
         assert_eq!(out.p90, 0);
         assert_eq!(out.p99, 0);
+    }
+}
+
+/// End-to-end coverage of the public `SpanQueryEngine::latency` entry point — the literal
+/// `[P1 · DoS]` repro (`GET /api/traces/latency?buckets=2000000000`) — against a real compacted
+/// span (not just the private `latency_over` helper, which the defensive clamp sits above). A
+/// span with a positive duration is required: on an empty store `latency` short-circuits to an
+/// empty histogram before the bucket allocation ever runs, which would hide a broken clamp.
+#[cfg(test)]
+mod engine_tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use arrow::record_batch::RecordBatch;
+    use object_store::local::LocalFileSystem;
+    use photon_compact::SpanCompactor;
+    use photon_core::segment::SegmentId;
+    use photon_core::span_record::{SpanBatchBuilder, SpanRecord};
+    use photon_core::span_schema::SpanSchema;
+    use photon_core::PhotonError;
+    use photon_storage::{Replicator, Storage};
+    use photon_wal::Wal;
+
+    use crate::{SpanQueryEngine, SpanQueryRequest, SpanSort};
+
+    /// Minimal in-memory WAL handing the compactor one pre-built segment, mirroring the
+    /// `FakeWal` fixtures in `infra.rs`/`metric_classic_hist.rs`.
+    struct FakeWal {
+        segments: Mutex<Vec<(SegmentId, Vec<RecordBatch>)>>,
+    }
+    #[allow(clippy::manual_async_fn)]
+    impl Wal for FakeWal {
+        fn append(
+            &self,
+            _b: RecordBatch,
+        ) -> impl std::future::Future<Output = Result<(), PhotonError>> + Send {
+            async move { unimplemented!() }
+        }
+        fn sync(&self) -> impl std::future::Future<Output = Result<(), PhotonError>> + Send {
+            async move { unimplemented!() }
+        }
+        fn list_closed_segments(&self) -> Result<Vec<SegmentId>, PhotonError> {
+            let mut ids: Vec<SegmentId> = self
+                .segments
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort();
+            Ok(ids)
+        }
+        fn read_segment(
+            &self,
+            id: SegmentId,
+        ) -> impl std::future::Future<Output = Result<Vec<RecordBatch>, PhotonError>> + Send
+        {
+            let batches = self
+                .segments
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(sid, _)| *sid == id)
+                .map(|(_, b)| b.clone())
+                .unwrap_or_default();
+            async move { Ok(batches) }
+        }
+        fn remove_segment(&self, id: SegmentId) -> Result<(), PhotonError> {
+            self.segments.lock().unwrap().retain(|(sid, _)| *sid != id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_method_clamps_a_dos_sized_bucket_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().to_path_buf();
+        let schema = SpanSchema::new(&["service.name".to_string()]);
+
+        let mut attributes = BTreeMap::new();
+        attributes.insert("service.name".to_string(), "api".to_string());
+        let mut b = SpanBatchBuilder::new(&schema);
+        b.append(&SpanRecord {
+            trace_id: "t1".into(),
+            span_id: "s1".into(),
+            name: Some("op".into()),
+            start_time_nanos: 10,
+            duration_nanos: Some(5_000_000),
+            attributes,
+            ..Default::default()
+        });
+        let batch = b.finish().unwrap();
+
+        let storage = Storage {
+            hot: Arc::new(LocalFileSystem::new_with_prefix(&hot).unwrap()),
+            durable: None,
+            hot_dir: Some(hot.clone()),
+        };
+        let wal = Arc::new(FakeWal {
+            segments: Mutex::new(vec![(SegmentId(0), vec![batch])]),
+        });
+        let replicator = Arc::new(Replicator::new(storage.clone()));
+        let compactor = SpanCompactor::new(wal, storage, replicator, schema.clone());
+        while compactor.run_once().await.unwrap().is_some() {}
+
+        let engine = SpanQueryEngine::new(hot, schema).unwrap();
+        let req = SpanQueryRequest {
+            start_ts_nanos: 0,
+            end_ts_nanos: 1_000_000_000,
+            query: None,
+            sort: SpanSort::Recent,
+            limit: 0,
+            offset: 0,
+            projected_attributes: Vec::new(),
+        };
+        let out = engine.latency(req, 10_000_000).await.unwrap();
+        assert!(
+            out.buckets.len() <= 3000,
+            "buckets must be clamped to MAX_BUCKETS, got {}",
+            out.buckets.len()
+        );
     }
 }

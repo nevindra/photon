@@ -185,13 +185,20 @@ impl SkipIndex {
 
     /// Decode a `.idx` blob. Tries the binary format first (magic-byte gated); falls back
     /// to the older serde_json format so `.idx` sidecars written by pre-binary-format
-    /// builds keep loading. Any other input is a genuine error — the query side already
-    /// treats an unreadable `.idx` as "keep the file" (conservative pruning).
+    /// builds keep loading. Any other input — garbage, a truncated blob, or a well-framed/
+    /// well-formed blob whose bloom fields are corrupt (`num_bits == 0`, a `bits` length
+    /// that disagrees with `num_bits`) — is a genuine `PhotonError::Index`, never a panic,
+    /// on EITHER decode path (both call `Bloom::validate` before returning `Ok`). The query
+    /// side treats an unreadable OR undecodable `.idx` as "keep the file" (conservative
+    /// pruning), so a torn sidecar can only ever add scan work, never drop a real result.
     pub fn from_bytes(b: &[u8]) -> Result<SkipIndex, PhotonError> {
         if idx_binary::has_magic(b) {
             return idx_binary::decode(b);
         }
-        serde_json::from_slice(b).map_err(|e| PhotonError::Index(e.to_string()))
+        let index: SkipIndex =
+            serde_json::from_slice(b).map_err(|e| PhotonError::Index(e.to_string()))?;
+        index.bloom.validate()?;
+        Ok(index)
     }
 }
 
@@ -309,6 +316,14 @@ mod idx_binary {
         let bits_len = cur.u64()? as usize;
         let bits = cur.take(bits_len)?.to_vec();
         let bloom = Bloom::from_raw_parts(num_bits, num_hashes, bits);
+        // Validate the bloom framing BEFORE returning it. `Bloom::index_for` computes
+        // `idx % num_bits` — a divide-by-zero panic when `num_bits == 0` — and `might_contain`
+        // indexes `bits[idx / 8]`, which is out of bounds when the bit vector is shorter than the
+        // `num_bits` the header claims. A well-framed-but-corrupt sidecar (torn write, bit-rot)
+        // must therefore decode to a clean `PhotonError::Index` — which the query side turns into
+        // "keep the file" — never a query-time panic. `num_hashes` needs no check: it only bounds
+        // an iteration count, never indexes.
+        bloom.validate()?;
 
         let timestamp_range = if cur.u8()? == 1 {
             Some((cur.i64()?, cur.i64()?))
@@ -713,6 +728,97 @@ mod tests {
         bytes.truncate(bytes.len() / 2); // still has the magic, but is cut off mid-payload
         let err = SkipIndex::from_bytes(&bytes).unwrap_err();
         assert!(matches!(err, PhotonError::Index(_)));
+    }
+
+    /// Hand-frame a v2 `.idx` blob with a caller-chosen `num_bits` and `bits` payload, all
+    /// ranges absent. Used to synthesize the well-framed-but-corrupt bloom sidecars that must
+    /// decode to an error instead of a query-time panic.
+    fn framed_blob(num_bits: u64, bits: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"PXSK");
+        b.push(2); // version
+        b.extend_from_slice(&num_bits.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes()); // num_hashes
+        b.extend_from_slice(&(bits.len() as u64).to_le_bytes()); // bits_len
+        b.extend_from_slice(bits);
+        b.push(0); // has_timestamp = 0
+        b.push(0); // has_service = 0
+        b.push(0); // has_host = 0
+        b
+    }
+
+    #[test]
+    fn zero_num_bits_sidecar_decodes_to_err_not_a_query_time_panic() {
+        // A well-framed sidecar claiming num_bits = 0. Before the decode hardening this built a
+        // poisoned bloom, and the FIRST membership probe divided by zero (`idx % 0`). decode must
+        // reject it as an Index error — which the query side turns into "keep the file".
+        let blob = framed_blob(0, &[]);
+        match SkipIndex::from_bytes(&blob) {
+            Err(PhotonError::Index(_)) => {} // expected after the fix
+            Err(other) => panic!("wrong error variant: {other:?}"),
+            Ok(index) => {
+                // Reachable only on the UNFIXED path; this probe is exactly what panicked at
+                // query time (kept so the RED run reproduces the real divide-by-zero, not just a
+                // wrong-Result assertion).
+                let _ = index.might_contain_token("x");
+                panic!("decode accepted a num_bits=0 sidecar (should be rejected)");
+            }
+        }
+    }
+
+    #[test]
+    fn bits_shorter_than_num_bits_decodes_to_err_not_a_query_time_panic() {
+        // num_bits = 8 needs one byte of bit vector, but the sidecar carries zero. Before the fix
+        // `might_contain` indexed `bits[idx / 8]` on an empty vector → out-of-bounds panic. decode
+        // must reject the framing mismatch.
+        let blob = framed_blob(8, &[]);
+        match SkipIndex::from_bytes(&blob) {
+            Err(PhotonError::Index(_)) => {} // expected after the fix
+            Err(other) => panic!("wrong error variant: {other:?}"),
+            Ok(index) => {
+                let _ = index.might_contain_token("probe");
+                panic!("decode accepted a bits-too-short sidecar (should be rejected)");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_json_sidecar_with_poisoned_bloom_decodes_to_err_not_a_panic() {
+        // Simulates a LEGACY (pre-binary-format) `.idx` sidecar that has bit-rotted so the JSON
+        // stays syntactically valid but the bloom's `num_bits` is 0 — reached via the
+        // `serde_json::from_slice` fallback branch of `from_bytes`, NOT the binary `idx_binary`
+        // path. Before this fix that branch reconstructed a `Bloom` straight from JSON with no
+        // validation, so the first membership probe below divided by zero (`idx % num_bits`).
+        let json = r#"{"bloom":{"bits":[],"num_bits":0,"num_hashes":1},"timestamp_range":null,"service_range":null,"host_range":null}"#;
+        match SkipIndex::from_bytes(json.as_bytes()) {
+            Err(PhotonError::Index(_)) => {} // expected after the fix
+            Err(other) => panic!("wrong error variant: {other:?}"),
+            Ok(index) => {
+                // Reachable only on the UNFIXED path; this probe is exactly what panicked at
+                // query time (kept so the RED run reproduces the real divide-by-zero, not just a
+                // wrong-Result assertion).
+                let _ = index.might_contain_token("x");
+                panic!("from_bytes accepted a legacy JSON sidecar with num_bits=0 (should be rejected)");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_json_sidecar_with_bits_shorter_than_num_bits_decodes_to_err_not_a_panic() {
+        // Same legacy serde_json fallback branch, but the framing mismatch shape: num_bits = 8
+        // (needs one byte of bit vector) while `bits` is empty. Before this fix, `might_contain`
+        // would index `bits[idx / 8]` on an empty vector → out-of-bounds panic.
+        let json = r#"{"bloom":{"bits":[],"num_bits":8,"num_hashes":1},"timestamp_range":null,"service_range":null,"host_range":null}"#;
+        match SkipIndex::from_bytes(json.as_bytes()) {
+            Err(PhotonError::Index(_)) => {} // expected after the fix
+            Err(other) => panic!("wrong error variant: {other:?}"),
+            Ok(index) => {
+                let _ = index.might_contain_token("probe");
+                panic!(
+                    "from_bytes accepted a legacy JSON sidecar with bits too short (should be rejected)"
+                );
+            }
+        }
     }
 
     #[test]

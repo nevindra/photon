@@ -11,6 +11,31 @@ use photon_core::query::{
 };
 use photon_query::{QueryRequest, SpanQueryRequest, SpanSort};
 
+/// Shared DoS-hardening ceiling for any `buckets` (histogram/timeseries bucket count) query
+/// param — a request for e.g. `buckets=2000000000` would otherwise allocate a proportionally huge
+/// `Vec` before any query even runs. `photon-query`'s engine methods re-state this same value
+/// (`3000`) inline as a defensive second layer, since that crate can't depend on this one.
+pub const MAX_BUCKETS: usize = 3000;
+
+/// Clamp a caller-supplied `buckets` param to `[1, MAX_BUCKETS]`. Silent clamp (not a 400) —
+/// matches `metrics.rs`'s pre-existing `buckets_for`. `0` has no meaning of its own for a bucket
+/// count (every engine already treats it as `1`), so flooring at `1` changes nothing observable.
+pub fn clamp_buckets(n: usize) -> usize {
+    n.clamp(1, MAX_BUCKETS)
+}
+
+/// Shared ceiling for any `limit` (facet/search row-count) query param — reuses the value already
+/// enforced ad hoc by `build_span_query_request` below.
+pub const MAX_LIMIT: usize = 1000;
+
+/// Clamp a caller-supplied `limit` param to at most `MAX_LIMIT`. Unlike [`clamp_buckets`], this
+/// does NOT floor at `1`: a `limit` of `0` is a pre-existing, legitimate input for both facet and
+/// search (it asks for zero rows/values — there is no "unlimited" sentinel anywhere in this
+/// codebase), so only the upper bound is new.
+pub fn clamp_limit(n: usize) -> usize {
+    n.min(MAX_LIMIT)
+}
+
 /// A bad request param, with an optional character offset (set for grammar parse errors so the UI
 /// can underline the offending character).
 #[derive(Debug)]
@@ -119,7 +144,8 @@ pub(crate) fn parse_sort(s: &str) -> SpanSort {
 
 /// Build a `SpanQueryRequest` for a spans/traces endpoint from the shared params. Unlike
 /// [`build_query_request`] (logs aggregations, which never page), spans searches are paged, so
-/// `sort`/`limit`/`offset` are caller-supplied rather than zeroed; `limit` is clamped to 1000.
+/// `sort`/`limit`/`offset` are caller-supplied rather than zeroed; `limit` is clamped to
+/// `MAX_LIMIT`.
 pub(crate) fn build_span_query_request(
     query: &str,
     start: &str,
@@ -136,10 +162,35 @@ pub(crate) fn build_span_query_request(
         end_ts_nanos,
         query: resolved,
         sort: parse_sort(sort),
-        limit: limit.min(1000),
+        limit: limit.min(MAX_LIMIT),
         offset,
         projected_attributes: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+
+    #[test]
+    fn clamp_buckets_caps_a_dos_sized_request_and_floors_zero() {
+        // The headline [P1 · DoS] repro: `buckets=2000000000` would otherwise drive a ~16 GB
+        // allocation before any query even runs.
+        assert_eq!(clamp_buckets(2_000_000_000), MAX_BUCKETS);
+        assert_eq!(clamp_buckets(0), 1); // matches every engine's pre-existing `.max(1)`
+        assert_eq!(clamp_buckets(48), 48); // in-range unchanged
+        assert_eq!(clamp_buckets(MAX_BUCKETS), MAX_BUCKETS); // exactly at the cap unchanged
+    }
+
+    #[test]
+    fn clamp_limit_caps_a_dos_sized_request_but_preserves_zero() {
+        assert_eq!(clamp_limit(999_999_999), MAX_LIMIT);
+        // Unlike buckets, `limit=0` already means "zero rows/values" today (there is no
+        // "unlimited" sentinel) — the clamp must not turn it into 1.
+        assert_eq!(clamp_limit(0), 0);
+        assert_eq!(clamp_limit(50), 50); // in-range unchanged
+        assert_eq!(clamp_limit(MAX_LIMIT), MAX_LIMIT); // exactly at the cap unchanged
+    }
 }
 
 #[cfg(test)]

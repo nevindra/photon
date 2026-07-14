@@ -6,7 +6,7 @@ use arrow::array::{Array, Int32Array, Int64Array};
 use arrow::datatypes::DataType;
 use datafusion::dataframe::DataFrame;
 use datafusion::functions_aggregate::expr_fn::count;
-use datafusion::prelude::{cast, lit, when, Expr};
+use datafusion::prelude::{cast, lit, Expr};
 
 use photon_core::span_schema;
 use photon_core::PhotonError;
@@ -32,7 +32,10 @@ impl SpanQueryEngine {
         req: SpanQueryRequest,
         buckets: usize,
     ) -> Result<Vec<SpanHistogramBucket>, PhotonError> {
-        let buckets = buckets.max(1);
+        // Defense-in-depth: mirrors `photon-api`'s `MAX_BUCKETS`
+        // (`crates/photon-api/src/query_params.rs`); `photon-query` can't depend on `photon-api`,
+        // so the value is restated here as a literal.
+        let buckets = buckets.clamp(1, 3000);
         let (start, end) = (req.start_ts_nanos, req.end_ts_nanos);
         match self.span_survivors_df(&req).await? {
             None => Ok(empty_buckets(start, end, buckets)),
@@ -76,18 +79,14 @@ async fn histogram_over(
     end: i64,
     buckets: usize,
 ) -> Result<Vec<SpanHistogramBucket>, PhotonError> {
-    let span = (end - start).max(1);
-    // bucket = ((start_time_nanos - start) * buckets) / span, integer division. All rows satisfy
-    // the predicate's `start_time_nanos BETWEEN start AND end`, so bucket ∈ [0, buckets]; a row
-    // at exactly `end` maps to `buckets`, which we clamp down to the last bucket.
+    // bucket = (start_time_nanos - start) / step, divide-first (see `crate::bucket_math`) so
+    // wide windows don't overflow i64 the way `(ts - start) * buckets / span` does past ~35 days
+    // at buckets = 3000. All rows satisfy the predicate's `start_time_nanos BETWEEN start AND
+    // end`, so bucket ∈ [0, buckets]; a row at exactly `end` maps to `buckets`, which the shared
+    // helper clamps to the last bucket.
     let start_time = cast(col_ref(span_schema::START_TIME), DataType::Int64);
-    let raw = (start_time - lit(start)) * lit(buckets as i64) / lit(span);
-    let bucket = when(
-        raw.clone().gt_eq(lit(buckets as i64)),
-        lit(buckets as i64 - 1),
-    )
-    .otherwise(raw)
-    .map_err(|e| PhotonError::Query(format!("span histogram bucket case: {e}")))?;
+    let bucket = crate::bucket_math::bucket_index_expr(start_time, start, end, buckets)
+        .map_err(|e| PhotonError::Query(format!("span histogram bucket case: {e}")))?;
 
     let batches = df
         .filter(predicate)
@@ -194,6 +193,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wide_window_bucket_index_does_not_overflow() {
+        // Regression for the i64-overflow bug: the old multiply-first bucket-index Expr
+        // (`(start_time - start) * buckets / span`) overflowed `i64` once the window exceeded
+        // ~35 days at `buckets = 3000` (`span * buckets > i64::MAX`). A 90-day window at the max
+        // bucket count exercises exactly that overflow through the real DataFusion `Expr` path.
+        const NS_PER_DAY: i64 = 24 * 3600 * 1_000_000_000;
+        let end = 90 * NS_PER_DAY;
+        let buckets = 3000usize;
+        assert!(
+            end.checked_mul(buckets as i64).is_none(),
+            "window must be wide enough to have overflowed the old multiply-first formula"
+        );
+
+        let records = vec![
+            span(0, Some(2)),       // window start -> bucket 0
+            span(end / 2, Some(1)), // mid window
+            span(end, None),        // window end -> last bucket
+        ];
+        let df = df_of(&records).await;
+        let out = histogram_over(df, lit_true(), 0, end, buckets)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), buckets);
+        assert_eq!(out[0].error, 1, "row at window start must land in bucket 0");
+        assert_eq!(
+            out[buckets - 1].unset,
+            1,
+            "row at window end must land in the last bucket"
+        );
+        assert_eq!(
+            out.iter().map(|b| b.total).sum::<u64>(),
+            3,
+            "no rows lost or duplicated across buckets"
+        );
+    }
+
+    #[tokio::test]
     async fn buckets_by_time_and_status() {
         // window [0, 100), 2 buckets → [0,50), [50,100]. Widths from bucket_start.
         let records = vec![
@@ -236,5 +272,23 @@ mod tests {
             out.iter().map(|b| b.t).collect::<Vec<_>>(),
             vec![0, 25, 50, 75]
         );
+    }
+
+    #[tokio::test]
+    async fn engine_method_clamps_a_dos_sized_bucket_count() {
+        // Defense-in-depth for the public `SpanQueryEngine::histogram` entry point itself.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SpanQueryEngine::new(dir.path().to_path_buf(), SpanSchema::new(&[])).unwrap();
+        let req = SpanQueryRequest {
+            start_ts_nanos: 0,
+            end_ts_nanos: 100,
+            query: None,
+            sort: crate::SpanSort::Recent,
+            limit: 0,
+            offset: 0,
+            projected_attributes: Vec::new(),
+        };
+        let out = engine.histogram(req, 10_000_000).await.unwrap();
+        assert_eq!(out.len(), 3000, "buckets must be clamped to MAX_BUCKETS");
     }
 }

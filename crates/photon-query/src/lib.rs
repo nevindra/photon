@@ -25,6 +25,8 @@ use std::time::SystemTime;
 
 use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
+use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{
     lit, lit_timestamp_nano, strpos, Column, Expr, ParquetReadOptions, SessionConfig,
     SessionContext,
@@ -34,11 +36,13 @@ use tokio::task::spawn_blocking;
 use photon_core::manifest::{Manifest, MANIFEST_OBJECT_PATH};
 use photon_core::schema::LogSchema;
 use photon_core::PhotonError;
-use photon_index::{tokenize, SkipIndex};
+use photon_index::{interior_tokens, SkipIndex};
 use photon_storage::Storage;
 
 mod predicate;
 pub use predicate::resolved_query_to_expr;
+
+mod bucket_math;
 
 mod count;
 mod facet;
@@ -132,8 +136,10 @@ pub struct QueryRequest {
     /// Empty means "any severity". Not used for file pruning (the skip index carries no
     /// severity stat), only as a row predicate.
     pub severities: Vec<(i32, i32)>,
-    /// Optional free-text filter. Tokenized with `photon_index::tokenize` for bloom pruning,
-    /// then confirmed per-row with a `strpos(body, text) > 0` substring match.
+    /// Optional free-text filter. Its *interior* (both-sides-delimited) tokens drive bloom
+    /// pruning via `photon_index::interior_tokens` — edge tokens are excluded because substring
+    /// semantics may match them as fragments of longer body words — then every row is confirmed
+    /// with a `strpos(body, text) > 0` substring match.
     pub text: Option<String>,
     /// Optional parsed+resolved grammar query. Compiled to a DataFusion predicate and ANDed
     /// with the structured filters above. `None` means no grammar filter.
@@ -422,9 +428,10 @@ impl QueryEngine {
     /// exact same skip-index range at write time (`Compactor::write_file`), so re-deriving them
     /// from the `.idx` sidecar here would just recompute values the manifest already carries.
     /// Only the bloom filter — which the manifest does not summarize — needs the `.idx` file,
-    /// and only when there is text to search. Conservative: a missing `.idx` (when a bloom
-    /// check is needed) keeps the file, so pruning can only ever drop files that definitely
-    /// cannot match — never a real result.
+    /// and only when there is text to search. Conservative: a missing, unreadable, OR corrupt
+    /// `.idx` (when a bloom check is needed) keeps the file — pruning can only ever drop files
+    /// that definitely cannot match, never a real result, and a torn sidecar never aborts the
+    /// search or panics.
     fn keep_candidate(
         &self,
         entry: &photon_core::manifest::FileEntry,
@@ -461,14 +468,23 @@ impl QueryEngine {
             Ok(b) => b,
             // No sidecar → cannot bloom-check → keep the file (correctness over pruning).
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            // Any OTHER read error (torn file, permissions, transient I/O) → also keep. A bad
+            // sidecar must never drop a real result or abort the whole search — pruning stays
+            // conservative. Log once per bad file (this runs once per candidate, not per row).
             Err(e) => {
-                return Err(PhotonError::Query(format!(
-                    "failed to read skip index {idx_path:?}: {e}"
-                )))
+                eprintln!("photon-query: warning: keeping {idx_path:?}, skip index unreadable: {e}");
+                return Ok(true);
             }
         };
-        let index = SkipIndex::from_bytes(&bytes)?;
-        Ok(index.might_contain_all(tokens))
+        match SkipIndex::from_bytes(&bytes) {
+            Ok(index) => Ok(index.might_contain_all(tokens)),
+            // Corrupt/undecodable sidecar → keep the file, same conservative rule as a missing one
+            // (decode already rejects the frames that used to panic the bloom at query time).
+            Err(e) => {
+                eprintln!("photon-query: warning: keeping {idx_path:?}, skip index corrupt: {e}");
+                Ok(true)
+            }
+        }
     }
 
     /// Distinct `service.name` values across the whole (unpruned — there is no time window)
@@ -482,14 +498,14 @@ impl QueryEngine {
     /// A file's skip-index only carries a `[min, max]` service range, not the exact distinct
     /// set, so — unlike `keep_candidate` — this cannot be answered from the manifest alone on a
     /// cache miss; scanning the actual columns is the only correct way to get the true set.
-    pub async fn distinct_services(&self) -> Result<Vec<String>, PhotonError> {
+    pub async fn distinct_services(&self) -> Result<Arc<Vec<String>>, PhotonError> {
         let manifest = self.load_manifest_async().await?;
         if manifest.entries().is_empty() {
-            return Ok(Vec::new());
+            return Ok(Arc::new(Vec::new()));
         }
         if let Some(cached) = self.services_cache.read().unwrap().as_ref() {
             if Arc::ptr_eq(&cached.manifest, &manifest) {
-                return Ok((*cached.services).clone());
+                return Ok(cached.services.clone());
             }
         }
 
@@ -538,7 +554,7 @@ impl QueryEngine {
             manifest,
             services: services.clone(),
         });
-        Ok((*services).clone())
+        Ok(services)
     }
 }
 
@@ -613,13 +629,21 @@ fn min_timestamp(batches: &[RecordBatch]) -> Option<i64> {
     min
 }
 
-/// The bloom-search tokens for a request: `req.text` plus every positive free-text term of the
-/// grammar query. `None` when there is nothing to search (so pruning skips the bloom check).
+/// The bloom-search tokens for a request: the *interior* (both-sides-delimited) tokens of `req.text`
+/// plus those of every positive free-text term of the grammar query. `None` when there is nothing
+/// safe to bloom-test (so pruning skips the bloom check and keeps the file).
+///
+/// Free-text search is *substring* (`strpos(body, text) > 0`), so only tokens delimited on both
+/// sides *within the search string itself* are guaranteed to appear as whole tokens in a matching
+/// body — see `photon_index::interior_tokens`. Bloom-testing an edge token (which may be a fragment
+/// of a longer body word, e.g. `tim` in `timeout`) would false-*negative* and silently drop a real
+/// result, violating the pruning-is-conservative invariant. A single-word search therefore
+/// contributes no bloom token and is confirmed entirely by the row predicate.
 pub(crate) fn text_tokens(req: &QueryRequest) -> Option<Vec<String>> {
-    let mut tokens: Vec<String> = req.text.as_deref().map(tokenize).unwrap_or_default();
+    let mut tokens: Vec<String> = req.text.as_deref().map(interior_tokens).unwrap_or_default();
     if let Some(rq) = &req.query {
         for t in rq.positive_freetext() {
-            tokens.extend(tokenize(t));
+            tokens.extend(interior_tokens(t));
         }
     }
     if tokens.is_empty() {
@@ -684,7 +708,32 @@ pub(crate) fn col_ref(name: &str) -> Expr {
 ///   so the two are set together.
 /// - `metadata_size_hint`: speculatively fetch the last 512KiB of each file in one read instead
 ///   of a separate footer-length round trip followed by a second read for the metadata.
+///
+/// It also installs a **bounded** [`GreedyMemoryPool`] (`QUERY_MEMORY_POOL_BYTES`) on the
+/// `RuntimeEnv`, so the RAM any single query's *tracked* operators may reserve is capped. This is
+/// the fail-loud guard for the unbounded-memory query paths — the facet `GROUP BY value` (holds
+/// every distinct value in a hash table before the `LIMIT` trims it) and the metrics
+/// pointwise/distribution scans (`filter → sort → collect()` every matching row) — which on a
+/// low-memory single node could otherwise OOM-kill the process. With the pool they error with a
+/// DataFusion `ResourcesExhausted` instead. Every engine shares this one factory (logs/spans/
+/// metrics), so the ceiling applies everywhere.
 pub(crate) fn session() -> SessionContext {
+    session_with_memory_pool_bytes(QUERY_MEMORY_POOL_BYTES)
+}
+
+/// Per-`SessionContext` DataFusion memory-pool budget, in bytes. 512 MiB: generous enough that
+/// any legitimate single-query working set fits (the whole `photon-query` test suite runs real
+/// queries on KB-scale data, orders of magnitude below this) yet small enough to cap a runaway
+/// high-cardinality query on a low-memory single node. There is no per-deployment config seam yet
+/// — `session()` is a zero-arg factory shared by every engine — so this is a deliberate constant
+/// for this pass; a future change could thread a configurable `[query].memory_pool_bytes` through
+/// the engine constructors.
+pub(crate) const QUERY_MEMORY_POOL_BYTES: usize = 512 * 1024 * 1024;
+
+/// [`session()`] with an explicit memory-pool budget — the seam `session()` delegates through, so
+/// tests can build a tiny-pool context and prove the unbounded paths fail loud (rather than having
+/// to actually allocate hundreds of MB). All the Parquet tuning above is applied identically.
+pub(crate) fn session_with_memory_pool_bytes(pool_bytes: usize) -> SessionContext {
     let config = SessionConfig::new()
         .set_bool(
             "datafusion.execution.parquet.schema_force_view_types",
@@ -696,7 +745,53 @@ pub(crate) fn session() -> SessionContext {
             "datafusion.execution.parquet.metadata_size_hint",
             512 * 1024,
         );
-    SessionContext::new_with_config(config)
+    // `build_arc` only fails if the default disk/cache managers can't initialize, which does not
+    // happen with the default config — hence `expect` rather than threading a Result through every
+    // engine's `session()` call site.
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
+        .build_arc()
+        .expect("RuntimeEnv with a memory pool builds under the default disk/cache config");
+    SessionContext::new_with_config_rt(config, runtime)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use datafusion::execution::memory_pool::MemoryConsumer;
+
+    /// Part 1 of the memory-bound fix: `session()` must ADD a bounded memory pool while
+    /// PRESERVING every existing Parquet tuning flag. A regression that dropped the flags (or
+    /// left the pool unbounded) is exactly the failure this pins.
+    #[test]
+    fn session_carries_parquet_tuning_and_a_bounded_memory_pool() {
+        let ctx = session();
+        let cfg = ctx.copied_config();
+        let parquet = &cfg.options().execution.parquet;
+
+        // Existing config — must be untouched by the memory-pool addition.
+        assert!(
+            !parquet.schema_force_view_types,
+            "Utf8 not Utf8View must be preserved"
+        );
+        assert!(parquet.pushdown_filters, "pushdown_filters must stay on");
+        assert!(parquet.reorder_filters, "reorder_filters must stay on");
+        assert_eq!(
+            parquet.metadata_size_hint,
+            Some(512 * 1024),
+            "metadata_size_hint must be preserved"
+        );
+
+        // New: a *bounded* pool. An `UnboundedMemoryPool` accepts any reservation; ours must
+        // reject one larger than its budget. `try_grow` is pure arithmetic — nothing is actually
+        // allocated — so probing the boundary is cheap even at the 512 MiB default.
+        let pool = ctx.runtime_env().memory_pool.clone();
+        let mut res = MemoryConsumer::new("session_bound_probe").register(&pool);
+        assert!(
+            res.try_grow(QUERY_MEMORY_POOL_BYTES + 1).is_err(),
+            "memory pool must be bounded (reject a reservation above its budget), not unbounded"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -757,5 +852,212 @@ mod storage_stats_tests {
         assert_eq!(s.min_ts_nanos, 100);
         assert_eq!(s.max_ts_nanos, 6000);
         assert_eq!(s.bytes, 350);
+    }
+}
+
+#[cfg(test)]
+mod text_token_pruning_tests {
+    //! `text_tokens` must return only *interior* (both-sides-delimited) tokens, and the bloom
+    //! step of `keep_candidate` (`might_contain_all`) must NEVER prune a file whose body actually
+    //! contains the search text as a substring. This guards the platform's #1 invariant: pruning
+    //! may false-*positive* but must never false-*negative*.
+    use super::*;
+    use photon_core::record::{LogRecord, RecordBatchBuilder};
+    use photon_core::schema::LogSchema;
+    use photon_index::SkipIndex;
+
+    fn req_text(text: &str) -> QueryRequest {
+        QueryRequest {
+            start_ts_nanos: 0,
+            end_ts_nanos: i64::MAX,
+            services: Vec::new(),
+            severities: Vec::new(),
+            text: Some(text.to_string()),
+            query: None,
+            limit: 10,
+        }
+    }
+
+    /// The safe (interior) tokens `text_tokens` derives for a plain free-text search string.
+    fn tokens_of(text: &str) -> Vec<String> {
+        text_tokens(&req_text(text)).unwrap_or_default()
+    }
+
+    #[test]
+    fn single_word_search_has_no_interior_token() {
+        // The whole string is one edge-to-edge token: it could be a fragment of a longer body
+        // word (`tim` ⊂ `timeout`, `timeout` ⊂ `timeouts`), so nothing is safe to bloom-test.
+        assert!(text_tokens(&req_text("tim")).is_none());
+        assert!(text_tokens(&req_text("timeout")).is_none());
+    }
+
+    #[test]
+    fn two_words_are_both_edge_tokens() {
+        // `foo` is first (left edge continues into the body), `bar` is last (right edge) → neither
+        // is interior → no safe token.
+        assert!(text_tokens(&req_text("foo bar")).is_none());
+    }
+
+    #[test]
+    fn keeps_only_the_interior_delimited_tokens() {
+        assert_eq!(tokens_of("a foo b"), vec!["foo"]);
+        assert_eq!(tokens_of("error timeout id:5"), vec!["timeout", "id"]);
+        // Leading/trailing punctuation delimits the outer tokens too, so both become interior.
+        assert_eq!(tokens_of("  --foo__bar--  "), vec!["foo", "bar"]);
+        // A fully-delimited single interior word is safe.
+        assert_eq!(tokens_of(" foo "), vec!["foo"]);
+    }
+
+    #[test]
+    fn interior_tokens_are_lowercased_like_the_index() {
+        assert_eq!(tokens_of("x TiMeOut y"), vec!["timeout"]);
+    }
+
+    /// Splitmix64 — a tiny deterministic PRNG so a failure reproduces exactly (no `rand` dep).
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Anti-false-negative property test (hand-rolled, seeded — this crate has no `proptest`).
+    /// For many random bodies and many random substrings *of those bodies*, the file whose `.idx`
+    /// bloom was built from the body must NEVER be pruned by the `text_tokens` → `might_contain_all`
+    /// path. Mirrors `photon-index`'s `bloom_never_reports_a_false_negative`, but exercises the
+    /// query-side token narrowing (the layer that regressed) rather than the raw bloom.
+    #[test]
+    fn pruning_never_drops_a_real_substring_match() {
+        // Mixes letters, digits, spaces and punctuation so both tokens and delimiters occur, and
+        // words frequently abut so substrings routinely slice through the middle of a token.
+        let alphabet: Vec<char> = "abcde012 _-.:/".chars().collect();
+        let schema = LogSchema::new(&[]);
+        let mut rng = SplitMix64(0x0DDB_1A5E_5EED_1234);
+
+        for _ in 0..500 {
+            let body_len = rng.below(40);
+            let body: String = (0..body_len)
+                .map(|_| alphabet[rng.below(alphabet.len())])
+                .collect();
+
+            let mut builder = RecordBatchBuilder::new(&schema);
+            builder.append(&LogRecord {
+                timestamp_nanos: 0,
+                body: Some(body.clone()),
+                ..Default::default()
+            });
+            let batch = builder.finish().unwrap();
+            let index = SkipIndex::build(&batch, &schema).unwrap();
+
+            let chars: Vec<char> = body.chars().collect();
+            if chars.is_empty() {
+                continue;
+            }
+            for _ in 0..8 {
+                let a = rng.below(chars.len());
+                let b = rng.below(chars.len());
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                let substr: String = chars[lo..=hi].iter().collect();
+
+                // Exactly what `keep_candidate` does for the bloom step: no safe tokens ⇒ keep.
+                let keep = match text_tokens(&req_text(&substr)) {
+                    None => true,
+                    Some(tokens) => index.might_contain_all(&tokens),
+                };
+                assert!(
+                    keep,
+                    "pruned a real substring match: body={body:?} substr={substr:?} tokens={:?}",
+                    text_tokens(&req_text(&substr))
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod corrupt_idx_keep_tests {
+    //! A corrupt/undecodable `.idx` must KEEP its file, never drop it, abort the prune, or panic —
+    //! the platform's #1 conservative-pruning invariant applied to the error/decode path.
+    use super::*;
+    use photon_core::manifest::{FileEntry, Manifest, MANIFEST_OBJECT_PATH};
+    use photon_core::schema::LogSchema;
+    use photon_core::segment::SegmentId;
+
+    /// A well-framed but corrupt `.idx`: valid magic + version, but `num_bits = 0`. Before the
+    /// decode hardening this decoded to a poisoned bloom whose first membership probe divided by
+    /// zero — so `keep_candidate`'s `might_contain_all` panicked at query time.
+    fn corrupt_zero_bits_idx() -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"PXSK");
+        b.push(2); // version
+        b.extend_from_slice(&0u64.to_le_bytes()); // num_bits = 0 (poison)
+        b.extend_from_slice(&1u32.to_le_bytes()); // num_hashes
+        b.extend_from_slice(&0u64.to_le_bytes()); // bits_len = 0
+        b.push(0); // has_timestamp = 0
+        b.push(0); // has_service = 0
+        b.push(0); // has_host = 0
+        b
+    }
+
+    #[test]
+    fn prune_keeps_a_candidate_whose_idx_fails_to_decode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = tmp.path().to_path_buf();
+        let seg = SegmentId(7);
+
+        // Corrupt sidecar on disk (no parquet needed — prune stops at keep_candidate).
+        let idx_path = hot.join(Storage::index_path(seg));
+        std::fs::create_dir_all(idx_path.parent().unwrap()).unwrap();
+        std::fs::write(&idx_path, corrupt_zero_bits_idx()).unwrap();
+
+        // Manifest with one entry pointing at that segment.
+        let mut m = Manifest::new();
+        m.add(FileEntry {
+            path: Storage::parquet_path(seg),
+            segment_id: seg,
+            min_ts_nanos: 0,
+            max_ts_nanos: 1_000,
+            min_service: "svc".into(),
+            max_service: "svc".into(),
+            row_count: 1,
+            durable: false,
+            attribute_keys: vec![],
+        });
+        let man_path = hot.join(MANIFEST_OBJECT_PATH);
+        std::fs::create_dir_all(man_path.parent().unwrap()).unwrap();
+        std::fs::write(&man_path, m.to_json().unwrap()).unwrap();
+
+        let engine =
+            QueryEngine::new(hot.clone(), LogSchema::new(&["service.name".to_string()])).unwrap();
+
+        // `"x alpha y"` has one interior token (`alpha`), which forces `keep_candidate` to open —
+        // and fail to decode — the sidecar. Conservative pruning must KEEP the file, returning it
+        // in the survivor set rather than erroring or panicking.
+        let req = QueryRequest {
+            start_ts_nanos: 0,
+            end_ts_nanos: 1_000,
+            services: vec![],
+            severities: vec![],
+            text: Some("x alpha y".to_string()),
+            query: None,
+            limit: 10,
+        };
+        let surviving = engine.prune(&req).unwrap();
+        let expected = hot
+            .join(Storage::parquet_path(seg))
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            surviving,
+            vec![expected],
+            "a candidate with a corrupt .idx must be kept, not pruned or errored"
+        );
     }
 }
