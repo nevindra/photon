@@ -87,21 +87,16 @@ pub(crate) async fn search(
     };
 
     let started = Instant::now();
-    let rows = match state.query.search(query.clone()).await {
-        Ok(batches) => batches_to_rows(&batches),
+    // One prune/open for both the (row-limited) page and the true total match count, instead of
+    // `search` + `count_matching` independently re-pruning the manifest/skip-indexes and
+    // re-opening every surviving Parquet file.
+    let (rows, matched_count) = match state.query.search_with_count(query).await {
+        Ok((batches, matched_count)) => (batches_to_rows(&batches), matched_count),
         Err(e) => {
             eprintln!("photon-api: warning: search query failed, returning empty results: {e}");
-            Vec::new()
+            (Vec::new(), 0)
         }
     };
-    // True total over the full pruned match set (independent of the row limit). Falls back to the
-    // returned row count if the count pass fails, so the toolbar never shows a smaller-than-rows
-    // total.
-    let matched_count = state
-        .query
-        .count_matching(query)
-        .await
-        .unwrap_or(rows.len() as u64);
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     Json(SearchResponse {
