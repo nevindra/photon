@@ -218,7 +218,9 @@ there is no `[[rum.apps]]` config anymore) — plus the curated Infrastructure v
 `GET /api/infra/hosts`, `GET /api/infra/hosts/:host`, `GET /api/infra/hosts/:host/timeseries` (see
 [`docs/subsystems/infra.md`](docs/subsystems/infra.md)). Handlers live in
 `crates/photon-api/src/*.rs`; the aggregation logic they call lives in
-`crates/photon-query/src/*.rs`.
+`crates/photon-query/src/*.rs`. A `tower-http` `CompressionLayer` wraps the whole surface
+(gzip/br, content-negotiated per `Accept-Encoding`; JSON logs compress ~15x) — its default predicate
+skips SSE (`/api/stream/*`), so live-tail is never buffered.
 
 ## Conventions
 

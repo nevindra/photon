@@ -188,6 +188,13 @@ Handlers live in `crates/photon-api/src/*.rs`; the aggregation logic they call l
 
 Everything else falls through to the embedded UI (SPA fallback to `index.html`).
 
+**Response compression:** a `tower-http` `CompressionLayer` wraps the whole HTTP surface (JSON API +
+embedded UI bundle), content-negotiating **gzip/br** from the client's `Accept-Encoding` (adds
+`Vary: Accept-Encoding`; transparent — no frontend change). JSON logs compress ~15x (a 500-row
+`/api/search` payload of ~115 KB → ~8 KB), so this is the primary transfer win, not a wire-format
+change. The default predicate skips SSE (`/api/stream/*` live-tail), gRPC, images, and sub-32-byte
+bodies, so streaming is never buffered.
+
 ## Load-bearing invariants — do not break
 
 - **No inverted index.** Pruning is min/max stats + token bloom filters (kilobytes/file). Bloom
