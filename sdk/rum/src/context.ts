@@ -5,7 +5,3 @@ export function context() {
     conn: c?.effectiveType ?? "",
   };
 }
-export function view(routeOf?: (p: string) => string) {
-  const path = location.pathname;
-  return { route: routeOf ? routeOf(path) : path, path };
-}

@@ -25,6 +25,11 @@ pub const ATTR_EXC_STACK: &str = "exception.stacktrace";
 pub const ATTR_ERR_KIND: &str = "error.kind";
 pub const ATTR_FINGERPRINT: &str = "rum.error.fingerprint";
 
+// ---- SPA soft-navigation attributes (Task B1) --------------------------------------------
+pub const ATTR_NAV: &str = "nav";
+pub const ATTR_VIEW_SEQ: &str = "view.seq";
+pub const ATTR_VIEW_PREV: &str = "view.previous_route";
+
 // ---- LCP/INP/CLS attribution (Task F1) ---------------------------------------------------
 // String attributes attached to the *main* vital point when the beacon carries `attr`.
 pub const ATTR_LCP_ELEMENT: &str = "lcp.element";
@@ -42,6 +47,10 @@ pub const METRIC_INP_INPUT_DELAY: &str = "web_vitals.inp.input_delay";
 pub const METRIC_INP_PROCESSING_DURATION: &str = "web_vitals.inp.processing_duration";
 pub const METRIC_INP_PRESENTATION_DELAY: &str = "web_vitals.inp.presentation_delay";
 
+// Soft-navigation metrics (SPA support): transition render time + time-on-view.
+pub const METRIC_ROUTE_CHANGE: &str = "web_vitals.route_change";
+pub const METRIC_VIEW_DURATION: &str = "web_vitals.view_duration";
+
 pub const ERROR_SEVERITY_NUMBER: i32 = 17; // OTEL ERROR
 pub const ERROR_SEVERITY_TEXT: &str = "ERROR";
 
@@ -54,6 +63,7 @@ pub fn metric_name_for(code: &str) -> Option<&'static str> {
         "CLS" => Some("web_vitals.cls"),
         "FCP" => Some("web_vitals.fcp"),
         "TTFB" => Some("web_vitals.ttfb"),
+        "ROUTE_CHANGE" => Some("web_vitals.route_change"),
         _ => None,
     }
 }
@@ -76,6 +86,7 @@ pub fn thresholds(metric_name: &str) -> Option<(f64, f64)> {
         "web_vitals.cls" => Some((0.1, 0.25)),
         "web_vitals.fcp" => Some((1800.0, 3000.0)),
         "web_vitals.ttfb" => Some((800.0, 1800.0)),
+        "web_vitals.route_change" => Some((1000.0, 3000.0)),
         _ => None,
     }
 }
@@ -183,6 +194,14 @@ pub struct BeaconView {
     pub route: String,
     #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub seq: Option<i64>,
+    #[serde(default)]
+    pub prev: String,
+    #[serde(default)]
+    pub nav: String,
+    #[serde(default)]
+    pub dur: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -245,6 +264,15 @@ fn common_attrs(b: &Beacon, service_name: &str) -> BTreeMap<String, String> {
     }
     if !b.view.id.is_empty() {
         a.insert(ATTR_VIEW.into(), b.view.id.clone());
+    }
+    if !b.view.nav.is_empty() {
+        a.insert(ATTR_NAV.into(), b.view.nav.clone());
+    }
+    if let Some(seq) = b.view.seq {
+        a.insert(ATTR_VIEW_SEQ.into(), seq.to_string());
+    }
+    if !b.view.prev.is_empty() {
+        a.insert(ATTR_VIEW_PREV.into(), b.view.prev.clone());
     }
     a
 }
@@ -384,6 +412,17 @@ pub fn beacon_to_metric_points(b: &Beacon, service_name: &str, now_nanos: i64) -
             timestamp_nanos: now_nanos,
             value: Some(vt.v),
             attributes: attrs,
+            ..MetricPoint::default()
+        });
+    }
+    if let Some(dur) = b.view.dur {
+        points.push(MetricPoint {
+            metric_name: METRIC_VIEW_DURATION.to_string(),
+            metric_type: metric_type::GAUGE,
+            unit: Some("ms".to_string()),
+            timestamp_nanos: now_nanos,
+            value: Some(dur),
+            attributes: base.clone(),
             ..MetricPoint::default()
         });
     }
@@ -702,5 +741,72 @@ mod tests {
         let cls = &pts[0];
         assert_eq!(cls.metric_name, "web_vitals.cls");
         assert_eq!(cls.attributes.get(ATTR_CLS_SOURCE).unwrap(), "div.banner");
+    }
+
+    // ---- Task B1: SPA soft-navigation attributes + route_change/view_duration -------------
+
+    fn beacon_json(v: serde_json::Value) -> Beacon {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn maps_soft_nav_attributes_and_route_change_metric() {
+        let b = beacon_json(serde_json::json!({
+            "app": "app", "key": "k", "session": "s",
+            "view": { "id": "v1", "route": "/p/:id", "path": "/p/42", "seq": 3, "prev": "/cart", "nav": "soft", "dur": 8421 },
+            "ctx": { "ua": "Mozilla/5.0 (Windows NT 10.0) Chrome/120 Safari/537", "conn": "4g" },
+            "vitals": [ { "n": "route_change", "v": 340 }, { "n": "CLS", "v": 0.05 } ]
+        }));
+        let pts = beacon_to_metric_points(&b, "app", 1_000);
+
+        let rc = pts
+            .iter()
+            .find(|p| p.metric_name == "web_vitals.route_change")
+            .expect("route_change point");
+        assert_eq!(rc.value, Some(340.0));
+        assert_eq!(rc.unit.as_deref(), Some("ms"));
+        assert_eq!(
+            rc.attributes.get(ATTR_NAV).map(String::as_str),
+            Some("soft")
+        );
+        assert_eq!(
+            rc.attributes.get(ATTR_VIEW_SEQ).map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            rc.attributes.get(ATTR_VIEW_PREV).map(String::as_str),
+            Some("/cart")
+        );
+
+        let vd = pts
+            .iter()
+            .find(|p| p.metric_name == "web_vitals.view_duration")
+            .expect("view_duration point");
+        assert_eq!(vd.value, Some(8421.0));
+        assert_eq!(vd.unit.as_deref(), Some("ms"));
+    }
+
+    #[test]
+    fn soft_nav_attributes_flow_to_error_logs() {
+        let b = beacon_json(serde_json::json!({
+            "app": "app", "key": "k", "session": "s",
+            "view": { "id": "v1", "route": "/x", "path": "/x", "seq": 1, "prev": "/", "nav": "soft" },
+            "ctx": { "ua": "x", "conn": "" },
+            "errors": [ { "kind": "exception", "type": "TypeError", "msg": "boom", "stack": "", "src": "a.js", "line": 1 } ]
+        }));
+        let logs = beacon_to_log_records(&b, "app", 1_000);
+        assert_eq!(
+            logs[0].attributes.get(ATTR_NAV).map(String::as_str),
+            Some("soft")
+        );
+        assert_eq!(
+            logs[0].attributes.get(ATTR_VIEW_SEQ).map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn route_change_has_thresholds() {
+        assert!(thresholds("web_vitals.route_change").is_some());
     }
 }

@@ -5,6 +5,35 @@ All notable changes to Photon are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-15
+
+A feature release adding first-class Single-Page-App (SPA) support to the RUM SDK,
+plus the metrics and attributes to store and query it. Fully backward compatible —
+older SDKs and existing data are unaffected (every new beacon field and metric is
+additive; unknown fields are ignored).
+
+### Added
+
+- **SPA / soft-navigation RUM tracking.** The `@photon/rum` SDK now models a **view**
+  as a logical pageview instead of a document load: `view.id` rotates on every real
+  client-side route change (History API — `pushState`/`replaceState`/`popstate`,
+  auto-detected, on by default; query/hash-only changes don't rotate, and MPAs are
+  unaffected). Each route becomes its own pageview with correctly-attributed Web
+  Vitals, JS errors, and — with `tracing: true` — its own backend trace. Attribution
+  is by construction (a per-view beacon buffer flushed on each rotation), not
+  flush-time timing. Fixes SPA routers (e.g. TanStack Router) reporting no data on
+  in-app navigation.
+- **Honest per-route Web Vitals.** Soft-navigated routes report per-view **CLS**
+  (web-vitals' session-window rule) and **INP**, plus a new **`web_vitals.route_change`**
+  metric — a DOM-settle transition-time heuristic (good ≤ 1 s / poor > 3 s). LCP/FCP/
+  TTFB stay real web-vitals for the landing load and are **never** synthesized for soft
+  navigations. A new **`web_vitals.view_duration`** metric captures time-on-view.
+- **New RUM attributes** on every vital point and error log — `nav` (`hard` | `soft`),
+  `view.seq` (ordinal within the session), and `view.previous_route` — enabling
+  navigation-path and engagement analysis.
+- **`trackView(route?)` SDK export** — a manual escape hatch for routers that prefer to
+  drive soft-navigation boundaries themselves (e.g. TanStack Router's `router.subscribe`).
+
 ## [1.1.0] - 2026-07-15
 
 A hardening release on top of 1.0.0: correctness, durability, and DoS fixes across
@@ -95,5 +124,6 @@ operator-facing knobs. Fully backward compatible — no config or API breaking c
 - **Cached metric probe metadata** per engine (manifest-pointer invalidated), dropping a
   redundant prune + Parquet open per chart panel.
 
+[1.2.0]: https://github.com/nevindra/photon/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/nevindra/photon/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/nevindra/photon/releases/tag/v1.0.0

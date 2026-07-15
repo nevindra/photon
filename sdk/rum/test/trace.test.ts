@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { newTraceId, newSpanId, traceparent, pageTraceId, matchesTarget } from "../src/trace";
 
 describe("trace ids", () => {
@@ -31,5 +31,23 @@ describe("matchesTarget", () => {
     // Unterminated IPv6 host literal: genuinely fails WHATWG URL parsing (unlike "::::", which
     // resolves fine as a relative path against location.href).
     expect(matchesTarget("http://[::1", ["same-origin"])).toBe(false);
+  });
+});
+
+describe("per-view trace id", () => {
+  it("mints a distinct trace id per view, cached on the view descriptor, on rotate", async () => {
+    vi.resetModules();
+    const view = await import("../src/view");
+    view.initView("/", "/");
+    const { pageTraceId, bindTraceToViews } = await import("../src/trace");
+    bindTraceToViews();                 // subscribe: each rotate mints a fresh id on the new descriptor
+    const first = pageTraceId();
+    expect(first).toMatch(/^[0-9a-f]{32}$/);
+    expect(view.currentView().traceId).toBe(first);
+    const { started } = view.rotateView("/next", "/next");
+    const second = view.currentView().traceId;
+    expect(second).toMatch(/^[0-9a-f]{32}$/);
+    expect(second).not.toBe(first);
+    expect(started.traceId).toBe(second);   // the rotated descriptor carries the fresh id
   });
 });

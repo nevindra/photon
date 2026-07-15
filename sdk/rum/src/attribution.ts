@@ -2,7 +2,10 @@
 // index.ts), so the core bundle stays tree-shaken and under the 5 KB budget. Uses the
 // `web-vitals/attribution` builds, which populate `metric.attribution` for LCP/INP/CLS with
 // debugging detail beyond the plain value.
-import { onLCP, onINP, onCLS } from "web-vitals/attribution";
+// Only LCP attribution is pulled from web-vitals here. INP and CLS are measured per-view by
+// `spa.ts` (one source of truth for those across hard + soft views), so reporting them again from
+// web-vitals/attribution would double-count them on the landing view.
+import { onLCP } from "web-vitals/attribution";
 
 export interface AttrVital {
   n: string;
@@ -36,21 +39,5 @@ export function initAttribution(b: AttrBeacon): void {
       },
     });
   });
-  onINP((m) => {
-    const a = m.attribution;
-    b.vital({
-      n: "INP",
-      v: Math.round(m.value),
-      attr: {
-        target: a.interactionTarget,
-        id: num(a.inputDelay),
-        pd: num(a.processingDuration),
-        pr: num(a.presentationDelay),
-      },
-    });
-  });
-  onCLS((m) => {
-    const a = m.attribution;
-    b.vital({ n: "CLS", v: m.value, attr: { source: a.largestShiftTarget } });
-  });
+  // INP and CLS are intentionally NOT reported here — spa.ts's per-view observers own them.
 }

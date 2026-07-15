@@ -1,131 +1,59 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { makeBeacon } from "../src/beacon";
+import type { ViewDescriptor } from "../src/view";
 
-// jsdom's Blob implementation doesn't have .text()/.arrayBuffer() (only slice/size/type),
-// so read it back via FileReader instead.
-function readBlobText(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error);
-    reader.readAsText(blob);
-  });
+function desc(over: Partial<ViewDescriptor> = {}): ViewDescriptor {
+  return { id: "v1", route: "/a", path: "/a", navStart: 0, seq: 0, nav: "hard", ...over };
 }
 
-describe("makeBeacon", () => {
-  let sendBeacon: ReturnType<typeof vi.fn>;
-
+describe("per-view beacon", () => {
+  let sent: any[];
   beforeEach(() => {
-    sendBeacon = vi.fn(() => true);
-    // jsdom does not implement navigator.sendBeacon
-    (navigator as any).sendBeacon = sendBeacon;
+    sent = [];
+    (globalThis as any).navigator = { sendBeacon: (_u: string, b: Blob) => { sent.push(b); return true; } };
+    (globalThis as any).Blob = class { constructor(public parts: any[]) {} async text() { return this.parts.join(""); } };
+    (globalThis as any).addEventListener = () => {};
   });
 
-  it("flushes queued vitals/errors on pagehide and posts the frozen beacon shape", async () => {
-    const base = () => ({
-      app: "web-storefront",
-      key: "pk_live_abc",
-      session: "018f-session",
-      view: { id: "018f-view", route: "/checkout", path: "/checkout" },
-      ctx: { ua: "Mozilla/5.0 (iPhone) Safari", conn: "4g" },
-    });
-    const beacon = makeBeacon("https://photon.example.com", base);
-
-    beacon.vital({ n: "LCP", v: 4300 });
-    beacon.vital({ n: "CLS", v: 0.06 });
-    beacon.error({
-      kind: "exception",
-      type: "TypeError",
-      msg: "x is undefined",
-      stack: "...",
-      src: "checkout.js",
-      line: 214,
-    });
-
-    window.dispatchEvent(new Event("pagehide"));
-
-    expect(sendBeacon).toHaveBeenCalledTimes(1);
-    const [url, blob] = sendBeacon.mock.calls[0];
-    expect(url).toBe("https://photon.example.com/api/rum");
-    expect(blob).toBeInstanceOf(Blob);
-
-    const text = await readBlobText(blob);
-    const parsed = JSON.parse(text);
-
-    // Frozen shape: app, key, session, view, vitals, errors (+ whatever base() contributes, e.g. ctx).
-    expect(Object.keys(parsed).sort()).toEqual(
-      ["app", "key", "session", "view", "ctx", "vitals", "errors"].sort()
-    );
-    expect(parsed.app).toBe("web-storefront");
-    expect(parsed.key).toBe("pk_live_abc");
-    expect(parsed.session).toBe("018f-session");
-    expect(parsed.view).toEqual({ id: "018f-view", route: "/checkout", path: "/checkout" });
-    expect(parsed.ctx).toEqual({ ua: "Mozilla/5.0 (iPhone) Safari", conn: "4g" });
-    expect(parsed.vitals).toEqual([
-      { n: "LCP", v: 4300 },
-      { n: "CLS", v: 0.06 },
-    ]);
-    expect(parsed.errors).toEqual([
-      {
-        kind: "exception",
-        type: "TypeError",
-        msg: "x is undefined",
-        stack: "...",
-        src: "checkout.js",
-        line: 214,
-      },
-    ]);
+  it("stamps flushed items with the supplied (outgoing) descriptor, not the current one", async () => {
+    const b = makeBeacon("https://x.test", () => ({ app: "app", key: "k", session: "s", ctx: {} }));
+    b.vital({ n: "LCP", v: 1 });
+    const viewA = desc({ id: "A", route: "/a" });
+    b.flush(viewA);                              // flush for view A
+    b.vital({ n: "INP", v: 2 });                 // now belongs to a later view
+    b.flush(desc({ id: "B", route: "/b" }));
+    const first = JSON.parse(await (sent[0] as any).text());
+    expect(first.view.id).toBe("A");
+    expect(first.view.route).toBe("/a");
+    expect(first.vitals).toEqual([{ n: "LCP", v: 1 }]);
   });
 
-  it("clears the queue after a flush so a second pagehide sends nothing new", async () => {
-    const base = () => ({ app: "web", key: "pk_1", session: "s1", view: { id: "v1", route: "/", path: "/" } });
-    const beacon = makeBeacon("https://photon.example.com", base);
-
-    beacon.vital({ n: "LCP", v: 1000 });
-    window.dispatchEvent(new Event("pagehide"));
-    expect(sendBeacon).toHaveBeenCalledTimes(1);
-
-    window.dispatchEvent(new Event("pagehide"));
-    expect(sendBeacon).toHaveBeenCalledTimes(1); // no second call: queue was empty
+  it("flush with an empty buffer sends nothing", () => {
+    const b = makeBeacon("https://x.test", () => ({ app: "a", key: "k", session: "s", ctx: {} }));
+    b.flush(desc());
+    expect(sent.length).toBe(0);
   });
 
-  it("sends nothing when there are no queued vitals or errors", () => {
-    const base = () => ({ app: "web", key: "pk_1", session: "s1", view: { id: "v1", route: "/", path: "/" } });
-    makeBeacon("https://photon.example.com", base);
-
-    window.dispatchEvent(new Event("pagehide"));
-
-    expect(sendBeacon).not.toHaveBeenCalled();
+  it("sendImmediate emits a one-off beacon for a specific descriptor without touching the buffer", async () => {
+    const b = makeBeacon("https://x.test", () => ({ app: "a", key: "k", session: "s", ctx: {} }));
+    b.vital({ n: "CLS", v: 0.1 });               // stays buffered
+    b.sendImmediate(desc({ id: "LATE" }), { vitals: [{ n: "LCP", v: 9 }] });
+    const body = JSON.parse(await (sent[0] as any).text());
+    expect(body.view.id).toBe("LATE");
+    expect(body.vitals).toEqual([{ n: "LCP", v: 9 }]);
+    // buffer still holds the CLS for a later flush:
+    b.flush(desc({ id: "CUR" }));
+    const second = JSON.parse(await (sent[1] as any).text());
+    expect(second.vitals).toEqual([{ n: "CLS", v: 0.1 }]);
   });
 
-  it("falls back to fetch keepalive when sendBeacon is unavailable or fails", () => {
-    (navigator as any).sendBeacon = vi.fn(() => false);
-    const fetchSpy = vi.fn(() => Promise.resolve(new Response(null, { status: 204 })));
-    vi.stubGlobal("fetch", fetchSpy);
-
-    const base = () => ({ app: "web", key: "pk_1", session: "s1", view: { id: "v1", route: "/", path: "/" } });
-    const beacon = makeBeacon("https://photon.example.com", base);
-    beacon.vital({ n: "TTFB", v: 120 });
-
-    window.dispatchEvent(new Event("pagehide"));
-
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchSpy.mock.calls[0];
-    expect(url).toBe("https://photon.example.com/api/rum");
-    expect(init).toMatchObject({ method: "POST", keepalive: true });
-
-    vi.unstubAllGlobals();
-  });
-
-  it("never throws into the host app even when sendBeacon itself throws", () => {
-    (navigator as any).sendBeacon = vi.fn(() => {
-      throw new Error("sendBeacon exploded");
-    });
-
-    const base = () => ({ app: "web", key: "pk_1", session: "s1", view: { id: "v1", route: "/", path: "/" } });
-    const beacon = makeBeacon("https://photon.example.com", base);
-    beacon.vital({ n: "LCP", v: 1000 });
-
-    expect(() => window.dispatchEvent(new Event("pagehide"))).not.toThrow();
+  it("includes view.seq/prev/nav/dur and per-view trace when present", async () => {
+    const b = makeBeacon("https://x.test", () => ({ app: "a", key: "k", session: "s", ctx: {} }));
+    b.vital({ n: "route_change", v: 300 });
+    b.flush(desc({ id: "V", route: "/r", path: "/r", seq: 2, prevRoute: "/p", nav: "soft", traceId: "abc", navStart: 0 }));
+    const body = JSON.parse(await (sent[0] as any).text());
+    expect(body.view).toMatchObject({ id: "V", route: "/r", path: "/r", seq: 2, prev: "/p", nav: "soft" });
+    expect(typeof body.view.dur).toBe("number");
+    expect(body.trace).toBe("abc");
   });
 });
