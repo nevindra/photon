@@ -321,6 +321,7 @@ async fn compact_metrics(server: &InfraServer) {
         hot_dir: server.hot_dir.clone(),
         db_path: String::new(),
         durable: None,
+        zstd_level: 1,
     })
     .unwrap();
     let replicator = Arc::new(Replicator::new(storage.clone()));

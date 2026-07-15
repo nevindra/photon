@@ -2829,6 +2829,7 @@ name = "photon-compact"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bytes",
  "futures",
  "object_store",
  "parquet",

@@ -203,7 +203,12 @@ impl SpanQueryEngine {
             s.total_rows += e.row_count;
             s.min_ts_nanos = s.min_ts_nanos.min(e.min_ts_nanos);
             s.max_ts_nanos = s.max_ts_nanos.max(e.max_ts_nanos);
-            if let Ok(md) = std::fs::metadata(self.hot_dir.join(&e.path)) {
+            // Prefer the Parquet size the compactor recorded at write time — pure manifest
+            // arithmetic, no syscall. Legacy entries (written before `FileEntry.bytes`) carry
+            // `bytes == 0`; stat() ONLY those so the footprint stays exact during the transition.
+            if e.bytes > 0 {
+                s.bytes += e.bytes;
+            } else if let Ok(md) = std::fs::metadata(self.hot_dir.join(&e.path)) {
                 s.bytes += md.len();
             }
         }
@@ -421,6 +426,44 @@ mod tests {
             offset: 0,
             projected_attributes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn storage_stats_prefers_recorded_bytes_and_falls_back_for_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hot.join("manifest")).unwrap();
+        std::fs::create_dir_all(hot.join("data-spans")).unwrap();
+        // seg-a on disk is 100 bytes but its entry records 999 — a correct sum uses the recorded
+        // field, not a stat. seg-b is legacy (bytes == 0) → its real 250 bytes come via stat().
+        std::fs::write(hot.join("data-spans/seg-a.parquet"), vec![0u8; 100]).unwrap();
+        std::fs::write(hot.join("data-spans/seg-b.parquet"), vec![0u8; 250]).unwrap();
+        let mut m = Manifest::new();
+        for (path, seg, bytes) in [
+            ("data-spans/seg-a.parquet", 1u64, 999u64),
+            ("data-spans/seg-b.parquet", 2, 0),
+        ] {
+            m.add(FileEntry {
+                path: path.into(),
+                segment_id: photon_core::segment::SegmentId(seg),
+                min_ts_nanos: 0,
+                max_ts_nanos: 100,
+                min_service: "api".into(),
+                max_service: "web".into(),
+                row_count: 1,
+                durable: false,
+                attribute_keys: vec![],
+                bytes,
+            });
+        }
+        std::fs::write(hot.join(SPANS_MANIFEST_OBJECT_PATH), m.to_json().unwrap()).unwrap();
+
+        let engine =
+            SpanQueryEngine::new(hot, SpanSchema::new(&["service.name".to_string()])).unwrap();
+        let s = engine.storage_stats().unwrap();
+        assert_eq!(s.file_count, 2);
+        // 999 (recorded field, proving no stat of the 100-byte file) + 250 (legacy fallback stat).
+        assert_eq!(s.bytes, 999 + 250);
     }
 
     /// Spans free-text over `name` is substring semantics too, so `span_text_tokens` must share the

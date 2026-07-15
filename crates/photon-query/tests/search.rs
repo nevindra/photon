@@ -83,6 +83,7 @@ fn entry_from(records: &[LogRecord], seg: SegmentId) -> FileEntry {
         row_count: records.len() as u64,
         durable: false,
         attribute_keys: Vec::new(),
+        bytes: 0,
     }
 }
 

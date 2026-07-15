@@ -63,11 +63,22 @@ pub struct StorageConfig {
     pub db_path: String,
     #[serde(default)]
     pub durable: Option<DurableConfig>,
+    /// zstd compression level the compactors use when streaming Parquet files to disk. Higher
+    /// levels shrink files further (roughly 10-30% smaller at level 3 vs the default) for more
+    /// CPU per compaction pass. Range `1..=19` (validated below). Default 1 is byte-identical to
+    /// the previously hardcoded `Compression::ZSTD(Default::default())` — `ZstdLevel::try_new(1)`
+    /// equals `ZstdLevel::default()` in parquet 53.
+    #[serde(default = "StorageConfig::default_zstd_level")]
+    pub zstd_level: i32,
 }
 
 impl StorageConfig {
     fn default_db_path() -> String {
         "./data/photon.db".to_string()
+    }
+
+    fn default_zstd_level() -> i32 {
+        1
     }
 }
 
@@ -88,6 +99,12 @@ pub struct DurableConfig {
 pub struct RetentionConfig {
     pub days: u32,
 }
+
+/// Upper bound on any per-signal retention `days` (100 years). `days` feeds directly into
+/// `days * 86_400_000_000_000` nanosecond cutoff arithmetic in the retention purge loops;
+/// anything above ~106_751 days overflows `i64`, so this cap keeps every accepted value far
+/// inside the safe range (the loops additionally use saturating arithmetic as defense in depth).
+pub const MAX_RETENTION_DAYS: u32 = 36_500;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SchemaConfig {
@@ -348,6 +365,11 @@ impl Config {
         if self.retention.days == 0 {
             return Err(PhotonError::Config("retention.days must be > 0".into()));
         }
+        if self.retention.days > MAX_RETENTION_DAYS {
+            return Err(PhotonError::Config(format!(
+                "retention.days must be <= {MAX_RETENTION_DAYS} (100 years)"
+            )));
+        }
         if !self
             .schema
             .promoted_attributes
@@ -392,6 +414,12 @@ impl Config {
             return Err(PhotonError::Config(
                 "storage.db_path must be non-empty".into(),
             ));
+        }
+        if !(1..=19).contains(&self.storage.zstd_level) {
+            return Err(PhotonError::Config(format!(
+                "storage.zstd_level must be between 1 and 19 (got {})",
+                self.storage.zstd_level
+            )));
         }
         if self.auth.session_secret.trim().is_empty() {
             return Err(PhotonError::Config(
@@ -509,6 +537,15 @@ session_secret = "a-long-random-session-signing-secret"
     }
 
     #[test]
+    fn rejects_retention_days_above_cap() {
+        // A user typing a huge number (e.g. "999999999" to mean "forever") must be rejected, not
+        // silently accepted and later overflow the i64 cutoff arithmetic in the retention loops.
+        let bad = VALID.replace("days = 30", "days = 999999999");
+        let err = Config::from_toml_str(&bad).unwrap_err();
+        assert!(err.to_string().contains("retention"));
+    }
+
+    #[test]
     fn rejects_duplicate_promoted_attribute() {
         let bad = VALID.replace(
             r#"["service.name", "host.name"]"#,
@@ -536,6 +573,42 @@ session_secret = "a-long-random-session-signing-secret"
         );
         let err = Config::from_toml_str(&bad).unwrap_err();
         assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn storage_zstd_level_defaults_to_1_when_omitted() {
+        let c = Config::from_toml_str(VALID).unwrap();
+        assert_eq!(c.storage.zstd_level, 1);
+    }
+
+    #[test]
+    fn storage_zstd_level_accepts_a_valid_override() {
+        let toml = VALID.replace(
+            "hot_dir = \"/var/lib/photon/hot\"",
+            "hot_dir = \"/var/lib/photon/hot\"\nzstd_level = 3",
+        );
+        let c = Config::from_toml_str(&toml).unwrap();
+        assert_eq!(c.storage.zstd_level, 3);
+    }
+
+    #[test]
+    fn rejects_zstd_level_below_range() {
+        let bad = VALID.replace(
+            "hot_dir = \"/var/lib/photon/hot\"",
+            "hot_dir = \"/var/lib/photon/hot\"\nzstd_level = 0",
+        );
+        let err = Config::from_toml_str(&bad).unwrap_err();
+        assert!(err.to_string().contains("zstd_level"));
+    }
+
+    #[test]
+    fn rejects_zstd_level_above_range() {
+        let bad = VALID.replace(
+            "hot_dir = \"/var/lib/photon/hot\"",
+            "hot_dir = \"/var/lib/photon/hot\"\nzstd_level = 20",
+        );
+        let err = Config::from_toml_str(&bad).unwrap_err();
+        assert!(err.to_string().contains("zstd_level"));
     }
 
     #[test]

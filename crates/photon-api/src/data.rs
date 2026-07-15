@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::settings::SettingsStore;
 use crate::AppState;
+use photon_core::config::MAX_RETENTION_DAYS;
 use photon_core::retention::PurgeReport;
 use photon_core::PhotonError;
 
@@ -172,6 +173,12 @@ pub(crate) async fn put_retention(
                 return Err(err_json(
                     StatusCode::BAD_REQUEST,
                     "retention days must be > 0",
+                ));
+            }
+            if days > MAX_RETENTION_DAYS {
+                return Err(err_json(
+                    StatusCode::BAD_REQUEST,
+                    format!("retention days must be <= {MAX_RETENTION_DAYS} (100 years)"),
                 ));
             }
             if signal == "uptime" && !data.uptime_enabled {
@@ -429,6 +436,23 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("cookie", &cookie)
                     .body(Body::from(r#"{"logs":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // PUT /retention { "logs": 999999999 } → 400 (above the 100-year cap; a user typing this
+        // to mean "forever" must not overflow the i64 cutoff arithmetic in the retention loops).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/retention")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(r#"{"logs":999999999}"#))
                     .unwrap(),
             )
             .await

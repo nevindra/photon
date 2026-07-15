@@ -38,6 +38,10 @@ hot_dir = "/var/lib/photon/hot"
 # Shared control-plane SQLite database: UI user accounts and uptime monitors.
 # Always used — required for login and by the always-on uptime subsystem.
 db_path = "/var/lib/photon/photon.db"
+# zstd compression level for compacted Parquet files. Range 1-19. Higher = smaller files
+# (roughly 10-30% smaller at level 3) but more CPU per compaction pass. Optional; defaults to 1
+# (fastest/lowest-ratio — byte-identical to the level Photon used before this was configurable).
+# zstd_level = 1
 
 # `[storage.durable]` is OPTIONAL. Omit the whole section to run hot-tier only (no
 # replication). When present, compacted objects are replicated hot -> durable to an

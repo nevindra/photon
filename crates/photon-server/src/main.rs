@@ -10,9 +10,10 @@
 //!   in-app onboarding + Settings, not in config.
 //! * `photon-server [config.toml]` — load the config (path from `argv[1]`, else the
 //!   `PHOTON_CONFIG` env var, else `photon.toml`) and run the server: an OTLP ingest front
-//!   end (gRPC + HTTP) writing to the WAL, a background compactor draining closed WAL
-//!   segments into Parquet (also replaying any segments recovered on startup) and flushing
-//!   hot -> durable replication, and a REST/UI API over the query engine.
+//!   end (gRPC + HTTP) writing to the WAL, per-signal background compactors draining closed WAL
+//!   segments into Parquet (also replaying any segments recovered on startup), a single
+//!   long-lived task flushing hot -> durable replication, and a REST/UI API over the query
+//!   engine.
 
 /// jemalloc returns freed pages to the OS (glibc retained them — B1 measured post-idle ≈ peak)
 /// and speeds the multithreaded, allocation-heavy ingest path. Process-global; libraries untouched.
@@ -44,9 +45,13 @@ use photon_query::{MetricsQueryEngine, QueryEngine, SpanQueryEngine};
 use photon_storage::{Replicator, Storage};
 use photon_wal::{BroadcastingWal, DiskWal, Wal};
 
-/// How often the background compactor wakes to drain closed WAL segments and flush
-/// replication.
+/// How often the background compactor wakes to drain closed WAL segments.
 const COMPACT_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the single long-lived replication drain task wakes to check the queue when it
+/// has caught up (see [`Replicator::spawn_drain_loop`]). A down/lagging durable store is gated
+/// separately by the replicator's own escalating pass-failure backoff, so this only bounds the
+/// pickup latency of freshly-enqueued objects once the queue has drained.
+const DRAIN_INTERVAL: Duration = Duration::from_secs(2);
 /// Run a small-file `merge_once` pass every Nth compactor tick.
 const MERGE_EVERY_TICKS: u64 = 5;
 /// Run a whole-file retention purge every Nth compactor tick (~1 hour at COMPACT_INTERVAL 2s).
@@ -83,6 +88,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared building blocks.
     let schema = LogSchema::new(&cfg.schema.promoted_attributes);
     let storage = Storage::from_config(&cfg.storage)?;
+    // Best-effort startup cleanup: a crash between `File::create(tmp)` and the atomic `rename`
+    // in `write_parquet_streamed` (photon-compact) orphans a `data*/<name>.parquet.tmp` file
+    // that nothing else ever revisits. Sweep once, before the compactors spawn, so it never races
+    // a compactor's own in-flight `.tmp` write. Cosmetic disk waste, not a correctness issue — a
+    // sweep error must not abort startup.
+    match storage.sweep_stale_tmp_files() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("swept {n} stale .tmp files"),
+        Err(e) => eprintln!("warning: failed to sweep stale .tmp files: {e}"),
+    }
     let wal_inner = DiskWal::open(
         cfg.storage.hot_dir.join("wal"),
         schema.clone(),
@@ -228,6 +243,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // The single, long-lived hot -> durable replication drain. Spawned ONCE, UNCONDITIONALLY —
+    // independent of PHOTON_DISABLE_COMPACTION — so all three signals' enqueued objects keep
+    // flushing to durable, and in-flight uploads stay bounded (the loop drains sequentially,
+    // one object at a time) instead of piling up per compaction tick as durable falls behind.
+    // No-op when no durable tier is configured (nothing ever enqueues). Each successful upload's
+    // (path, byte size) is forwarded to the recorder task above via `repl_tx` — a full channel
+    // simply drops the sample (`try_send` never blocks the drain).
+    {
+        let tx = repl_tx;
+        let drain_handle =
+            replicator
+                .clone()
+                .spawn_drain_loop(DRAIN_INTERVAL, move |path, bytes| {
+                    let _ = tx.try_send((path, bytes));
+                });
+        // Only supervise when a durable tier is actually configured: with none, the loop
+        // legitimately completes immediately (see `Replicator::spawn_drain_loop`'s doc) on a
+        // hot-tier-only deployment (`[storage.durable]` is optional) — supervising it there
+        // would misreport a healthy config as a dead task.
+        if replicator.durable_configured() {
+            supervise("replication drain", drain_handle);
+        }
+    }
+
     // Seed the live retention atomics: SQLite override wins, else the config default. Uptime
     // uses its own `[uptime].retention_days` (defaulted when the section is omitted).
     let uptime_default = cfg.uptime.retention_days;
@@ -248,40 +287,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx_traces, rx_traces) = tokio::sync::mpsc::channel::<PurgeCommand>(1);
     let (tx_metrics, rx_metrics) = tokio::sync::mpsc::channel::<PurgeCommand>(1);
 
-    // Background compactor: drains closed WAL segments (incl. those recovered on startup =
-    // WAL replay) into Parquet, occasionally merges small files, applies hourly retention, then
-    // flushes replication. Also serves on-demand purge commands from the API.
+    // Background compactors (one per signal): each drains closed WAL segments (incl. those
+    // recovered on startup = WAL replay) into Parquet, occasionally merges small files, applies
+    // hourly retention, and enqueues compacted objects into the shared `Replicator`. Each also
+    // serves on-demand purge commands from the API. `PHOTON_DISABLE_COMPACTION` gates ALL THREE
+    // uniformly (previously only logs) — the standalone replication drain above is independent,
+    // so an already-populated queue keeps flushing to durable even with compaction off.
     if std::env::var("PHOTON_DISABLE_COMPACTION").is_err() {
-        spawn_compactor(
+        let logs_handle = spawn_compactor(
             wal.clone(),
             storage.clone(),
             replicator.clone(),
             schema.clone(),
             rx_logs,
             retention.clone(),
-            repl_tx.clone(),
+            cfg.storage.zstd_level,
         );
+        let traces_handle = spawn_span_compactor(
+            spans_wal.clone(),
+            storage.clone(),
+            replicator.clone(),
+            span_schema.clone(),
+            rx_traces,
+            retention.clone(),
+            cfg.storage.zstd_level,
+        );
+        let metrics_handle = spawn_metric_compactor(
+            metrics_wal.clone(),
+            storage.clone(),
+            replicator.clone(),
+            metric_schema.clone(),
+            rx_metrics,
+            retention.clone(),
+            cfg.storage.zstd_level,
+        );
+        // These loops are meant to run forever; if one ever completes it means its body panicked
+        // and that signal's compaction has silently stopped (WAL segments then accumulate until
+        // disk fills). Make that observable instead of silent — see `supervise`.
+        supervise("logs compactor", logs_handle);
+        supervise("traces compactor", traces_handle);
+        supervise("metrics compactor", metrics_handle);
     } else {
         eprintln!(
-            "PHOTON_DISABLE_COMPACTION set — logs compactor disabled; WAL will not be compacted"
+            "PHOTON_DISABLE_COMPACTION set — all compaction disabled (logs, traces, metrics); \
+             WAL segments will not be compacted (replication drain still runs)"
         );
+        // Compaction is gated off, so nothing will ever `.recv()` from these purge channels.
+        // Drop them explicitly so a purge request from the API (photon-api's `data.rs`, which
+        // `send()`s and then `.await`s a reply) fails fast against a closed channel with its
+        // existing 500 "compactor unavailable" instead of hanging the HTTP handler forever.
+        drop(rx_logs);
+        drop(rx_traces);
+        drop(rx_metrics);
     }
-    spawn_span_compactor(
-        spans_wal.clone(),
-        storage.clone(),
-        replicator.clone(),
-        span_schema.clone(),
-        rx_traces,
-        retention.clone(),
-    );
-    spawn_metric_compactor(
-        metrics_wal.clone(),
-        storage.clone(),
-        replicator.clone(),
-        metric_schema.clone(),
-        rx_metrics,
-        retention.clone(),
-    );
 
     // Resolve bind addresses.
     let grpc_addr: SocketAddr = cfg
@@ -440,6 +498,15 @@ fn now_ms() -> i64 {
     now_nanos() / 1_000_000
 }
 
+/// Retention cutoff in nanoseconds: `now - days` back. `Config::validate` and `put_retention`
+/// cap `days` at `MAX_RETENTION_DAYS` (100 years), but this stays saturating as defense in
+/// depth — a plain `now - days * 86_400_000_000_000` overflows `i64` once `days` exceeds
+/// ~106_751, wrapping to a cutoff *after* `now` and causing the purge loop to delete every
+/// current file for that signal.
+fn retention_cutoff_nanos(now: i64, days: i64) -> i64 {
+    now.saturating_sub(days.saturating_mul(86_400_000_000_000))
+}
+
 /// Seed one retention atomic: prefer the SQLite-persisted override, else `default`. A store
 /// error is treated as "no override" so a missing/empty settings row falls back to the config.
 async fn seed_retention(settings: &dyn SettingsStore, signal: &str, default: u32) -> u32 {
@@ -451,12 +518,38 @@ async fn seed_retention(settings: &dyn SettingsStore, signal: &str, default: u32
         .unwrap_or(default)
 }
 
-/// Spawn the background compaction + replication loop.
+/// Watch a background task's `JoinHandle` and, if it ever completes, log a clear error naming
+/// which loop died. The compactor/drain loops spawned in `main` are meant to run forever (they
+/// are `loop { ... }` bodies with no break), so completion here means the loop body panicked (a
+/// realistic trigger used to be the replicator queue mutex `.expect(...)` on poison — now fixed
+/// — but this stays as a general safety net for any future panic) and that signal's compaction
+/// (or replication) has silently stopped, letting WAL segments accumulate until disk fills.
+/// Detect + log only, deliberately not respawning: turns a silently wedged task into a visible
+/// operator-facing error instead.
+fn supervise(name: &'static str, handle: tokio::task::JoinHandle<()>) {
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(()) => eprintln!(
+                "photon-server: FATAL: {name} loop exited unexpectedly (it is meant to run \
+                 forever) — {name} has stopped and will not resume until the process is \
+                 restarted"
+            ),
+            Err(e) => eprintln!(
+                "photon-server: FATAL: {name} loop panicked ({e}) — {name} has stopped and \
+                 will not resume until the process is restarted"
+            ),
+        }
+    });
+}
+
+/// Spawn the background logs compaction loop. Returns its `JoinHandle` so `main` can supervise
+/// it (see [`supervise`]) — the loop itself still runs forever; the handle is only used to
+/// detect the (should-never-happen) case where it exits.
 ///
-/// The compactor and the periodic `spawn`-based replication flush share one [`Replicator`]
-/// (its queue lives behind an `Arc<Mutex<_>>`, so clones enqueue into and drain from the same
-/// queue). `Replicator::spawn` drains whatever is queued and then exits, so it is re-spawned
-/// every tick.
+/// The compactor ENQUEUES compacted objects into the shared [`Replicator`] (its queue lives
+/// behind an `Arc<Mutex<_>>`, so every clone enqueues into the same queue). The actual
+/// hot -> durable drain is a single long-lived task spawned once in `main`
+/// ([`Replicator::spawn_drain_loop`]) — it is no longer re-spawned per tick here.
 fn spawn_compactor(
     wal: Arc<BroadcastingWal<DiskWal>>,
     storage: Storage,
@@ -464,10 +557,11 @@ fn spawn_compactor(
     schema: LogSchema,
     mut purge_rx: tokio::sync::mpsc::Receiver<PurgeCommand>,
     retention: Arc<RetentionAtomics>,
-    repl_tx: tokio::sync::mpsc::Sender<(String, u64)>,
-) {
+    zstd_level: i32,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let compactor = Compactor::new(wal, storage, Arc::new(replicator.clone()), schema);
+        let compactor =
+            Compactor::new(wal, storage, Arc::new(replicator), schema).with_zstd_level(zstd_level);
         let mut tick: u64 = 0;
         loop {
             tokio::select! {
@@ -495,20 +589,13 @@ fn spawn_compactor(
                     // Hourly retention: purge whole Parquet files older than the live cutoff.
                     if tick.is_multiple_of(PURGE_EVERY_TICKS) {
                         let days = retention.logs.load(std::sync::atomic::Ordering::Relaxed) as i64;
-                        let cutoff = now_nanos() - days * 86_400_000_000_000;
+                        let cutoff = retention_cutoff_nanos(now_nanos(), days);
                         if let Err(e) = compactor.purge_before(cutoff).await {
                             eprintln!("compactor: purge failed: {e}");
                         }
                     }
-
-                    // Flush hot -> durable replication. `spawn` drains-then-exits, so re-spawn each
-                    // tick; the handle is intentionally detached. Each successfully-replicated
-                    // object's (path, byte size) is forwarded to the recorder task for the usage
-                    // store (a full channel simply drops the sample — try_send never blocks).
-                    let tx = repl_tx.clone();
-                    replicator.clone().spawn(move |path, bytes| {
-                        let _ = tx.try_send((path, bytes));
-                    });
+                    // Replication is flushed by the single long-lived drain task spawned in
+                    // `main` (this loop only enqueues, via the compactor's `Replicator`).
                 }
                 // On-demand purge from the API: run it and reply with the report.
                 Some(cmd) = purge_rx.recv() => {
@@ -517,12 +604,13 @@ fn spawn_compactor(
                 }
             }
         }
-    });
+    })
 }
 
 /// Spawn the background spans compaction loop (drains the spans WAL into `data-spans/` Parquet
 /// and the spans manifest). Mirrors [`spawn_compactor`]; replication is flushed by the logs
-/// loop's shared `Replicator`, so this loop only compacts + merges.
+/// loop's shared `Replicator`, so this loop only compacts + merges. Returns its `JoinHandle` so
+/// `main` can supervise it (see [`supervise`]).
 fn spawn_span_compactor(
     wal: Arc<BroadcastingWal<DiskWal>>,
     storage: Storage,
@@ -530,9 +618,11 @@ fn spawn_span_compactor(
     schema: SpanSchema,
     mut purge_rx: tokio::sync::mpsc::Receiver<PurgeCommand>,
     retention: Arc<RetentionAtomics>,
-) {
+    zstd_level: i32,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let compactor = SpanCompactor::new(wal, storage, Arc::new(replicator), schema);
+        let compactor = SpanCompactor::new(wal, storage, Arc::new(replicator), schema)
+            .with_zstd_level(zstd_level);
         let mut tick: u64 = 0;
         loop {
             tokio::select! {
@@ -555,7 +645,7 @@ fn spawn_span_compactor(
                     }
                     if tick.is_multiple_of(PURGE_EVERY_TICKS) {
                         let days = retention.traces.load(std::sync::atomic::Ordering::Relaxed) as i64;
-                        let cutoff = now_nanos() - days * 86_400_000_000_000;
+                        let cutoff = retention_cutoff_nanos(now_nanos(), days);
                         if let Err(e) = compactor.purge_before(cutoff).await {
                             eprintln!("span-compactor: purge failed: {e}");
                         }
@@ -567,12 +657,13 @@ fn spawn_span_compactor(
                 }
             }
         }
-    });
+    })
 }
 
 /// Spawn the background metrics compaction loop (drains the metrics WAL into `data-metrics/`
 /// Parquet and the metrics manifest). Mirrors [`spawn_span_compactor`]; replication is flushed
-/// by the logs loop's shared `Replicator`, so this loop only compacts + merges.
+/// by the logs loop's shared `Replicator`, so this loop only compacts + merges. Returns its
+/// `JoinHandle` so `main` can supervise it (see [`supervise`]).
 fn spawn_metric_compactor(
     wal: Arc<BroadcastingWal<DiskWal>>,
     storage: Storage,
@@ -580,9 +671,11 @@ fn spawn_metric_compactor(
     schema: MetricSchema,
     mut purge_rx: tokio::sync::mpsc::Receiver<PurgeCommand>,
     retention: Arc<RetentionAtomics>,
-) {
+    zstd_level: i32,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let compactor = MetricsCompactor::new(wal, storage, Arc::new(replicator), schema);
+        let compactor = MetricsCompactor::new(wal, storage, Arc::new(replicator), schema)
+            .with_zstd_level(zstd_level);
         let mut tick: u64 = 0;
         loop {
             tokio::select! {
@@ -605,7 +698,7 @@ fn spawn_metric_compactor(
                     }
                     if tick.is_multiple_of(PURGE_EVERY_TICKS) {
                         let days = retention.metrics.load(std::sync::atomic::Ordering::Relaxed) as i64;
-                        let cutoff = now_nanos() - days * 86_400_000_000_000;
+                        let cutoff = retention_cutoff_nanos(now_nanos(), days);
                         if let Err(e) = compactor.purge_before(cutoff).await {
                             eprintln!("metric-compactor: purge failed: {e}");
                         }
@@ -617,7 +710,7 @@ fn spawn_metric_compactor(
                 }
             }
         }
-    });
+    })
 }
 
 /// How often the usage sampler snapshots per-signal footprint + ingest counters.
@@ -738,8 +831,29 @@ fn spawn_uptime(
 
 #[cfg(test)]
 mod tests {
-    use super::{healthcheck, metrics_promoted};
+    use super::{healthcheck, metrics_promoted, retention_cutoff_nanos};
     use std::net::TcpListener;
+
+    #[test]
+    fn retention_cutoff_nanos_saturates_instead_of_overflowing() {
+        // A naive `now - days * 86_400_000_000_000` overflows i64 for days > ~106_751 (u32::MAX
+        // is far past that), wrapping to a cutoff > now and causing the purge loop to delete
+        // every current file for that signal. Saturating arithmetic must instead clamp to a
+        // cutoff that is sane: no panic, and never in the future relative to `now`.
+        let now: i64 = 1_700_000_000_000_000_000;
+        let cutoff = retention_cutoff_nanos(now, u32::MAX as i64);
+        assert!(cutoff <= now);
+    }
+
+    #[test]
+    fn retention_cutoff_nanos_matches_plain_subtraction_for_normal_values() {
+        let now: i64 = 1_700_000_000_000_000_000;
+        let days: i64 = 30;
+        assert_eq!(
+            retention_cutoff_nanos(now, days),
+            now - days * 86_400_000_000_000
+        );
+    }
 
     #[test]
     fn metrics_promoted_injects_host_name_when_absent() {

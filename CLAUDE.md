@@ -174,7 +174,8 @@ semaphore, maps OTLP → an Arrow record, appends to that signal's WAL → the g
 completes = **the ack / durability boundary** (data survives a crash from here) → the signal's
 background compactor in `photon-server` drains each *closed* WAL segment into a sort-key-ordered
 Parquet file + `.idx` skip-index sidecar in the hot dir, enqueues an async replicate to the durable
-store, and updates the manifest → a lower-frequency `merge_once` consolidates small files →
+store, and updates the manifest → a lower-frequency `merge_once` consolidates small files (bounded
+per pass) →
 `photon-query` prunes candidate files via the manifest (time overlap) then the skip index (min/max +
 token bloom), and only then reads the surviving **local** Parquet with DataFusion.
 
@@ -186,7 +187,11 @@ token bloom), and only then reads the surviving **local** Parquet with DataFusio
 - **Local disk is the primary store**; the S3-compatible durable store is an async replica, never on
   the ack or query path. Ingest acks after the local WAL `fsync`, not after durable upload. The
   cold/durable **read** path is deliberately unimplemented (no `object_store` registered with
-  DataFusion). `[storage.durable]` is optional; omit it to run hot-tier-only.
+  DataFusion). `[storage.durable]` is optional; omit it to run hot-tier-only. The replicator is one
+  long-lived drain loop (bounded in-flight, retry + re-enqueue — never silently drops) carrying BOTH
+  uploads and **retention deletes**: `merge_once`/`purge_before` enqueue durable deletes for the
+  objects they unlink from hot (NotFound-tolerant), so the durable replica honors retention instead
+  of growing forever.
 - **Rows are sorted by the signal's sort key before Parquet encoding** (logs `(service.name,
   timestamp)`, spans `(service.name, start_time)`, metrics `(metric_name, service.name, host.name,
   timestamp)`) — this is what makes min/max pruning effective and compresses well. The compactor's

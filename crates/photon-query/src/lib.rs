@@ -398,7 +398,12 @@ impl QueryEngine {
             s.total_rows += e.row_count;
             s.min_ts_nanos = s.min_ts_nanos.min(e.min_ts_nanos);
             s.max_ts_nanos = s.max_ts_nanos.max(e.max_ts_nanos);
-            if let Ok(md) = std::fs::metadata(self.hot_dir.join(&e.path)) {
+            // Prefer the Parquet size the compactor recorded at write time — pure manifest
+            // arithmetic, no syscall. Legacy entries (written before `FileEntry.bytes`) carry
+            // `bytes == 0`; stat() ONLY those so the footprint stays exact during the transition.
+            if e.bytes > 0 {
+                s.bytes += e.bytes;
+            } else if let Ok(md) = std::fs::metadata(self.hot_dir.join(&e.path)) {
                 s.bytes += md.len();
             }
         }
@@ -472,7 +477,9 @@ impl QueryEngine {
             // sidecar must never drop a real result or abort the whole search — pruning stays
             // conservative. Log once per bad file (this runs once per candidate, not per row).
             Err(e) => {
-                eprintln!("photon-query: warning: keeping {idx_path:?}, skip index unreadable: {e}");
+                eprintln!(
+                    "photon-query: warning: keeping {idx_path:?}, skip index unreadable: {e}"
+                );
                 return Ok(true);
             }
         };
@@ -841,6 +848,8 @@ mod storage_stats_tests {
                 row_count: rows,
                 durable: false,
                 attribute_keys: vec![],
+                // Legacy entries (bytes == 0) → the footprint comes from the stat() fallback.
+                bytes: 0,
             });
         }
         std::fs::write(hot.join(MANIFEST_OBJECT_PATH), m.to_json().unwrap()).unwrap();
@@ -851,7 +860,47 @@ mod storage_stats_tests {
         assert_eq!(s.total_rows, 14);
         assert_eq!(s.min_ts_nanos, 100);
         assert_eq!(s.max_ts_nanos, 6000);
+        // Both entries are legacy (bytes == 0), so the total is the sum of the real on-disk sizes
+        // via the stat() fallback: 100 + 250 = 350.
         assert_eq!(s.bytes, 350);
+    }
+
+    #[tokio::test]
+    async fn storage_stats_prefers_recorded_bytes_and_falls_back_for_legacy() {
+        use photon_core::manifest::{FileEntry, Manifest, MANIFEST_OBJECT_PATH};
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hot.join("manifest")).unwrap();
+        std::fs::create_dir_all(hot.join("data")).unwrap();
+        // seg-a on disk is 100 bytes but its entry records 999 — so a correct sum must use the
+        // recorded field (999), NOT a stat() of the file (100). seg-b is legacy (bytes == 0) and
+        // must contribute its real 250-byte on-disk size via the fallback.
+        std::fs::write(hot.join("data/seg-a.parquet"), vec![0u8; 100]).unwrap();
+        std::fs::write(hot.join("data/seg-b.parquet"), vec![0u8; 250]).unwrap();
+        let mut m = Manifest::new();
+        for (path, seg, rows, bytes) in [
+            ("data/seg-a.parquet", 1u64, 10u64, 999u64),
+            ("data/seg-b.parquet", 2, 4, 0),
+        ] {
+            m.add(FileEntry {
+                path: path.into(),
+                segment_id: photon_core::segment::SegmentId(seg),
+                min_ts_nanos: 0,
+                max_ts_nanos: 100,
+                min_service: "api".into(),
+                max_service: "web".into(),
+                row_count: rows,
+                durable: false,
+                attribute_keys: vec![],
+                bytes,
+            });
+        }
+        std::fs::write(hot.join(MANIFEST_OBJECT_PATH), m.to_json().unwrap()).unwrap();
+
+        let engine = QueryEngine::new(hot, LogSchema::new(&["service.name".to_string()])).unwrap();
+        let s = engine.storage_stats().unwrap();
+        // 999 (recorded field, proving no stat of the 100-byte file) + 250 (legacy fallback stat).
+        assert_eq!(s.bytes, 999 + 250);
     }
 }
 
@@ -1029,6 +1078,7 @@ mod corrupt_idx_keep_tests {
             row_count: 1,
             durable: false,
             attribute_keys: vec![],
+            bytes: 0,
         });
         let man_path = hot.join(MANIFEST_OBJECT_PATH);
         std::fs::create_dir_all(man_path.parent().unwrap()).unwrap();

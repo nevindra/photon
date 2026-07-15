@@ -10,7 +10,9 @@ accounting and retention management (including manual purge).
 - **Engine:** `storage_stats` (`QueryEngine`) + the usage sampler (spawned in `photon-server`).
   Retention purge is routed to the three per-signal compactors over an mpsc channel; each runs
   `purge_before(cutoff)` → `PurgeReport` (`photon-core/src/retention.rs`).
-- **Config:** `[retention].days` (default 30, must be > 0).
+- **Config:** `[retention].days` (default 30; must be `> 0` and `<= MAX_RETENTION_DAYS` — 36,500,
+  i.e. 100 years — enforced in both `Config::validate` and `PUT /api/retention`, since the retention
+  loops' cutoff arithmetic (`now - days * 86_400_000_000_000` ns) overflows `i64` well past that).
 - **Trait seam:** `DataAdmin` (defined in `photon-api`, implemented in `photon-server`).
 
 ## API

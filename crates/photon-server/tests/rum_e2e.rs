@@ -485,6 +485,7 @@ async fn rum_beacon_maps_to_queryable_rows() {
         hot_dir: hot.clone(),
         db_path: String::new(),
         durable: None,
+        zstd_level: 1,
     })
     .unwrap();
     let replicator = Arc::new(Replicator::new(storage.clone()));

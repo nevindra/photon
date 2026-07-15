@@ -15,6 +15,12 @@ use parquet::file::properties::WriterProperties;
 use photon_core::PhotonError;
 use photon_storage::Storage;
 
+/// Default zstd compression level: matches the level `Compression::ZSTD(Default::default())`
+/// hardcoded before the level became configurable, so a compactor built via `::new` (without a
+/// `.with_zstd_level(..)` override) streams byte-identical Parquet to the pre-config behavior —
+/// `parquet::basic::ZstdLevel::try_new(1)` equals `ZstdLevel::default()` in parquet 53.
+pub(crate) const DEFAULT_ZSTD_LEVEL: i32 = 1;
+
 /// Resolve an object path to its real on-disk location under the hot store's local root, so a
 /// blocking task can stream a Parquet encode straight to a `File`. The object path maps 1:1 onto
 /// `<hot_dir>/<object_path>`, so the same hot store still serves it via `get`. Errors when the hot
@@ -52,11 +58,13 @@ pub(crate) async fn fsync_manifest(
 /// parent directory so the rename itself is crash-durable — a crash mid-write can never leave a
 /// torn file visible at `target`, and a crash after the rename can never lose it. The parent dir is
 /// created first — a raw `std::fs` write, unlike `object_store::put`, does not auto-create parents.
-/// Compression matches the former in-memory encoder exactly (zstd default), so the file reads back
-/// byte-equivalent to what `object_store::put(encode_parquet(..))` produced.
+/// `zstd_level` is the configured `[storage] zstd_level` (validated to `1..=19` at config load);
+/// the default (1) is byte-identical to the former hardcoded zstd default, so the file reads back
+/// byte-equivalent to what `object_store::put(encode_parquet(..))` produced at that level.
 pub(crate) fn write_parquet_streamed(
     target: &Path,
     batch: &RecordBatch,
+    zstd_level: i32,
 ) -> Result<(), PhotonError> {
     let parent = target.parent().ok_or_else(|| {
         PhotonError::Io(format!("parquet target {target:?} has no parent directory"))
@@ -68,8 +76,11 @@ pub(crate) fn write_parquet_streamed(
     let file = File::create(&tmp)
         .map_err(|e| PhotonError::Io(format!("failed to create {tmp:?}: {e}")))?;
 
+    let level = parquet::basic::ZstdLevel::try_new(zstd_level).map_err(|e| {
+        PhotonError::Config(format!("invalid storage.zstd_level {zstd_level}: {e}"))
+    })?;
     let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
+        .set_compression(Compression::ZSTD(level))
         .build();
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
         .map_err(|e| PhotonError::Arrow(e.to_string()))?;
@@ -116,4 +127,60 @@ fn tmp_path(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     target.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    fn sample_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
+    }
+
+    fn read_back(target: &Path) -> Vec<RecordBatch> {
+        let file = File::open(target).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        reader.map(|b| b.unwrap()).collect()
+    }
+
+    #[test]
+    fn default_level_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("out.parquet");
+        write_parquet_streamed(&target, &sample_batch(), DEFAULT_ZSTD_LEVEL).unwrap();
+
+        let batches = read_back(&target);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
+    /// A non-default level (still valid, `1..=19` per `Config::validate`) must also produce a
+    /// readable Parquet file — the level only changes the codec's internal effort, not the
+    /// logical rows the reader sees back.
+    #[test]
+    fn non_default_level_still_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("out.parquet");
+        write_parquet_streamed(&target, &sample_batch(), 9).unwrap();
+
+        let batches = read_back(&target);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn out_of_range_level_errors_instead_of_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("out.parquet");
+        let err = write_parquet_streamed(&target, &sample_batch(), 0).unwrap_err();
+        assert!(err.to_string().contains("zstd_level"));
+    }
 }
