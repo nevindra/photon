@@ -22,6 +22,10 @@ export function useFields(startNs: MaybeRefOrGetter<string>, endNs: MaybeRefOrGe
   return useQuery({
     queryKey: computed(() => ['fields', String(toValue(startNs)), String(toValue(endNs))]),
     queryFn: ({ signal }) => api.fields(toValue(startNs), toValue(endNs), { signal }),
+    // The field set rarely changes; hold it fresh for a bucket-width so a remount within the same
+    // (60s-rounded) window serves from cache instead of refetching (new attribute keys still surface
+    // within a minute, and any window change is a new key that refetches immediately).
+    staleTime: 60_000,
   })
 }
 

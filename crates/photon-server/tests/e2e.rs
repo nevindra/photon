@@ -155,6 +155,7 @@ async fn ingest_wal_compact_query_end_to_end() {
         hot_dir: hot.clone(),
         db_path: String::new(),
         durable: None,
+        zstd_level: 1,
     })
     .unwrap();
     let replicator = Arc::new(Replicator::new(storage.clone()));
@@ -381,6 +382,7 @@ async fn spawn_live_server() -> LiveServer {
         span_schema,
         metric_schema,
         256,
+        16 * 1024 * 1024,
         Arc::new(photon_core::ingest_counters::IngestCounters::new()),
     );
     let grpc_addr = free_addr();
@@ -651,6 +653,7 @@ async fn compact_metrics(server: &LiveServer) {
         hot_dir: server.hot_dir.clone(),
         db_path: String::new(),
         durable: None,
+        zstd_level: 1,
     })
     .unwrap();
     let replicator = Arc::new(Replicator::new(storage.clone()));

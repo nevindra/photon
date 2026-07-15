@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use photon_query::HistogramBucket;
 
-use crate::query_params::build_query_request;
+use crate::query_params::{build_query_request, clamp_buckets};
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -37,7 +37,7 @@ pub(crate) async fn histogram(
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    match state.query.histogram(req, p.buckets).await {
+    match state.query.histogram(req, clamp_buckets(p.buckets)).await {
         Ok(buckets) => Json(buckets.iter().map(bucket_to_json).collect::<Vec<_>>()).into_response(),
         Err(e) => (
             axum::http::StatusCode::BAD_REQUEST,
@@ -86,5 +86,32 @@ mod tests {
         assert_eq!(arr.len(), 4);
         assert_eq!(arr[0]["total"], serde_json::json!(0));
         assert!(arr[0]["t"].is_string()); // nanos as string
+    }
+
+    #[tokio::test]
+    async fn histogram_clamps_a_dos_sized_bucket_count() {
+        // The `/api/histogram` twin of the `/api/traces/latency` OOM repro: `buckets=2000000000`
+        // would otherwise allocate a huge `Vec<HistogramBucket>` before any query runs.
+        let router = crate::test_router();
+        let cookie = crate::session_cookie(&router).await;
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/histogram?start=0&end=100&buckets=2000000000")
+                    .header(axum::http::header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v.as_array().unwrap().len(),
+            crate::query_params::MAX_BUCKETS
+        );
     }
 }

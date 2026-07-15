@@ -22,6 +22,14 @@ grpc_addr = "0.0.0.0:4317"
 # for a permit — bounds peak decoded-batch memory (roughly max_in_flight * max decoded batch
 # size) so a saturation burst can't pile decoded batches on the heap. Optional; defaults to 256.
 max_in_flight = 256
+# Max request body size (bytes) accepted by both front doors, enforced on the DECOMPRESSED
+# stream: a stock OTel Collector gzips OTLP bodies by default, so gzipped requests are
+# transparently inflated first (HTTP `Content-Encoding: gzip`; gRPC `accept_compressed`), then
+# this bound applies. HTTP (DefaultBodyLimit) and gRPC (max_decoding_message_size) share it so
+# the two agree instead of an exporter retrying a silent 413 forever. Also caps the Prometheus
+# remote-write snappy decompression. Optional; defaults to ~16 MiB (16777216).
+# Override with the PHOTON_INGEST_MAX_BODY_BYTES env var.
+max_body_bytes = 16777216
 
 # --- Storage -----------------------------------------------------------------------------
 [storage]
@@ -30,6 +38,10 @@ hot_dir = "/var/lib/photon/hot"
 # Shared control-plane SQLite database: UI user accounts and uptime monitors.
 # Always used — required for login and by the always-on uptime subsystem.
 db_path = "/var/lib/photon/photon.db"
+# zstd compression level for compacted Parquet files. Range 1-19. Higher = smaller files
+# (roughly 10-30% smaller at level 3) but more CPU per compaction pass. Optional; defaults to 1
+# (fastest/lowest-ratio — byte-identical to the level Photon used before this was configurable).
+# zstd_level = 1
 
 # `[storage.durable]` is OPTIONAL. Omit the whole section to run hot-tier only (no
 # replication). When present, compacted objects are replicated hot -> durable to an

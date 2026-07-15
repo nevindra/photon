@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 
 use photon_query::DepRow;
 
-use crate::query_params::build_span_query_request;
+use crate::query_params::{build_span_query_request, clamp_buckets};
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -67,7 +67,7 @@ pub(crate) async fn timeseries(
     // Capture the window before `req` is moved into `red_timeseries` — it powers the per-bucket
     // rate denominator.
     let (start_ns, end_ns) = (req.start_ts_nanos, req.end_ts_nanos);
-    let buckets = p.buckets.max(1);
+    let buckets = clamp_buckets(p.buckets);
     let secs_per_bucket = bucket_seconds(start_ns, end_ns, buckets);
     let (threshold_ms, _is_default) = resolve_threshold(&state, &service).await;
 
@@ -504,6 +504,24 @@ mod tests {
         let (s, v) = get(&app, "/api/services/web/dependencies?start=0&end=100").await;
         assert_eq!(s, axum::http::StatusCode::OK);
         assert!(v["database"].is_array() && v["external"].is_array());
+    }
+
+    #[tokio::test]
+    async fn timeseries_clamps_a_dos_sized_bucket_count() {
+        // The [P1 · DoS] repro shape (`buckets=2000000000` would otherwise allocate a huge
+        // `Vec` before any query runs) — must return 200 with exactly `MAX_BUCKETS` buckets,
+        // not hang/OOM.
+        let app = router_with_data_admin();
+        let (s, v) = get(
+            &app,
+            "/api/services/web/timeseries?start=0&end=100&buckets=2000000000",
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(
+            v.as_array().unwrap().len(),
+            crate::query_params::MAX_BUCKETS
+        );
     }
 
     #[tokio::test]

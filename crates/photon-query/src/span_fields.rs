@@ -67,6 +67,7 @@ mod tests {
             row_count: 1,
             durable: false,
             attribute_keys: keys.iter().map(|s| s.to_string()).collect(),
+            bytes: 0,
         }
     }
 

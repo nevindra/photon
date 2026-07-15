@@ -2,7 +2,7 @@
 
 # Photon
 
-**Fast, lightweight, OTEL-native observability — logs, traces, metrics, APM, uptime, and RUM in a single Rust binary.**
+**Fast, lightweight, OTEL-native observability — logs, traces, metrics, APM, RUM, uptime, and host/GPU monitoring in a single Rust binary.**
 
 A self-hosted alternative to SigNoz, Datadog, Sentry, and Grafana that aims to be _better, faster, and cheaper_:
 one process, one binary, your disk, your data.
@@ -41,11 +41,13 @@ Photon is a **full-signal** platform, not just a log store. Every section below 
 
 | Section | What it does |
 |---|---|
+| **Home** | A cross-signal landing dashboard that stitches recent activity from every signal into one at-a-glance overview (the default view). |
 | **Logs** | OTLP log explorer with a small query grammar (`field:value`, OR-lists, negation, numeric compare, free-text), facets, severity histogram, and live tail. |
 | **Traces** | Distributed-trace explorer + waterfall detail view, with log↔trace↔span correlation. |
 | **Services (APM)** | Per-service RED metrics (Rate/Errors/Duration), Apdex, health-first service list, and per-service dashboards derived from trace spans. |
 | **Metrics** | OTLP metrics explorer (gauges, sums, histograms/summaries) with a query builder and a metric catalog. |
 | **RUM** | Real-User Monitoring: Core Web Vitals (LCP/INP/CLS/FCP/TTFB) + JS error tracking from a tiny browser SDK, sliceable per app / route / device / browser. |
+| **Infrastructure** | Host & NVIDIA-GPU resource monitoring — CPU / RAM / disk / network + GPU util / memory / temperature — pushed by a tiny standalone `photon-agent`, with a per-host dashboard. |
 | **Uptime** | Always-on synthetic HTTP/ping monitors with per-monitor intervals, timeouts, and webhook alerts. |
 | **Data** | Data-usage and storage monitoring + retention management, so you can see and bound what you're keeping. |
 
@@ -58,7 +60,7 @@ service's RED metrics → the errors on that page) is a click, not an integratio
 |---|---|---|---|---|---|
 | Deployment | 1 binary / 1 container | ClickHouse + collector + UI | Loki + Tempo + Mimir + Grafana | SaaS agent | SaaS SDK |
 | Storage engine | Embedded (Parquet + DataFusion) | ClickHouse server | 3 separate TSDB/stores | Proprietary cloud | Proprietary cloud |
-| Signals | Logs, traces, metrics, APM, uptime, RUM | Logs, traces, metrics | Logs, traces, metrics | All + more | Errors, some tracing/RUM |
+| Signals | Logs, traces, metrics, APM, RUM, uptime, infra (host/GPU) | Logs, traces, metrics | Logs, traces, metrics | All + more | Errors, some tracing/RUM |
 | Log index | Skip index (min/max + bloom) | Inverted / ClickHouse | Loki labels | Proprietary | — |
 | RUM SDK size | **< 5 KB gzip** | n/a | Faro (~larger) | ~25–40 KB | ~20 KB+ |
 | Cost model | Self-host, flat | Self-host | Self-host | Per-host/GB/seat | Per-event/seat |
@@ -104,6 +106,19 @@ remote_write:
     authorization:
       credentials: <ingest token>   # matches [ingest].token
 ```
+
+### Host & GPU resource monitoring
+
+Run the standalone `photon-agent` on any box to stream host CPU / RAM / disk / network — and NVIDIA
+GPU util / memory / temperature — as OTLP `system.*` metrics tagged with `host.name`. They surface in
+the **Infrastructure → Hosts** UI (`/infra`) with a per-host dashboard:
+
+```bash
+cargo run -p photon-agent -- --endpoint http://127.0.0.1:4318/v1/metrics   # $PHOTON_INGEST_TOKEN read from env
+```
+
+It's an ordinary metrics producer — no new storage engine — see
+[`docs/subsystems/infra.md`](docs/subsystems/infra.md).
 
 ### Local development (both processes, hot reload)
 
@@ -170,6 +185,7 @@ photon-uptime   always-on synthetic HTTP/ping monitors
 photon-api      axum REST API + session auth + embedded Vue UI
 photon-server   the binary: config, wiring, background-task supervision
 photon-loadgen  dev-only OTLP load generator
+photon-agent    standalone host/GPU resource-metrics agent (its own binary)
 ```
 
 **Write path (one signal):** OTLP request → token check → map to Arrow record → **WAL append**

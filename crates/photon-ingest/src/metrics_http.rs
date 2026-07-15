@@ -3,7 +3,7 @@
 //! is touched.
 
 use crate::auth::check_bearer_token;
-use crate::otlp_metrics_to_points;
+use crate::metrics_mapping::{estimate_rows, otlp_metrics_into_builder};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -52,6 +52,16 @@ async fn ingest_metrics<W: Wal + Send + Sync + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Cheap token check first so an unauthenticated flood is rejected before it ever
+    // competes for an in-flight permit; the permit exists to bound expensive work
+    // (decode→build→append), not free rejections.
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if !check_bearer_token(auth_header, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+
     let _permit = match state.in_flight.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => {
@@ -63,23 +73,13 @@ async fn ingest_metrics<W: Wal + Send + Sync + 'static>(
         }
     };
 
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if !check_bearer_token(auth_header, &state.token) {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
-    }
-
     let req = match decode_metrics_request(&body) {
         Ok(req) => req,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
-    let points = otlp_metrics_to_points(req);
-    let mut builder = MetricBatchBuilder::new(&state.schema);
-    for point in &points {
-        builder.append(point);
-    }
+    let mut builder = MetricBatchBuilder::with_capacity(&state.schema, estimate_rows(&req));
+    otlp_metrics_into_builder(req, &mut builder);
     let batch = match builder.finish() {
         Ok(batch) => batch,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

@@ -108,6 +108,65 @@ impl Storage {
     pub fn index_path_metrics(seg: SegmentId) -> String {
         format!("data-metrics/{}.idx", segment_stem(seg))
     }
+
+    /// Sweep orphaned `*.tmp` files left behind under the hot store's local root.
+    ///
+    /// `write_parquet_streamed` (`photon-compact`) writes each Parquet to a sibling
+    /// `<target>.tmp` path, fsyncs it, then atomically renames it into place. A crash between
+    /// `File::create(tmp)` and the `rename` leaves that `.tmp` file on disk forever — nothing
+    /// else ever revisits it. This is a best-effort startup sweep (called once in `photon-server`'s
+    /// `main`, before the compactors are spawned): it recursively walks `data/`, `data-spans/`,
+    /// `data-metrics/`, and any other subdirectory under the root, removing every file whose name
+    /// ends in `.tmp` and returning the count removed. Directories are only ever recursed into,
+    /// never deleted, and only entries reported as plain files by `DirEntry::file_type()` (which
+    /// does not follow symlinks) are considered.
+    ///
+    /// A no-op returning `0` when the hot store isn't local (`hot_local_root()` is `None` — the
+    /// in-memory stores used by some tests), since there's nothing on disk to sweep. Individual
+    /// entries that error (permission issues, races with a concurrent writer, etc.) are skipped —
+    /// this is best-effort cosmetic cleanup, not a correctness path — but a failure to read the
+    /// root itself is a hard error.
+    pub fn sweep_stale_tmp_files(&self) -> Result<usize, PhotonError> {
+        let Some(root) = self.hot_local_root() else {
+            return Ok(0);
+        };
+        let mut count = 0usize;
+        sweep_tmp_dir(root, &mut count, true)?;
+        Ok(count)
+    }
+}
+
+/// Recursive helper for [`Storage::sweep_stale_tmp_files`]. `is_root` controls whether a failure
+/// to read `dir` itself is propagated (only true for the very first call) or silently skipped
+/// (every deeper directory, so one unreadable subtree can't abort the whole sweep).
+fn sweep_tmp_dir(dir: &Path, count: &mut usize, is_root: bool) -> Result<(), PhotonError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if is_root => {
+            return Err(PhotonError::Storage(format!(
+                "failed to read hot store root {dir:?}: {e}"
+            )));
+        }
+        Err(_) => return Ok(()),
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            // Best-effort: an unreadable subdirectory doesn't abort the rest of the sweep.
+            let _ = sweep_tmp_dir(&path, count, false);
+        } else if file_type.is_file()
+            && path.extension().is_some_and(|ext| ext == "tmp")
+            && std::fs::remove_file(&path).is_ok()
+        {
+            *count += 1;
+        }
+    }
+    Ok(())
 }
 
 /// `SegmentId::filename()` yields `seg-<hex>.wal`; strip the `.wal` extension to get the
@@ -134,6 +193,7 @@ mod tests {
             hot_dir: tmp.path().to_path_buf(),
             db_path: String::new(),
             durable: None,
+            zstd_level: 1,
         };
 
         let storage = Storage::from_config(&cfg).unwrap();
@@ -158,6 +218,7 @@ mod tests {
             hot_dir: hot_dir.clone(),
             db_path: String::new(),
             durable: None,
+            zstd_level: 1,
         };
 
         let storage = Storage::from_config(&cfg).unwrap();
@@ -214,5 +275,52 @@ mod tests {
         assert!(Storage::parquet_path_metrics(seg).ends_with(".parquet"));
         assert!(Storage::index_path_metrics(seg).starts_with("data-metrics/"));
         assert!(Storage::index_path_metrics(seg).ends_with(".idx"));
+    }
+
+    #[test]
+    fn sweep_removes_orphaned_tmp_files_but_keeps_real_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = StorageConfig {
+            hot_dir: tmp.path().to_path_buf(),
+            db_path: String::new(),
+            durable: None,
+            zstd_level: 1,
+        };
+        let storage = Storage::from_config(&cfg).unwrap();
+
+        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("data-spans")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("data-metrics")).unwrap();
+
+        // Orphaned .tmp files across the three signal subdirs — these must be swept.
+        std::fs::write(tmp.path().join("data/x.parquet.tmp"), b"stale").unwrap();
+        std::fs::write(tmp.path().join("data-spans/a.parquet.tmp"), b"stale").unwrap();
+        std::fs::write(tmp.path().join("data-metrics/b.parquet.tmp"), b"stale").unwrap();
+
+        // A real, already-renamed Parquet file — must survive the sweep.
+        std::fs::write(tmp.path().join("data/y.parquet"), b"real").unwrap();
+
+        let removed = storage.sweep_stale_tmp_files().unwrap();
+        assert_eq!(removed, 3);
+
+        assert!(!tmp.path().join("data/x.parquet.tmp").exists());
+        assert!(!tmp.path().join("data-spans/a.parquet.tmp").exists());
+        assert!(!tmp.path().join("data-metrics/b.parquet.tmp").exists());
+        assert!(tmp.path().join("data/y.parquet").exists());
+
+        // Sweeping again is a no-op (nothing left to remove).
+        let removed_again = storage.sweep_stale_tmp_files().unwrap();
+        assert_eq!(removed_again, 0);
+    }
+
+    #[test]
+    fn sweep_is_a_no_op_for_non_local_hot_store() {
+        let hot: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let storage = Storage {
+            hot,
+            durable: None,
+            hot_dir: None,
+        };
+        assert_eq!(storage.sweep_stale_tmp_files().unwrap(), 0);
     }
 }

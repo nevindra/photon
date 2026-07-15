@@ -49,7 +49,10 @@ impl SpanQueryEngine {
         buckets: usize,
         threshold_ms: u32,
     ) -> Result<Vec<RedBucket>, PhotonError> {
-        let buckets = buckets.max(1);
+        // Defense-in-depth: mirrors `photon-api`'s `MAX_BUCKETS`
+        // (`crates/photon-api/src/query_params.rs`); `photon-query` can't depend on `photon-api`,
+        // so the value is restated here as a literal.
+        let buckets = buckets.clamp(1, 3000);
         match self.span_survivors_df(&req).await? {
             None => Ok(empty_buckets(start, end, buckets)),
             Some(df) => {
@@ -392,5 +395,27 @@ mod tests {
             out.iter().map(|b| b.ts).collect::<Vec<_>>(),
             vec![0, 25, 50, 75]
         );
+    }
+
+    #[tokio::test]
+    async fn engine_method_clamps_a_dos_sized_bucket_count() {
+        // Defense-in-depth for the public `SpanQueryEngine::red_timeseries` entry point itself
+        // (powers the Services detail-page charts, e.g. `GET /api/services/:service/timeseries`).
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SpanQueryEngine::new(dir.path().to_path_buf(), SpanSchema::new(&[])).unwrap();
+        let req = SpanQueryRequest {
+            start_ts_nanos: 0,
+            end_ts_nanos: 100,
+            query: None,
+            sort: SpanSort::Recent,
+            limit: 0,
+            offset: 0,
+            projected_attributes: Vec::new(),
+        };
+        let out = engine
+            .red_timeseries(req, 0, 100, 10_000_000, 500)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 3000, "buckets must be clamped to MAX_BUCKETS");
     }
 }

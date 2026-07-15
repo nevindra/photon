@@ -83,6 +83,7 @@ fn entry_from(records: &[LogRecord], seg: SegmentId) -> FileEntry {
         row_count: records.len() as u64,
         durable: false,
         attribute_keys: Vec::new(),
+        bytes: 0,
     }
 }
 
@@ -170,8 +171,8 @@ async fn distinct_services_returns_sorted_distinct() {
 
     let got = engine(&dir).distinct_services().await.unwrap();
     assert_eq!(
-        got,
-        vec!["api".to_string(), "db".to_string(), "web".to_string()]
+        got.as_ref(),
+        &vec!["api".to_string(), "db".to_string(), "web".to_string()]
     );
 }
 
@@ -183,10 +184,10 @@ async fn distinct_services_returns_sorted_distinct() {
 async fn distinct_services_empty_store_returns_empty() {
     let dir = TempDir::new().unwrap();
     // No manifest at all (brand-new hot dir).
-    assert!(engine(&dir).distinct_services().await.unwrap().is_empty());
+    assert!(engine(&dir).distinct_services().await.unwrap().as_ref().is_empty());
     // Explicit empty manifest — the exact post-purge state (`{"entries":[]}`).
     write_manifest(dir.path(), vec![]);
-    assert!(engine(&dir).distinct_services().await.unwrap().is_empty());
+    assert!(engine(&dir).distinct_services().await.unwrap().as_ref().is_empty());
 }
 
 /// 1. A time-range search returns only the rows inside the window, newest first.
@@ -258,17 +259,21 @@ async fn search_service_prunes_files_and_filters_rows() {
     assert_eq!(ts, vec![200, 100]);
 }
 
-/// 3. A `text` search returns only matching rows; a file whose bloom lacks the token is
-///    skipped entirely. The skipped file's Parquet is deliberately corrupt: if the bloom
-///    prune failed and the engine tried to read it, the query would error.
+/// 3. A `text` search returns only matching rows; a file whose bloom lacks a *bloom-safe*
+///    (interior, both-sides-delimited) token of the search string is skipped entirely. The search
+///    text `"an alpha login"` has one interior token — `alpha` — so bloom pruning is exercised
+///    (a single word like `"alpha"` alone would be an edge token: substring semantics forbid
+///    bloom-pruning on it, since `alpha` could be a fragment of `alphabet`). The skipped file's
+///    Parquet is deliberately corrupt: if the bloom prune failed and the engine tried to read it,
+///    the query would error.
 #[tokio::test]
 async fn search_text_prunes_via_bloom_and_confirms_rows() {
     let dir = tempfile::tempdir().unwrap();
     let s = schema();
 
-    // File A: has an "alpha" row and a non-matching "delta" row.
+    // File A: has a matching "an alpha login" row and a non-matching "delta" row.
     let a = vec![
-        record(1000, "svc", "alpha login ok"),
+        record(1000, "svc", "an alpha login ok"),
         record(1100, "svc", "delta logout"),
     ];
     let ea = write_segment(dir.path(), SegmentId(1), &a, &s);
@@ -294,7 +299,8 @@ async fn search_text_prunes_via_bloom_and_confirms_rows() {
             end_ts_nanos: 100_000,
             services: vec![],
             severities: vec![],
-            text: Some("alpha".to_string()),
+            // Interior token `alpha` drives the bloom prune; the whole string is the row predicate.
+            text: Some("an alpha login".to_string()),
             query: None,
             limit: 100,
         })
@@ -304,8 +310,79 @@ async fn search_text_prunes_via_bloom_and_confirms_rows() {
     let got = rows(&out);
     assert_eq!(
         got,
-        vec![(1000, "svc".to_string(), "alpha login ok".to_string())],
-        "only the alpha row, corrupt bloom-pruned file never read"
+        vec![(1000, "svc".to_string(), "an alpha login ok".to_string())],
+        "only the matching row, corrupt bloom-pruned file never read"
+    );
+}
+
+/// A well-framed but corrupt `.idx`: valid magic and version, but `num_bits = 0`. Before the
+/// decode and keep-on-error hardening this both aborted the search and panicked (divide-by-zero)
+/// inside the bloom when the query engine tried to bloom-test it. Written next to a VALID parquet
+/// so the file must be kept and its matching rows must come through.
+fn write_corrupt_zero_bits_idx(path: &Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut b = Vec::new();
+    b.extend_from_slice(b"PXSK");
+    b.push(2); // version
+    b.extend_from_slice(&0u64.to_le_bytes()); // num_bits = 0 (poison)
+    b.extend_from_slice(&1u32.to_le_bytes()); // num_hashes
+    b.extend_from_slice(&0u64.to_le_bytes()); // bits_len = 0
+    b.push(0); // has_timestamp = 0
+    b.push(0); // has_service = 0
+    b.push(0); // has_host = 0
+    fs::write(path, b).unwrap();
+}
+
+/// 3a. A corrupt/undecodable `.idx` must KEEP its file (conservative pruning), so a search over a
+///     window that includes one torn sidecar still returns the good files' rows AND the corrupt-
+///     sidecar file's matching rows — never a query error and never a panic. The bad sidecar here
+///     is well-framed but claims `num_bits = 0`; before the fix this decoded to a poisoned bloom
+///     that divided by zero on the first membership probe, panicking the whole search.
+#[tokio::test]
+async fn search_keeps_file_with_corrupt_idx_and_still_returns_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = schema();
+
+    // File A: good idx + parquet, with a row matching "an alpha login".
+    let a = vec![
+        record(1000, "svc", "an alpha login ok"),
+        record(1100, "svc", "delta logout"),
+    ];
+    let ea = write_segment(dir.path(), SegmentId(1), &a, &s);
+
+    // File B: VALID parquet with a matching row, but a CORRUPT (num_bits = 0) idx. It cannot be
+    // bloom-pruned; conservative pruning must keep it and its rows must be returned.
+    let b = vec![
+        record(1050, "svc", "please an alpha login now"),
+        record(1150, "svc", "beta only"),
+    ];
+    let bb = build_batch(&b, &s);
+    write_parquet(&dir.path().join(Storage::parquet_path(SegmentId(2))), &bb);
+    write_corrupt_zero_bits_idx(&dir.path().join(Storage::index_path(SegmentId(2))));
+    let eb = entry_from(&b, SegmentId(2));
+
+    write_manifest(dir.path(), vec![ea, eb]);
+
+    let out = engine(&dir)
+        .search(QueryRequest {
+            start_ts_nanos: 0,
+            end_ts_nanos: 10_000,
+            services: vec![],
+            severities: vec![],
+            // Interior token `alpha` drives the bloom step; the whole string is the row predicate.
+            text: Some("an alpha login".to_string()),
+            query: None,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+
+    // Both matching rows returned, newest first: the good file's AND the corrupt-sidecar file's.
+    let ts: Vec<i64> = rows(&out).iter().map(|(t, _, _)| *t).collect();
+    assert_eq!(
+        ts,
+        vec![1050, 1000],
+        "a corrupt .idx keeps its file; both matching rows come through"
     );
 }
 

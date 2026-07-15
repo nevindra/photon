@@ -5,7 +5,7 @@ use arrow::array::{Array, Int32Array, Int64Array};
 use arrow::datatypes::DataType;
 use datafusion::dataframe::DataFrame;
 use datafusion::functions_aggregate::expr_fn::count;
-use datafusion::prelude::{cast, lit, when, Expr};
+use datafusion::prelude::{cast, lit, Expr};
 
 use photon_core::schema;
 use photon_core::PhotonError;
@@ -31,7 +31,12 @@ impl QueryEngine {
         req: QueryRequest,
         buckets: usize,
     ) -> Result<Vec<HistogramBucket>, PhotonError> {
-        let buckets = buckets.max(1);
+        // Defense-in-depth: the engine is a public API in its own right, so it must not trust a
+        // caller's `buckets` even though `photon-api`'s handlers already clamp it — a huge value
+        // would otherwise allocate a proportionally huge `Vec` below. Mirrors `photon-api`'s
+        // `MAX_BUCKETS` (`crates/photon-api/src/query_params.rs`); `photon-query` can't depend on
+        // `photon-api`, so the value is restated here as a literal.
+        let buckets = buckets.clamp(1, 3000);
         let (start, end) = (req.start_ts_nanos, req.end_ts_nanos);
         match self.survivors_df(&req).await? {
             None => Ok(empty_buckets(start, end, buckets)),
@@ -79,18 +84,14 @@ pub(crate) async fn histogram_over(
     end: i64,
     buckets: usize,
 ) -> Result<Vec<HistogramBucket>, PhotonError> {
-    let span = (end - start).max(1);
-    // bucket = ((ts_nanos - start) * buckets) / span, integer division. All rows satisfy the
-    // predicate's `ts BETWEEN start AND end`, so bucket ∈ [0, buckets]; ts == end maps to
-    // `buckets`, which we clamp down to the last bucket.
+    // bucket = (ts_nanos - start) / step, divide-first (see `crate::bucket_math`) so wide
+    // windows don't overflow i64 the way `(ts - start) * buckets / span` does past ~35 days at
+    // buckets = 3000. All rows satisfy the predicate's `ts BETWEEN start AND end`, so bucket ∈
+    // [0, buckets]; ts == end maps to `buckets`, which the shared helper clamps to the last
+    // bucket.
     let ts_nanos = cast(col_ref(schema::TIMESTAMP), DataType::Int64);
-    let raw = (ts_nanos - lit(start)) * lit(buckets as i64) / lit(span);
-    let bucket = when(
-        raw.clone().gt_eq(lit(buckets as i64)),
-        lit(buckets as i64 - 1),
-    )
-    .otherwise(raw)
-    .map_err(|e| PhotonError::Query(format!("histogram bucket case: {e}")))?;
+    let bucket = crate::bucket_math::bucket_index_expr(ts_nanos, start, end, buckets)
+        .map_err(|e| PhotonError::Query(format!("histogram bucket case: {e}")))?;
 
     let batches = df
         .filter(predicate)
@@ -224,5 +225,64 @@ mod tests {
 
     fn lit_true() -> datafusion::prelude::Expr {
         datafusion::prelude::lit(true)
+    }
+
+    #[tokio::test]
+    async fn wide_window_bucket_index_does_not_overflow() {
+        // Regression for the i64-overflow bug: the old multiply-first bucket-index Expr
+        // (`(ts - start) * buckets / span`) overflowed `i64` once the window exceeded ~35 days at
+        // `buckets = 3000` (`span * buckets > i64::MAX`). A 90-day window at the max bucket count
+        // exercises exactly that overflow through the real DataFusion `Expr` path (not just the
+        // pure-Rust helper covered by `bucket_math`'s unit tests).
+        const NS_PER_DAY: i64 = 24 * 3600 * 1_000_000_000;
+        let end = 90 * NS_PER_DAY;
+        let buckets = 3000usize;
+        assert!(
+            end.checked_mul(buckets as i64).is_none(),
+            "window must be wide enough to have overflowed the old multiply-first formula"
+        );
+
+        let records = vec![
+            rec(0, Some(18)),      // window start -> bucket 0
+            rec(end / 2, Some(9)), // mid window
+            rec(end, None),        // window end -> last bucket
+        ];
+        let df = df_of(&records).await;
+        let out = histogram_over(df, lit_true(), 0, end, buckets)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), buckets);
+        assert_eq!(out[0].error, 1, "row at window start must land in bucket 0");
+        assert_eq!(
+            out[buckets - 1].info,
+            1,
+            "row at window end must land in the last bucket"
+        );
+        assert_eq!(
+            out.iter().map(|b| b.total).sum::<u64>(),
+            3,
+            "no rows lost or duplicated across buckets"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_method_clamps_a_dos_sized_bucket_count() {
+        // Defense-in-depth for the public `QueryEngine::histogram` entry point itself, not just
+        // `histogram_over` — a direct caller passing e.g. `buckets = 10_000_000` must not drive a
+        // multi-million-entry allocation.
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            crate::QueryEngine::new(dir.path().to_path_buf(), LogSchema::new(&[])).unwrap();
+        let req = crate::QueryRequest {
+            start_ts_nanos: 0,
+            end_ts_nanos: 100,
+            services: Vec::new(),
+            severities: Vec::new(),
+            text: None,
+            query: None,
+            limit: 0,
+        };
+        let out = engine.histogram(req, 10_000_000).await.unwrap();
+        assert_eq!(out.len(), 3000, "buckets must be clamped to MAX_BUCKETS");
     }
 }

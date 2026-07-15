@@ -18,7 +18,7 @@ use photon_core::schema;
 use photon_core::PhotonError;
 use photon_query::QueryRequest;
 
-use crate::query_params::resolve_query;
+use crate::query_params::{clamp_limit, resolve_query};
 use crate::AppState;
 
 /// The search request sent by the UI. Timestamps arrive as decimal-nanosecond strings (they
@@ -51,7 +51,7 @@ fn default_limit() -> u64 {
 /// defensive fallback for a genuine query failure.
 pub(crate) async fn services(State(state): State<AppState>) -> Response {
     match state.query.distinct_services().await {
-        Ok(list) => Json(list).into_response(),
+        Ok(list) => Json(list.as_ref()).into_response(),
         Err(e) => {
             eprintln!("photon-api: warning: services query failed, returning empty list: {e}");
             Json(Vec::<String>::new()).into_response()
@@ -87,21 +87,16 @@ pub(crate) async fn search(
     };
 
     let started = Instant::now();
-    let rows = match state.query.search(query.clone()).await {
-        Ok(batches) => batches_to_rows(&batches),
+    // One prune/open for both the (row-limited) page and the true total match count, instead of
+    // `search` + `count_matching` independently re-pruning the manifest/skip-indexes and
+    // re-opening every surviving Parquet file.
+    let (rows, matched_count) = match state.query.search_with_count(query).await {
+        Ok((batches, matched_count)) => (batches_to_rows(&batches), matched_count),
         Err(e) => {
             eprintln!("photon-api: warning: search query failed, returning empty results: {e}");
-            Vec::new()
+            (Vec::new(), 0)
         }
     };
-    // True total over the full pruned match set (independent of the row limit). Falls back to the
-    // returned row count if the count pass fails, so the toolbar never shows a smaller-than-rows
-    // total.
-    let matched_count = state
-        .query
-        .count_matching(query)
-        .await
-        .unwrap_or(rows.len() as u64);
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     Json(SearchResponse {
@@ -173,7 +168,7 @@ fn build_query(
         severities,
         text,
         query,
-        limit: req.limit as usize,
+        limit: clamp_limit(req.limit as usize),
     })
 }
 
@@ -368,6 +363,22 @@ mod tests {
     }
 
     #[test]
+    fn limit_is_clamped_to_max_limit_but_in_range_values_pass_through() {
+        // The [P1 · DoS] gap: `SearchRequest.limit` (u64) flowed straight to `req.limit as
+        // usize` unclamped.
+        let mut req = request(&[], &[], "");
+        req.limit = 999_999_999;
+        assert_eq!(
+            build_query(&req, None).unwrap().limit,
+            crate::query_params::MAX_LIMIT
+        );
+
+        // In-range values are untouched (purely additive bound).
+        req.limit = 10;
+        assert_eq!(build_query(&req, None).unwrap().limit, 10);
+    }
+
+    #[test]
     fn record_batch_converts_to_json_row() {
         let schema = LogSchema::new(&["service.name".to_string(), "host.name".to_string()]);
         let mut builder = RecordBatchBuilder::new(&schema);
@@ -442,5 +453,37 @@ mod tests {
         assert!(v["rows"].is_array());
         assert_eq!(v["matched_count"], serde_json::json!(0));
         assert!(v["elapsed_ms"].is_number());
+    }
+
+    #[tokio::test]
+    async fn search_clamps_a_dos_sized_limit() {
+        use tower::ServiceExt;
+        let router = crate::test_router();
+        let cookie = crate::session_cookie(&router).await;
+        let body = serde_json::json!({
+            "start_ts_nanos": "0",
+            "end_ts_nanos": "9223372036854775807",
+            "query": "",
+            "limit": 999_999_999u64
+        })
+        .to_string();
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/search")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::COOKIE, cookie)
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["rows"].is_array());
     }
 }

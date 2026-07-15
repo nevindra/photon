@@ -147,7 +147,9 @@ photon-query    three engines: QueryEngine (logs), SpanQueryEngine (traces/APM/R
                 (metrics + RUM vitals). Reassembles Prometheus classic histograms (`le`-bucket →
                 quantile) at query time. Manifest + skip-index pruning, then DataFusion over survivors.
 photon-ingest   OTLP gRPC (tonic) + HTTP (axum) receivers for logs/traces/metrics, mapping, token auth.
-                + Prometheus remote-write 1.0 (/api/v1/write, snappy+protobuf → metrics WAL).
+                + Prometheus remote-write 1.0 (/api/v1/write, snappy+protobuf → metrics WAL). Both
+                front doors accept gzipped requests (stock OTel Collector gzips by default) and share
+                one `[ingest].max_body_bytes` cap (~16 MiB) enforced on the *decompressed* size.
 photon-uptime   always-on synthetic HTTP/TCP/ICMP monitors → embedded SQLite. Trait: UptimeStore.
 photon-api      axum REST + session auth (argon2, signed cookies) + embedded Vue UI. Defines trait
                 seams RumSink/RumAppStore/UserStore/UsageStore/ReplicationStatus/DataAdmin (photon-api
@@ -172,7 +174,8 @@ semaphore, maps OTLP → an Arrow record, appends to that signal's WAL → the g
 completes = **the ack / durability boundary** (data survives a crash from here) → the signal's
 background compactor in `photon-server` drains each *closed* WAL segment into a sort-key-ordered
 Parquet file + `.idx` skip-index sidecar in the hot dir, enqueues an async replicate to the durable
-store, and updates the manifest → a lower-frequency `merge_once` consolidates small files →
+store, and updates the manifest → a lower-frequency `merge_once` consolidates small files (bounded
+per pass) →
 `photon-query` prunes candidate files via the manifest (time overlap) then the skip index (min/max +
 token bloom), and only then reads the surviving **local** Parquet with DataFusion.
 
@@ -184,7 +187,11 @@ token bloom), and only then reads the surviving **local** Parquet with DataFusio
 - **Local disk is the primary store**; the S3-compatible durable store is an async replica, never on
   the ack or query path. Ingest acks after the local WAL `fsync`, not after durable upload. The
   cold/durable **read** path is deliberately unimplemented (no `object_store` registered with
-  DataFusion). `[storage.durable]` is optional; omit it to run hot-tier-only.
+  DataFusion). `[storage.durable]` is optional; omit it to run hot-tier-only. The replicator is one
+  long-lived drain loop (bounded in-flight, retry + re-enqueue — never silently drops) carrying BOTH
+  uploads and **retention deletes**: `merge_once`/`purge_before` enqueue durable deletes for the
+  objects they unlink from hot (NotFound-tolerant), so the durable replica honors retention instead
+  of growing forever.
 - **Rows are sorted by the signal's sort key before Parquet encoding** (logs `(service.name,
   timestamp)`, spans `(service.name, start_time)`, metrics `(metric_name, service.name, host.name,
   timestamp)`) — this is what makes min/max pruning effective and compresses well. The compactor's
@@ -196,7 +203,13 @@ token bloom), and only then reads the surviving **local** Parquet with DataFusio
   `timestamp`, sorts DESC, takes `limit`, finds the cutoff; pass 2 re-runs with `timestamp >= cutoff`
   and returns full rows — so the wide `attributes` map is decoded only for surviving rows. Don't
   collapse it to one pass: it regresses broad-window, low-selectivity searches ~5x. Spans use the
-  same trick for `SpanSort::Recent`.
+  same trick for all three `SpanSort`s (`span_search.rs`) — `Recent` on `start_time_nanos`,
+  `Slowest` on nullable `duration_nanos`, `Errors` on the COMPOSITE `(status_code, start_time)`
+  (cutoff `(cs, cts)`, pass 2 filter `(status_code > cs) OR (status_code = cs AND start_time >=
+  cts)`, not a single-column `>=`). All three span sorts also append `(span_id ASC, trace_id ASC)`
+  as the final ORDER BY key in both passes — `span_id` is unique only *within* a trace per OTLP,
+  but the pair is unique per row, giving a genuine total order so exact ties paginate
+  deterministically instead of depending on which physical plan DataFusion picks.
 
 ### The query grammar & UI API
 
@@ -218,7 +231,9 @@ there is no `[[rum.apps]]` config anymore) — plus the curated Infrastructure v
 `GET /api/infra/hosts`, `GET /api/infra/hosts/:host`, `GET /api/infra/hosts/:host/timeseries` (see
 [`docs/subsystems/infra.md`](docs/subsystems/infra.md)). Handlers live in
 `crates/photon-api/src/*.rs`; the aggregation logic they call lives in
-`crates/photon-query/src/*.rs`.
+`crates/photon-query/src/*.rs`. A `tower-http` `CompressionLayer` wraps the whole surface
+(gzip/br, content-negotiated per `Accept-Encoding`; JSON logs compress ~15x) — its default predicate
+skips SSE (`/api/stream/*`), so live-tail is never buffered.
 
 ## Conventions
 

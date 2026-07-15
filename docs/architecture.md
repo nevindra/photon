@@ -54,10 +54,10 @@ runtime (dev-dep only). `photon-loadgen` depends only on `photon-ingest` (reuses
 | **photon-core** | Shared domain types, no I/O. Owns `PhotonError` (one enum, a variant per crate). Modules per signal: logs (`schema.rs`, `record.rs`), spans (`span_schema.rs`, `span_record.rs`), metrics (`metric_schema.rs`, `metric_record.rs`, `metric_agg.rs`), RUM (`rum.rs`), plus `manifest.rs`, `segment.rs`, `config.rs`, `retention.rs`, `ingest_counters.rs`. | `PhotonError`, `LogRecord`, `Span*`, `MetricPoint`, `Manifest`, `SegmentId`, `Config` |
 | **photon-wal** | Durable WAL with group commit; `append` resolves only after the coalesced `fsync` covering its bytes (the ack boundary). Signal-agnostic — one type backs the logs, spans, and metrics WALs. | trait **`Wal`** (append/sync/list_closed_segments/read_segment/remove_segment); `DiskWal`; `BroadcastingWal` (fans appends to live-tail SSE) |
 | **photon-index** | Pure/sync **skip index — a bloom filter + min/max ranges, NOT an inverted index.** Per-file variants for logs (bloom over tokenized `body`), spans (bloom over `name` + whole `trace_id`), metrics (bloom over whole `metric_name`). Binary `.idx` sidecar. | struct **`SkipIndex`** (not a trait), `tokenize` |
-| **photon-storage** | Hot (always local) + optional durable S3-compatible object store; owns the per-segment object-path scheme; background hot→durable replicator that flips a manifest entry's `durable=true` after upload. | **`Storage`**, **`Replicator`** (concrete types — there is no `BlobStore` trait) |
-| **photon-compact** | Drains closed WAL segments → sorted zstd Parquet + skip-index sidecar → manifest → enqueue replication; `merge_once` consolidates small files; `purge_before` enforces retention. **Three parallel compactors, one per signal.** | `Compactor` (logs), `SpanCompactor`, `MetricsCompactor` |
+| **photon-storage** | Hot (always local) + optional durable S3-compatible object store; owns the per-segment object-path scheme; a single long-lived background `Replicator` drain loop that copies finalized objects hot→durable AND applies retention deletes to durable (one FIFO queue of upload/delete ops, bounded in-flight, retry + re-enqueue on failure); also a startup `*.tmp` sweep. | **`Storage`**, **`Replicator`** (concrete types — there is no `BlobStore` trait) |
+| **photon-compact** | Drains closed WAL segments → sorted zstd Parquet (`[storage] zstd_level`) + skip-index sidecar → manifest (`FileEntry.bytes` recorded at write time) → enqueue replication; `merge_once` consolidates small files (bounded per pass); `purge_before` enforces retention; both enqueue durable deletes for unlinked objects. **Three parallel compactors, one per signal.** | `Compactor` (logs), `SpanCompactor`, `MetricsCompactor` |
 | **photon-query** | Prune (manifest time overlap + skip-index bloom/min-max — our code) then read only surviving **local** Parquet with DataFusion 43. **Three engines, one per signal.** | `QueryEngine` (logs), `SpanQueryEngine` (traces), `MetricsQueryEngine` (metrics + RUM vitals) |
-| **photon-ingest** | OTLP receivers for all three write signals: gRPC (`LogsService`/`TraceService`/`MetricsService`) + HTTP (`/v1/logs`, `/v1/traces`, `/v1/metrics`); plus a Prometheus remote-write 1.0 receiver (`POST /api/v1/write`, snappy+protobuf → the metrics WAL). Holds three WALs + three schemas sharing one bearer token; per-signal `max_in_flight` semaphore. | `IngestServer`; pure cores `otlp_logs_to_records`, `otlp_traces_to_spans`, `otlp_metrics_to_points` |
+| **photon-ingest** | OTLP receivers for all three write signals: gRPC (`LogsService`/`TraceService`/`MetricsService`) + HTTP (`/v1/logs`, `/v1/traces`, `/v1/metrics`); plus a Prometheus remote-write 1.0 receiver (`POST /api/v1/write`, snappy+protobuf → the metrics WAL). Holds three WALs + three schemas sharing one bearer token; per-signal `max_in_flight` semaphore. Both front doors accept **gzipped** requests (HTTP `RequestDecompressionLayer`; gRPC `accept_compressed(Gzip)` — a stock OTel Collector gzips by default) and enforce one shared `max_body_bytes` cap on the *decompressed* size (HTTP `DefaultBodyLimit`, gRPC `max_decoding_message_size`, snappy remote-write decompress cap). | `IngestServer`; pure cores `otlp_logs_to_records`, `otlp_traces_to_spans`, `otlp_metrics_to_points` |
 | **photon-api** | axum REST + embedded Vue UI + argon2 signed-cookie sessions. `ApiServer` holds the three query engines + optional builder-attached subsystems (`with_uptime`, `with_data_admin`, `with_live_hub`, `with_usage`, `with_rum`) — each `None` ⇒ its routes 404. | `ApiServer`; trait seams `RumSink`, `RumAppStore`, `UserStore`, `UsageStore`, `ReplicationStatus`, `DataAdmin` |
 | **photon-server** | The single binary. Wires everything; spawns ingest, **three** compactor loops, the usage sampler, the uptime scheduler + retention, the replicator flush, and builds `ApiServer`. Also `hash-password <pw>` and `healthcheck` subcommands. | `main` |
 | **photon-loadgen** | Standalone OTLP/HTTP load generator (`logs`/`traces`/`metrics` subcommands): steady-rate soak or max-concurrency ceiling, reporting throughput/ack-latency. | `main` |
@@ -82,13 +82,21 @@ WAL-allocated IDs.
 | **Traces** | `TraceService` / `POST /v1/traces` | `spans_wal` | `(service.name, start_time)` | `data-spans/` | bloom over `name` + whole `trace_id` |
 | **Metrics** | `MetricsService` / `POST /v1/metrics` | `metrics_wal` | `(metric_name, service.name, host.name, timestamp)` | `data-metrics/` | bloom over whole `metric_name` + `host.name` min/max range (binary v2; see [`subsystems/infra.md`](subsystems/infra.md)) |
 
-The flow (identical per signal): **OTLP request → bearer-token check + per-signal semaphore →
+The flow (identical per signal): **OTLP request → (gzip-decompress if `Content-Encoding: gzip`) +
+`max_body_bytes` cap on the decompressed body → bearer-token check + per-signal semaphore →
 `otlp_*_to_*` mapping → Arrow `RecordBatch` → `wal.append`** (the group-commit `fsync` completes =
 **the ack / durability boundary**; data survives a crash from here) **+ `IngestCounters` bump →**
 the signal's background compactor `run_once` drains each _closed_ WAL segment → concat + lexsort by
-the sort key → stream one zstd Parquet + build the skip-index `.idx` sidecar → append a
-`FileEntry(durable=false)` to that signal's manifest → enqueue an async hot→durable replicate → a
-lower-frequency `merge_once` consolidates small files → `purge_before(cutoff)` enforces retention.
+the sort key → stream one zstd Parquet (level from `[storage] zstd_level`) + build the skip-index
+`.idx` sidecar → append a `FileEntry` (carrying the Parquet's on-disk `bytes`, so `storage_stats` is
+manifest arithmetic rather than one `stat()` per file per sampler tick) to that signal's manifest →
+enqueue an async hot→durable replicate → a lower-frequency `merge_once` consolidates small files
+(**bounded per pass**, oldest-first, so a merge can't hold the whole small-file union in RAM) →
+`purge_before(cutoff)` enforces retention. Both `merge_once` and `purge_before` also **enqueue async
+durable deletes** for the objects they unlink from hot, so the durable replica honors retention
+instead of accumulating every file ever written. (An empty/torn-tail segment compacts to zero rows
+and is dropped without a manifest entry; orphaned `*.tmp` files from a crash mid-write are swept at
+startup.)
 
 **Crash-consistency recipe** (all three compactors, `photon-compact/src/stream.rs`): stream one zstd
 Parquet to a temp file → `fsync` → atomic rename → `fsync` parent dir → pin the just-saved manifest
@@ -111,6 +119,14 @@ the per-feature docs in [`subsystems/`](subsystems/).
 3. **DataFusion** columnar-scans only the survivors, predicates pushed down. Free-text log search is
    bloom-pruned then confirmed with a `strpos(body, text) > 0` substring scan — **there is no
    inverted index.**
+
+Every engine's `SessionContext` (the shared `session()` factory in `photon-query/src/lib.rs`) carries
+a **bounded DataFusion memory pool** (`GreedyMemoryPool`, `QUERY_MEMORY_POOL_BYTES` = 512 MiB). Its
+job is to keep the intrinsically-unbounded query paths — a facet `GROUP BY value` on a
+high-cardinality field (holds every distinct value in a hash table before the `LIMIT`) and the
+metrics pointwise/distribution scans (`filter → sort → collect()` every matching row, then cap at
+`MAX_SERIES`) — **fail-loud** (`ResourcesExhausted`) instead of OOM-killing a low-memory single node.
+It is not a config surface yet; a future change could make it per-deployment tunable.
 
 Per-signal engines:
 
@@ -138,7 +154,17 @@ Two `object_store` backends with strict role separation:
   register an object_store with DataFusion.
 - **Durable store = S3-compatible (Garage recommended), asynchronous replica.** Optional
   (`[storage.durable]`; omit to run hot-tier-only). Every finalized Parquet + skip index is uploaded
-  in the background. This is what survives **local-disk failure**. Never on the ack or hot-query path.
+  in the background by a single long-lived drain loop (bounded in-flight; failed items are
+  re-enqueued and retried, never silently dropped). Superseded (merge input) and expired (purge)
+  objects are **deleted from durable** through that same queue (NotFound-tolerant), so durable-tier
+  retention is enforced. This is what survives **local-disk failure**. Never on the ack or
+  hot-query path.
+- **`[storage] zstd_level`** (optional, default `1`, validated range `1..=19`) tunes the zstd
+  compression level all three compactors pass to `write_parquet_streamed` (`photon-compact/src/
+  stream.rs`) when streaming a compacted/merged Parquet file to disk. Higher shrinks files further
+  (roughly 10-30% smaller at level 3) for more CPU per compaction pass. The default is
+  byte-identical to the level Photon hardcoded before this became configurable
+  (`ZstdLevel::try_new(1) == ZstdLevel::default()` in parquet 53).
 
 | Failure | Recovered by |
 |---|---|
@@ -188,12 +214,22 @@ Handlers live in `crates/photon-api/src/*.rs`; the aggregation logic they call l
 
 Everything else falls through to the embedded UI (SPA fallback to `index.html`).
 
+**Response compression:** a `tower-http` `CompressionLayer` wraps the whole HTTP surface (JSON API +
+embedded UI bundle), content-negotiating **gzip/br** from the client's `Accept-Encoding` (adds
+`Vary: Accept-Encoding`; transparent — no frontend change). JSON logs compress ~15x (a 500-row
+`/api/search` payload of ~115 KB → ~8 KB), so this is the primary transfer win, not a wire-format
+change. The default predicate skips SSE (`/api/stream/*` live-tail), gRPC, images, and sub-32-byte
+bodies, so streaming is never buffered.
+
 ## Load-bearing invariants — do not break
 
 - **No inverted index.** Pruning is min/max stats + token bloom filters (kilobytes/file). Bloom
   filters may false-**positive** (extra scan) but **never false-negative** — pruning can only add
-  work, never drop a real result. This is a property test; keep pruning conservative (a missing
-  `.idx` or an unknown range means _keep the file_).
+  work, never drop a real result. This is a property test; keep pruning conservative (a missing,
+  unreadable, or corrupt `.idx`, or an unknown range, means _keep the file_ — a torn sidecar can
+  never drop a real result, abort the query, or panic; `idx_binary::decode` rejects the frames
+  that used to divide-by-zero in the bloom, and every `keep_candidate` keeps on any read/decode
+  error, not just `NotFound`).
 - **Local disk is the primary store**; the S3 durable store is an async replica, never on the ack or
   query path. Ingest acks after the local WAL `fsync`, not after durable upload.
 - **Rows are sorted by the signal's sort key before Parquet encoding** (logs `(service.name,

@@ -152,8 +152,8 @@ pub(crate) async fn traces_search(
 
 /// `POST /api/spans/search` — raw span rows matching the filter request, in the same JSON shape
 /// as `GET /api/traces/:trace_id`'s spans. A fresh system (or a hard engine error) yields an empty
-/// `rows` array; `matched_count` falls back to the returned row count if the separate count pass
-/// fails, so the toolbar never shows a smaller-than-rows total (mirrors `search::search`).
+/// `rows` array and a zero `matched_count` — both come from the same `search_spans_with_count`
+/// call, so they can't disagree (mirrors `search::search`).
 pub(crate) async fn spans_search(
     State(state): State<AppState>,
     Json(req): Json<SpanSearchRequest>,
@@ -178,18 +178,16 @@ pub(crate) async fn spans_search(
     let offset = query.offset;
 
     let started = Instant::now();
-    let rows = match state.span_query.search_spans(query.clone()).await {
-        Ok(batches) => span_batches_to_rows(&batches),
+    // One prune/open for both the (row-limited) page and the true total match count, instead of
+    // `search_spans` + `count_matching_spans` independently re-pruning the manifest/skip-indexes
+    // and re-opening every surviving Parquet file.
+    let (rows, matched_count) = match state.span_query.search_spans_with_count(query).await {
+        Ok((batches, matched_count)) => (span_batches_to_rows(&batches), matched_count),
         Err(e) => {
             eprintln!("photon-api: warning: spans search failed, returning empty results: {e}");
-            Vec::new()
+            (Vec::new(), 0)
         }
     };
-    let matched_count = state
-        .span_query
-        .count_matching_spans(&query)
-        .await
-        .unwrap_or(rows.len() as u64);
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let cursor = next_cursor(rows.len(), limit, offset, matched_count);
 

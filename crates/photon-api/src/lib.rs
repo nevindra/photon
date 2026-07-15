@@ -323,6 +323,11 @@ impl ApiServer {
         Router::new()
             .nest("/api", api)
             .fallback(assets::static_handler)
+            // Content-negotiated response compression (gzip/br) over the whole surface: the JSON
+            // API responses (a 500-row /api/search shrinks ~15x) and the embedded UI bundle. The
+            // default predicate skips SSE (`/api/stream/*`), gRPC, images, and sub-32-byte bodies,
+            // so live-tail streaming is untouched. Transparent to clients — no frontend change.
+            .layer(tower_http::compression::CompressionLayer::new())
             .with_state(state)
     }
 }
@@ -500,5 +505,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `GET /api/session` on the open route returns a >32-byte JSON body, so the CompressionLayer
+    /// engages. Drive it with each `Accept-Encoding` to prove the layer is wired and negotiates.
+    async fn session_content_encoding(accept_encoding: Option<&str>) -> Option<String> {
+        let app = test_server().into_router();
+        let mut req = Request::builder().method("GET").uri("/api/session");
+        if let Some(ae) = accept_encoding {
+            req = req.header(axum::http::header::ACCEPT_ENCODING, ae);
+        }
+        let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.headers()
+            .get(axum::http::header::CONTENT_ENCODING)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn compresses_json_response_with_gzip() {
+        assert_eq!(
+            session_content_encoding(Some("gzip")).await.as_deref(),
+            Some("gzip")
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiates_brotli_when_offered() {
+        assert_eq!(
+            session_content_encoding(Some("br")).await.as_deref(),
+            Some("br")
+        );
+    }
+
+    #[tokio::test]
+    async fn stays_uncompressed_without_accept_encoding() {
+        // Transparent by default: a client that doesn't opt in gets plain JSON, not gzip.
+        assert_eq!(session_content_encoding(None).await, None);
     }
 }

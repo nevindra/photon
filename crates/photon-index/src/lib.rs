@@ -8,4 +8,4 @@ mod skip_index;
 mod tokenize;
 
 pub use skip_index::SkipIndex;
-pub use tokenize::tokenize;
+pub use tokenize::{interior_tokens, tokenize};

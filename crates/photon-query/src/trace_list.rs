@@ -6,13 +6,19 @@
 //!
 //! Precomputed per-trace rollups are deferred (design brief); v1 recomputes them per query:
 //! 1. Prune + open the surviving spans Parquet (`span_survivors_df`); `None` → empty result.
-//! 2. **Matched trace ids:** apply the grammar predicate, `GROUP BY trace_id` with
-//!    `min(start_time)`, and collect `(trace_id, min_start)`. `matched_count` is the full distinct
-//!    count. Sort by `min_start DESC` and cap the rollup scan to [`MAX_CANDIDATE_TRACES`] (a
-//!    documented v1 limitation: sort/slowest accuracy is bounded by the cap; `matched_count` still
-//!    reports the full total, and a capped scan is logged rather than silently truncated).
+//! 2. **Matched trace ids (ranked in DataFusion, bounded memory):** apply the grammar predicate,
+//!    then from that one filtered handle run two bounded queries — `COUNT(DISTINCT trace_id)` for
+//!    `matched_count` (the full distinct total, independent of the cap/paging), and
+//!    `GROUP BY trace_id → min(start_time)` sorted `min_start DESC` (id-tiebroken) `LIMIT`
+//!    [`MAX_CANDIDATE_TRACES`] for the ranked page. Only the cap-many ranked rows ever reach Rust,
+//!    instead of collecting every distinct id into a `Vec` (a documented v1 limitation:
+//!    sort/slowest accuracy is bounded by the cap; a capped scan is logged, never silent).
 //! 3. **Whole-trace spans:** fetch every span of the capped trace ids (`trace_id IN (...)`, no
-//!    grammar filter) so the rollups reflect the entire trace, not only the matching spans.
+//!    grammar filter) so the rollups reflect the entire trace, not only the matching spans — over a
+//!    window narrowed to the kept traces' earliest-matching-span span ± [`STEP3_WINDOW_PAD_NANOS`],
+//!    so min/max pruning drops files outside that range (the old code rescanned the ENTIRE original
+//!    window for one page) while the ±1h pad still admits every whole-trace span, including
+//!    window-straddling ones the old un-padded step 3 undercounted (audit F10).
 //! 4. **Rust rollup** per trace: `span_count`, `error_count` (`status_code == 2`), distinct sorted
 //!    `services`, and a representative span (the parent-less root if present, else the earliest by
 //!    start) supplying `root_service` / `root_name` / `start_ts_nanos` / `duration_nanos` (falling
@@ -29,8 +35,8 @@ use arrow::array::{
     Array, Int32Array, Int64Array, MapArray, StringArray, TimestampNanosecondArray,
 };
 use arrow::record_batch::RecordBatch;
-use datafusion::functions_aggregate::expr_fn::min;
-use datafusion::prelude::{lit, Expr};
+use datafusion::functions_aggregate::expr_fn::{count_distinct, min};
+use datafusion::prelude::{col, lit, Expr};
 
 use photon_core::span_schema;
 use photon_core::PhotonError;
@@ -43,6 +49,24 @@ use crate::{col_ref, SpanQueryEngine, SpanQueryRequest, SpanSort};
 /// v1 limitation (sort/slowest accuracy is bounded by the cap); the future optimization is
 /// precomputed per-trace rollups so the whole match set can be ranked cheaply.
 const MAX_CANDIDATE_TRACES: usize = 2000;
+
+/// ±window added around the kept traces' earliest-matching-span span when narrowing step 3's
+/// whole-trace scan (see `search_traces`). Mirrors `span_engine::TRACE_TIME_HINT_PADDING_NANOS`
+/// (±1h) — defined locally so this fix stays confined to `trace_list.rs`.
+///
+/// **Pad-safety (why narrowing cannot drop a real span — the conservative-pruning invariant):**
+/// step 2 ranks each kept trace by its earliest *matching* span start; the narrowed window is
+/// `[min(kept starts) − PAD, max(kept starts) + PAD]`. For a kept trace `T` with earliest-matching
+/// start `m` (so `min(kept starts) ≤ m ≤ max(kept starts)`), every span of `T` starts within `T`'s
+/// wall-clock extent, i.e. in `[m − dur(T), m + dur(T)]`. As long as `dur(T) ≤ PAD`, that whole
+/// range sits inside `[m − PAD, m + PAD] ⊆ [min(kept starts) − PAD, max(kept starts) + PAD]`, so
+/// the file holding any of `T`'s spans overlaps the narrowed window and survives min/max pruning —
+/// nothing real is dropped. A trace longer than 1h is the *same* documented v1 edge that
+/// `get_trace`'s ±1h hint already accepts; a real span never starts more than a trace's own
+/// duration before its earliest matching span, so 1h is comfortably conservative for typical
+/// request/RED traces. (If a workload were known to routinely span >1h, widen this or keep the
+/// original bound — do NOT under-pad.)
+const STEP3_WINDOW_PAD_NANOS: i64 = 3_600_000_000_000; // ±1h; mirrors span_engine::TRACE_TIME_HINT_PADDING_NANOS
 
 /// One trace's rollup: identity, a representative root span's fields, and per-trace aggregates.
 pub struct TraceSummary {
@@ -112,22 +136,84 @@ impl SpanQueryEngine {
             }
         };
 
-        // Step 2 — matched trace ids + earliest start per trace (grammar predicate applied here).
-        let agg_batches = df
+        // Step 2 — matched trace ids, ranked, plus the full distinct match count. Both derive from
+        // one filtered handle (`filtered`) over the pruned survivors, so the grammar predicate and
+        // the file set are shared (one prune/open, two bounded collects). Instead of collecting
+        // every distinct id into a Rust `Vec`:
+        //   * `matched_count` = `COUNT(DISTINCT trace_id)` — one row. SQL `COUNT(DISTINCT)` already
+        //     skips null trace_ids, matching the old null-skipping loop.
+        //   * the ranked page = `GROUP BY trace_id → min(start_time)`, `min_start DESC` (id-tiebroken)
+        //     `LIMIT MAX_CANDIDATE_TRACES` — at most the cap-many rows ever reach Rust.
+        // The ranking's `min_start DESC, id ASC` order + `LIMIT` selects the identical *set* of ids
+        // the old Rust `sort_by` + `truncate` did (a total order on distinct ids), so results are
+        // unchanged; the two bounded collects just replace the unbounded `Vec`.
+        let filtered = df
             .clone()
             .filter(span_base_predicate(&req))
-            .map_err(|e| PhotonError::Query(format!("trace match filter: {e}")))?
+            .map_err(|e| PhotonError::Query(format!("trace match filter: {e}")))?;
+
+        let count_batches = filtered
+            .clone()
+            .aggregate(
+                vec![],
+                vec![count_distinct(col_ref(span_schema::TRACE_ID)).alias("n")],
+            )
+            .map_err(|e| PhotonError::Query(format!("trace match count aggregate: {e}")))?
+            .collect()
+            .await
+            .map_err(|e| PhotonError::Query(format!("trace match count collect: {e}")))?;
+        let matched_count = match count_batches.first() {
+            Some(b) if b.num_rows() > 0 => b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .filter(|c| !c.is_null(0))
+                .map(|c| c.value(0) as u64)
+                .unwrap_or(0),
+            _ => 0,
+        };
+        if matched_count == 0 {
+            return Ok(TraceSearchResult {
+                traces: Vec::new(),
+                matched_count: 0,
+            });
+        }
+
+        // A capped rollup scan is logged, never silent; `matched_count` still reports the full total.
+        if matched_count > MAX_CANDIDATE_TRACES as u64 {
+            eprintln!(
+                "photon-query: search_traces rolling up only the newest {MAX_CANDIDATE_TRACES} of \
+                 {matched_count} matched traces (v1 cap); matched_count reports the full total"
+            );
+        }
+
+        // Rank + cap in DataFusion — newest traces first (`min_start DESC`), id-tiebroken for
+        // determinism, `LIMIT MAX_CANDIDATE_TRACES`. Only these ≤ cap rows are materialized.
+        let ranked_batches = filtered
             .aggregate(
                 vec![col_ref(span_schema::TRACE_ID).alias("trace_id")],
                 vec![min(col_ref(span_schema::START_TIME)).alias("ts")],
             )
             .map_err(|e| PhotonError::Query(format!("trace match aggregate: {e}")))?
+            .filter(col("trace_id").is_not_null())
+            .map_err(|e| PhotonError::Query(format!("trace match not-null: {e}")))?
+            .sort(vec![
+                col("ts").sort(false, false),      // min(start) DESC — newest traces first
+                col("trace_id").sort(true, false), // id ASC — deterministic tiebreak
+            ])
+            .map_err(|e| PhotonError::Query(format!("trace match sort: {e}")))?
+            .limit(0, Some(MAX_CANDIDATE_TRACES))
+            .map_err(|e| PhotonError::Query(format!("trace match limit: {e}")))?
             .collect()
             .await
             .map_err(|e| PhotonError::Query(format!("trace match collect: {e}")))?;
 
-        let mut matched: Vec<(String, i64)> = Vec::new();
-        for b in &agg_batches {
+        // Collect the capped ids and the min/max of their earliest-matching-span starts — the two
+        // bounds that narrow step 3's whole-trace window (see `STEP3_WINDOW_PAD_NANOS`).
+        let mut capped_ids: Vec<String> = Vec::new();
+        let mut kept_start_min = i64::MAX;
+        let mut kept_start_max = i64::MIN;
+        for b in &ranked_batches {
             let ids = b
                 .column(0)
                 .as_any()
@@ -144,38 +230,36 @@ impl SpanQueryEngine {
                 if ids.is_null(i) {
                     continue;
                 }
+                capped_ids.push(ids.value(i).to_string());
                 let start = if ts.is_null(i) { 0 } else { ts.value(i) };
-                matched.push((ids.value(i).to_string(), start));
+                kept_start_min = kept_start_min.min(start);
+                kept_start_max = kept_start_max.max(start);
             }
         }
-
-        let matched_count = matched.len() as u64;
-        if matched.is_empty() {
+        if capped_ids.is_empty() {
+            // Unreachable when matched_count > 0 (`COUNT(DISTINCT)` counts exactly the non-null ids
+            // the not-null filter keeps), but guard rather than build a bogus window from the
+            // sentinel min/max.
             return Ok(TraceSearchResult {
                 traces: Vec::new(),
                 matched_count,
             });
         }
 
-        // Newest traces first; deterministic tiebreak on id. Cap the rollup scan (never silent).
-        matched.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        if matched.len() > MAX_CANDIDATE_TRACES {
-            eprintln!(
-                "photon-query: search_traces rolling up only the newest {MAX_CANDIDATE_TRACES} of \
-                 {matched_count} matched traces (v1 cap); matched_count reports the full total"
-            );
-            matched.truncate(MAX_CANDIDATE_TRACES);
-        }
-        let capped_ids: Vec<String> = matched.into_iter().map(|(id, _)| id).collect();
-
-        // Whole-trace rollups must see EVERY span of the matched traces, including spans in files
-        // the free-text name-bloom pruned out of `df`. Re-open survivors with the grammar query
-        // dropped (time-window pruning only) so no name-token bloom check drops a file. `df` (used
-        // for match detection in step 2) stays free-text-pruned — matching is still complete because
-        // the bloom never false-negatives.
+        // Whole-trace rollups must see EVERY span of the capped traces, including spans in files the
+        // free-text name-bloom pruned out of `df` AND spans that straddle the request window's edges
+        // (audit F10). Re-open survivors with the grammar dropped (time-window pruning only) over a
+        // window NARROWED to the kept traces' earliest-matching-span span ± STEP3_WINDOW_PAD_NANOS:
+        // narrowing lets min/max pruning drop files outside the kept traces' actual time range (the
+        // win — the old code rescanned the ENTIRE original window for one page), while the ±1h pad
+        // still admits every whole-trace span of the kept traces (see the pad-safety note on
+        // STEP3_WINDOW_PAD_NANOS), incl. window-straddling ones the old un-padded original-window
+        // step 3 dropped — so straddling traces are now rolled up completely. `df` (step 2's match
+        // detection) stays free-text-pruned; matching is still complete because the bloom never
+        // false-negatives.
         let whole_req = SpanQueryRequest {
-            start_ts_nanos: req.start_ts_nanos,
-            end_ts_nanos: req.end_ts_nanos,
+            start_ts_nanos: kept_start_min.saturating_sub(STEP3_WINDOW_PAD_NANOS),
+            end_ts_nanos: kept_start_max.saturating_add(STEP3_WINDOW_PAD_NANOS),
             query: None,
             sort: SpanSort::Recent,
             limit: 0,
@@ -184,7 +268,9 @@ impl SpanQueryEngine {
         };
         let whole_df = match self.span_survivors_df(&whole_req).await? {
             Some(d) => d,
-            None => df, // unreachable in practice: query:None prunes a superset of `df`'s files
+            // Unreachable: the file holding each kept trace's earliest-matching span overlaps the
+            // narrowed window and passes query:None pruning, so survivors are non-empty.
+            None => df,
         };
 
         // Requested root-span attribute keys. Empty ⇒ the wide `attributes` map is neither

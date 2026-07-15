@@ -21,6 +21,47 @@ pub fn tokenize(text: &str) -> Vec<String> {
     split_tokens(&lowered).map(str::to_string).collect()
 }
 
+/// The subset of `tokenize(text)` that is safe to drive bloom pruning of a **substring** search:
+/// the tokens that are *interior* to `text` — bounded by a non-alphanumeric delimiter on BOTH
+/// sides *within `text` itself*.
+///
+/// Free-text search is substring semantics (`strpos(body, text) > 0` / `body.contains(text)`), but
+/// the token bloom holds only the *whole* tokens of the body. A query token that touches the start
+/// or end of `text` may be a mere fragment of a longer body word (searching `tim` matches a body
+/// reading `timeout`, `timeout` matches `timeouts`), so it is NOT guaranteed to appear as a whole
+/// token in a matching body — bloom-testing it would false-*negative* and silently drop a real
+/// result. Only a token with a delimiter on both sides inside `text` carries those delimiters into
+/// every body that contains `text` as a substring, so its occurrence there is necessarily a whole
+/// token → safe to prune on. Concretely:
+///   - the first token (when `text` starts with an alphanumeric) may continue a longer word to its
+///     left in the body → dropped;
+///   - the last token (when `text` ends with an alphanumeric) may continue to its right → dropped;
+///   - a single-word query has no interior token → returns empty ⇒ the caller keeps every
+///     time-window candidate and lets the row predicate confirm. Correctness over pruning power.
+///
+/// The delimiter rule is exactly `tokenize`'s (split on any non-alphanumeric char) and the tokens
+/// are lowercased identically, so "whole token" means the same thing on the query side as on the
+/// index-build side, and the result is always a subset of `tokenize(text)`.
+pub fn interior_tokens(text: &str) -> Vec<String> {
+    let lowered = text.to_lowercase();
+    let mut tokens = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for (i, c) in lowered.char_indices() {
+        if c.is_alphanumeric() {
+            run_start.get_or_insert(i);
+        } else if let Some(start) = run_start.take() {
+            // This run ended at a delimiter (`c`), so it has one on its right. It is interior iff
+            // it also has a delimiter on its left, i.e. it did not start at byte 0 of the query.
+            if start > 0 {
+                tokens.push(lowered[start..i].to_string());
+            }
+        }
+    }
+    // A run still open here reached the end of `text` with no trailing delimiter → it touches the
+    // right edge → not interior → dropped.
+    tokens
+}
+
 /// Like `tokenize`, but inserts distinct tokens directly into `out` instead of returning a
 /// `Vec` with one allocation per occurrence. A `String` is only allocated for a token the
 /// first time it's seen — log bodies repeat tokens heavily, so this keeps allocation count
@@ -65,6 +106,42 @@ mod tests {
             tokenize("connection.timeout: retrying (attempt #3)"),
             vec!["connection", "timeout", "retrying", "attempt", "3"]
         );
+    }
+
+    #[test]
+    fn interior_tokens_drops_edge_tokens() {
+        // Single word: the one token touches both edges → could be a fragment of a longer body
+        // word → not safe to bloom-test.
+        assert!(interior_tokens("tim").is_empty());
+        assert!(interior_tokens("timeout").is_empty());
+        // Two words: `foo` is first (left edge), `bar` is last (right edge) → neither interior.
+        assert!(interior_tokens("foo bar").is_empty());
+    }
+
+    #[test]
+    fn interior_tokens_keeps_both_sides_delimited_tokens() {
+        assert_eq!(interior_tokens("a foo b"), vec!["foo"]);
+        assert_eq!(interior_tokens("error timeout id:5"), vec!["timeout", "id"]);
+        // Leading/trailing punctuation delimits the outer tokens, making them interior.
+        assert_eq!(interior_tokens("  --foo__bar--  "), vec!["foo", "bar"]);
+        assert_eq!(interior_tokens(" foo "), vec!["foo"]);
+    }
+
+    #[test]
+    fn interior_tokens_lowercases_and_is_a_subset_of_tokenize() {
+        assert_eq!(interior_tokens("x TiMeOut y"), vec!["timeout"]);
+        // Every interior token is a real token of the same string — never a fabricated one.
+        for text in [
+            "",
+            "a foo b",
+            "  --foo__bar--  ",
+            "Error404_NotFound mid end",
+        ] {
+            let all: HashSet<String> = tokenize(text).into_iter().collect();
+            for t in interior_tokens(text) {
+                assert!(all.contains(&t), "{t:?} not a token of {text:?}");
+            }
+        }
     }
 
     #[test]

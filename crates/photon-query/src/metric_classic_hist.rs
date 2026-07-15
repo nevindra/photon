@@ -145,7 +145,12 @@ impl MetricsQueryEngine {
         }
 
         let (start, end) = (req.start_ts_nanos, req.end_ts_nanos);
-        let buckets = buckets.max(1);
+        // Defense-in-depth: mirrors `photon-api`'s `MAX_BUCKETS`
+        // (`crates/photon-api/src/query_params.rs`); `photon-query` can't depend on `photon-api`,
+        // so the value is restated here as a literal. Without this, the `(0..buckets)` builds
+        // below (and `reset_aware_series`'s own per-series allocation) scale directly with a
+        // caller-supplied `buckets`.
+        let buckets = buckets.clamp(1, 3000);
 
         // `le` is consumed by the reassembly — never a user group-by (drop it if a caller passes it).
         let group_by: Vec<String> = req
@@ -723,5 +728,30 @@ mod engine_tests {
             .unwrap();
         assert_eq!(r.default_agg, Agg::P99);
         assert_eq!(r.chosen_agg, Agg::P99);
+    }
+
+    #[tokio::test]
+    async fn engine_clamps_a_dos_sized_bucket_count() {
+        // Defense-in-depth for the classic-histogram reassembly path: a caller-supplied
+        // `buckets = 10_000_000` must not drive a multi-million-entry `Vec<SeriesPoint>` per
+        // series (the `(0..buckets)` builds inside `classic_avg`/`classic_percentiles` and
+        // `classic_counter_rollup`'s `reset_aware_series` all scale with `buckets`).
+        let r = classic_engine()
+            .query_series(MetricSeriesRequest {
+                metric: "h".into(),
+                agg: Some(Agg::P50),
+                group_by: vec![],
+                filter: None,
+                start_ts_nanos: 0,
+                end_ts_nanos: 200,
+                buckets: 10_000_000,
+            })
+            .await
+            .unwrap();
+        assert!(
+            r.series[0].points.len() <= 3000,
+            "buckets must be clamped to MAX_BUCKETS, got {}",
+            r.series[0].points.len()
+        );
     }
 }

@@ -28,6 +28,11 @@ pub(crate) struct PromRwHttpState<W: Wal + Send + Sync + 'static> {
     /// receivers — bounds concurrently in-flight remote-write requests (decompress→decode→build→
     /// append) so a burst waits for a permit instead of piling decoded batches on the heap.
     pub(crate) in_flight: Arc<Semaphore>,
+    /// Snappy decompress cap (bytes), from `[ingest].max_body_bytes` — the same limit the OTLP
+    /// HTTP front door enforces on decompressed bodies. A snappy frame header claims a
+    /// decompressed length that `decompress_vec` allocates up-front, so a tiny remote-write body
+    /// could otherwise demand a giant buffer; we reject (413) when the claimed length exceeds it.
+    pub(crate) max_body_bytes: usize,
     /// Cumulative ingest tallies (the `metrics` signal), incremented after a successful append.
     pub(crate) counters: Arc<IngestCounters>,
 }
@@ -43,6 +48,13 @@ pub(crate) fn decode_write_request(body: &[u8]) -> Result<WriteRequest, PhotonEr
         .map_err(|e| PhotonError::Config(format!("invalid remote-write protobuf payload: {e}")))
 }
 
+/// The size a snappy body *claims* it will decompress to (read cheaply from the frame header),
+/// before `decode_write_request` allocates that much. `None` if the header is unreadable (a
+/// malformed body — `decode_write_request` then produces the 400). Pure and unit-testable.
+pub(crate) fn claimed_decompressed_len(body: &[u8]) -> Option<usize> {
+    snap::raw::decompress_len(body).ok()
+}
+
 pub(crate) fn router<W: Wal + Send + Sync + 'static>(state: Arc<PromRwHttpState<W>>) -> Router {
     Router::new()
         .route("/api/v1/write", post(ingest_promrw::<W>))
@@ -54,6 +66,16 @@ async fn ingest_promrw<W: Wal + Send + Sync + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Cheap token check first so an unauthenticated flood is rejected before it ever
+    // competes for an in-flight permit; the permit exists to bound expensive work
+    // (decompress→decode→build→append), not free rejections.
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if !check_bearer_token(auth_header, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+
     let _permit = match state.in_flight.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => {
@@ -65,11 +87,22 @@ async fn ingest_promrw<W: Wal + Send + Sync + 'static>(
         }
     };
 
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if !check_bearer_token(auth_header, &state.token) {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    // Cap the *claimed* decompressed size before `decode_write_request` allocates it: a snappy
+    // frame header can claim gigabytes from a tiny body. Reject over-cap with 413, matching the
+    // OTLP HTTP front door's `DefaultBodyLimit` semantics (an exporter distinguishes 413 from the
+    // 400 we return for a genuinely malformed/undecodable body).
+    if let Some(len) = claimed_decompressed_len(&body) {
+        if len > state.max_body_bytes {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "remote-write body decompresses to {len} bytes, over the \
+                     {} byte limit",
+                    state.max_body_bytes
+                ),
+            )
+                .into_response();
+        }
     }
 
     let req = match decode_write_request(&body) {
@@ -150,6 +183,7 @@ mod tests {
             token: "t".to_string(),
             schema: MetricSchema::new(&["service.name".to_string()]),
             in_flight: Arc::new(Semaphore::new(4)),
+            max_body_bytes: 16 * 1024 * 1024,
             counters: Arc::new(IngestCounters::new()),
         })
     }
@@ -247,6 +281,41 @@ mod tests {
     }
 
     #[test]
+    fn claimed_decompressed_len_reads_the_snappy_header() {
+        // Snappy of 4 KiB of zeros compresses tiny but claims 4096 decompressed bytes.
+        let mut encoder = snap::raw::Encoder::new();
+        let compressed = encoder.compress_vec(&vec![0u8; 4096]).unwrap();
+        assert!(
+            compressed.len() < 4096,
+            "should compress well below its claim"
+        );
+        assert_eq!(claimed_decompressed_len(&compressed), Some(4096));
+        // A non-snappy body has no readable claim → None (the 400 path handles it).
+        assert_eq!(claimed_decompressed_len(&[0xFFu8; 8]), None);
+    }
+
+    /// A small snappy body that *claims* to decompress past `max_body_bytes` is rejected with 413
+    /// BEFORE `decode_write_request` allocates that buffer — the snappy analogue of the OTLP HTTP
+    /// front door's decompressed-stream body limit.
+    #[tokio::test]
+    async fn oversize_snappy_body_is_payload_too_large_and_appends_nothing() {
+        let wal = Arc::new(CapturingWal::default());
+        let state = Arc::new(PromRwHttpState {
+            wal: wal.clone(),
+            token: "t".to_string(),
+            schema: MetricSchema::new(&["service.name".to_string()]),
+            in_flight: Arc::new(Semaphore::new(4)),
+            max_body_bytes: 64, // tiny cap so we allocate nothing large
+            counters: Arc::new(IngestCounters::new()),
+        });
+        let mut encoder = snap::raw::Encoder::new();
+        let compressed = encoder.compress_vec(&vec![0u8; 4096]).unwrap(); // claims 4096 > 64
+        let resp = ingest_promrw(State(state), bearer("t"), Bytes::from(compressed)).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(wal.batches.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn promrw_http_state_bounds_in_flight_permits() {
         let s = state(Arc::new(CapturingWal::default()));
         let s = PromRwHttpState {
@@ -254,6 +323,7 @@ mod tests {
             token: s.token.clone(),
             schema: s.schema.clone(),
             in_flight: Arc::new(Semaphore::new(1)),
+            max_body_bytes: s.max_body_bytes,
             counters: s.counters.clone(),
         };
         let _first = s
@@ -265,5 +335,39 @@ mod tests {
             s.in_flight.clone().try_acquire_owned().is_err(),
             "second concurrent permit refused while the first is held"
         );
+    }
+
+    /// Auth must be checked BEFORE the in-flight permit is acquired: hold the crate's only
+    /// permit for the whole test, then send an invalid-token request. If the handler acquired
+    /// the permit before checking the token, `ingest_promrw` would block forever waiting on a
+    /// permit that never frees; the bounded `timeout` turns that hang into a clear test failure
+    /// instead of a wedged test run.
+    #[tokio::test]
+    async fn invalid_token_is_rejected_without_waiting_for_a_permit() {
+        let wal = Arc::new(CapturingWal::default());
+        let in_flight = Arc::new(Semaphore::new(1));
+        let state = Arc::new(PromRwHttpState {
+            wal: wal.clone(),
+            token: "t".to_string(),
+            schema: MetricSchema::new(&["service.name".to_string()]),
+            in_flight: in_flight.clone(),
+            max_body_bytes: 16 * 1024 * 1024,
+            counters: Arc::new(IngestCounters::new()),
+        });
+        let _held = in_flight
+            .acquire_owned()
+            .await
+            .expect("the sole permit should be available before the test holds it");
+
+        let req = WriteRequest { timeseries: vec![] };
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ingest_promrw(State(state), bearer("wrong"), Bytes::from(snappy(&req))),
+        )
+        .await
+        .expect("token check must reject before waiting on the in-flight permit");
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(wal.batches.lock().unwrap().is_empty());
     }
 }

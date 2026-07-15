@@ -21,6 +21,12 @@ impl SpanQueryEngine {
         req: SpanQueryRequest,
         limit: usize,
     ) -> Result<FacetResult, PhotonError> {
+        // Defense-in-depth, mirroring `crate::facet::QueryEngine::facet` (the logs facet): caps
+        // `limit` to `photon-api`'s `MAX_LIMIT` (`crates/photon-api/src/query_params.rs`, restated
+        // here as a literal since `photon-query` can't depend on `photon-api`). No floor at 1 —
+        // `limit=0` is a pre-existing, legitimate input (zero values back), so only the upper
+        // bound is new. Reachable via `GET /api/traces/facet`.
+        let limit = limit.min(1000);
         let value = self.facet_value_expr(field)?;
         match self.span_survivors_df(&req).await? {
             None => Ok(FacetResult {
@@ -221,5 +227,20 @@ mod tests {
         .unwrap();
         assert!(r.capped);
         assert_eq!(r.values.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn engine_method_survives_a_dos_sized_limit() {
+        // Defense-in-depth for the public `SpanQueryEngine::facet` entry point itself (beyond
+        // `facet_over`, which is tested above): a direct caller passing a huge `limit` must not
+        // panic (e.g. via `limit + 1` overflow) or hang.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SpanQueryEngine::new(dir.path().to_path_buf(), SpanSchema::new(&[])).unwrap();
+        let r = engine
+            .facet("service.name", req(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(r.values.len(), 0);
+        assert!(!r.capped);
     }
 }

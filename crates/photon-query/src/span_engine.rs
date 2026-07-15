@@ -14,7 +14,7 @@ use photon_core::manifest::{FileEntry, Manifest, SPANS_MANIFEST_OBJECT_PATH};
 use photon_core::query::SpanResolvedQuery;
 use photon_core::span_schema::{self, SpanSchema};
 use photon_core::PhotonError;
-use photon_index::{tokenize, SkipIndex};
+use photon_index::{interior_tokens, SkipIndex};
 use photon_storage::Storage;
 
 use crate::{cached_manifest, col_ref, session, ManifestCache};
@@ -154,8 +154,9 @@ impl SpanQueryEngine {
     }
 
     /// Keep a candidate iff its `trace_id` bloom reports the id as possibly-present. The bloom
-    /// never false-negatives, so this only drops files that truly cannot hold the trace; a missing
-    /// `.idx` is kept (correctness over pruning), exactly as the logs engine does.
+    /// never false-negatives, so this only drops files that truly cannot hold the trace; a missing,
+    /// unreadable, OR corrupt `.idx` is kept (correctness over pruning), exactly as the logs engine
+    /// does — a torn sidecar never aborts the lookup or panics.
     fn keep_span_candidate(&self, entry: &FileEntry, trace_id: &str) -> Result<bool, PhotonError> {
         let idx_path = self
             .hot_dir
@@ -163,14 +164,24 @@ impl SpanQueryEngine {
         let bytes = match std::fs::read(&idx_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            // Any other read error → keep (conservative pruning, log once per bad file).
             Err(e) => {
-                return Err(PhotonError::Query(format!(
-                    "failed to read spans skip index {idx_path:?}: {e}"
-                )))
+                eprintln!(
+                    "photon-query: warning: keeping {idx_path:?}, spans skip index unreadable: {e}"
+                );
+                return Ok(true);
             }
         };
-        let index = SkipIndex::from_bytes(&bytes)?;
-        Ok(index.might_contain_token(trace_id))
+        match SkipIndex::from_bytes(&bytes) {
+            Ok(index) => Ok(index.might_contain_token(trace_id)),
+            // Corrupt/undecodable sidecar → keep the file (same rule as a missing one).
+            Err(e) => {
+                eprintln!(
+                    "photon-query: warning: keeping {idx_path:?}, spans skip index corrupt: {e}"
+                );
+                Ok(true)
+            }
+        }
     }
 
     /// Manifest-only storage summary (no data scan): file/row counts, timestamp span, and the
@@ -192,7 +203,12 @@ impl SpanQueryEngine {
             s.total_rows += e.row_count;
             s.min_ts_nanos = s.min_ts_nanos.min(e.min_ts_nanos);
             s.max_ts_nanos = s.max_ts_nanos.max(e.max_ts_nanos);
-            if let Ok(md) = std::fs::metadata(self.hot_dir.join(&e.path)) {
+            // Prefer the Parquet size the compactor recorded at write time — pure manifest
+            // arithmetic, no syscall. Legacy entries (written before `FileEntry.bytes`) carry
+            // `bytes == 0`; stat() ONLY those so the footprint stays exact during the transition.
+            if e.bytes > 0 {
+                s.bytes += e.bytes;
+            } else if let Ok(md) = std::fs::metadata(self.hot_dir.join(&e.path)) {
                 s.bytes += md.len();
             }
         }
@@ -296,8 +312,8 @@ impl SpanQueryEngine {
     /// `min_ts_nanos`/`max_ts_nanos` from the exact same skip-index range at write time
     /// (`SpanCompactor::write_file`; see `crate::QueryEngine::keep_candidate`'s doc comment for
     /// the logs-side equivalent) — plus, only when there is positive free-text, the
-    /// `name`-token bloom, which the manifest does not carry. Conservative: a missing `.idx`
-    /// (when a bloom check is needed) keeps the file.
+    /// `name`-token bloom, which the manifest does not carry. Conservative: a missing, unreadable,
+    /// or corrupt `.idx` (when a bloom check is needed) keeps the file — never aborts the search.
     fn keep_span_search_candidate(
         &self,
         entry: &FileEntry,
@@ -323,25 +339,41 @@ impl SpanQueryEngine {
             Ok(b) => b,
             // No sidecar → cannot bloom-check → keep the file (correctness over pruning).
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            // Any other read error → also keep, never abort the search (log once per bad file).
             Err(e) => {
-                return Err(PhotonError::Query(format!(
-                    "failed to read spans skip index {idx_path:?}: {e}"
-                )))
+                eprintln!(
+                    "photon-query: warning: keeping {idx_path:?}, spans skip index unreadable: {e}"
+                );
+                return Ok(true);
             }
         };
-        let index = SkipIndex::from_bytes(&bytes)?;
-        Ok(index.might_contain_all(tokens))
+        match SkipIndex::from_bytes(&bytes) {
+            Ok(index) => Ok(index.might_contain_all(tokens)),
+            // Corrupt/undecodable sidecar → keep the file (same rule as a missing one).
+            Err(e) => {
+                eprintln!(
+                    "photon-query: warning: keeping {idx_path:?}, spans skip index corrupt: {e}"
+                );
+                Ok(true)
+            }
+        }
     }
 }
 
-/// The bloom-search tokens for a span request: every positive free-text term of the grammar
-/// query (e.g. bare words matching `name`), tokenized with `photon_index::tokenize`. `None`
-/// when there is nothing to search, so pruning skips the bloom check entirely.
+/// The bloom-search tokens for a span request: the *interior* (both-sides-delimited) tokens of
+/// every positive free-text term of the grammar query (e.g. bare words / quoted phrases matching
+/// `name`), via `photon_index::interior_tokens`. `None` when there is nothing safe to bloom-test,
+/// so pruning skips the bloom check and keeps the file.
+///
+/// Free-text over the span `name` is *substring* (`strpos(name, text) > 0`), identical to the logs
+/// body case, so it shares the same interior-token rule as `crate::text_tokens` — only tokens
+/// delimited on both sides within the search term are guaranteed whole in a matching name, so
+/// bloom-testing an edge token would false-*negative* and drop a real result.
 pub(crate) fn span_text_tokens(req: &SpanQueryRequest) -> Option<Vec<String>> {
     let mut tokens: Vec<String> = Vec::new();
     if let Some(rq) = &req.query {
         for t in rq.positive_freetext() {
-            tokens.extend(tokenize(t));
+            tokens.extend(interior_tokens(t));
         }
     }
     if tokens.is_empty() {
@@ -369,6 +401,8 @@ pub(crate) fn span_base_predicate(req: &SpanQueryRequest) -> Expr {
 mod tests {
     use super::*;
 
+    use photon_core::query::{parse, SpanFieldResolver};
+
     #[test]
     fn constructs_over_a_hot_dir() {
         let engine = SpanQueryEngine::new(
@@ -377,5 +411,73 @@ mod tests {
         )
         .unwrap();
         assert!(engine.hot_dir.ends_with("does-not-exist"));
+    }
+
+    fn req_query(q: &str) -> SpanQueryRequest {
+        let rq = SpanFieldResolver::new(&["service.name".to_string()])
+            .resolve(&parse(q).unwrap())
+            .unwrap();
+        SpanQueryRequest {
+            start_ts_nanos: 0,
+            end_ts_nanos: i64::MAX,
+            query: Some(rq),
+            sort: SpanSort::Recent,
+            limit: 10,
+            offset: 0,
+            projected_attributes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn storage_stats_prefers_recorded_bytes_and_falls_back_for_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hot.join("manifest")).unwrap();
+        std::fs::create_dir_all(hot.join("data-spans")).unwrap();
+        // seg-a on disk is 100 bytes but its entry records 999 — a correct sum uses the recorded
+        // field, not a stat. seg-b is legacy (bytes == 0) → its real 250 bytes come via stat().
+        std::fs::write(hot.join("data-spans/seg-a.parquet"), vec![0u8; 100]).unwrap();
+        std::fs::write(hot.join("data-spans/seg-b.parquet"), vec![0u8; 250]).unwrap();
+        let mut m = Manifest::new();
+        for (path, seg, bytes) in [
+            ("data-spans/seg-a.parquet", 1u64, 999u64),
+            ("data-spans/seg-b.parquet", 2, 0),
+        ] {
+            m.add(FileEntry {
+                path: path.into(),
+                segment_id: photon_core::segment::SegmentId(seg),
+                min_ts_nanos: 0,
+                max_ts_nanos: 100,
+                min_service: "api".into(),
+                max_service: "web".into(),
+                row_count: 1,
+                durable: false,
+                attribute_keys: vec![],
+                bytes,
+            });
+        }
+        std::fs::write(hot.join(SPANS_MANIFEST_OBJECT_PATH), m.to_json().unwrap()).unwrap();
+
+        let engine =
+            SpanQueryEngine::new(hot, SpanSchema::new(&["service.name".to_string()])).unwrap();
+        let s = engine.storage_stats().unwrap();
+        assert_eq!(s.file_count, 2);
+        // 999 (recorded field, proving no stat of the 100-byte file) + 250 (legacy fallback stat).
+        assert_eq!(s.bytes, 999 + 250);
+    }
+
+    /// Spans free-text over `name` is substring semantics too, so `span_text_tokens` must share the
+    /// interior-token rule: only both-sides-delimited tokens are safe to bloom-test.
+    #[test]
+    fn span_text_tokens_returns_only_interior_tokens() {
+        // A quoted phrase is one free-text term → interior token is `checkout` (edges dropped).
+        assert_eq!(
+            span_text_tokens(&req_query("\"a checkout b\"")).unwrap(),
+            vec!["checkout"]
+        );
+        // A single-word free-text term is edge-to-edge → nothing safe to bloom-test.
+        assert!(span_text_tokens(&req_query("\"tim\"")).is_none());
+        // A bare word is also a single edge-to-edge free-text term → no safe token.
+        assert!(span_text_tokens(&req_query("checkout")).is_none());
     }
 }

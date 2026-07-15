@@ -17,11 +17,10 @@ use photon_core::query::parser::parse;
 use photon_core::query::{MetricFieldResolver, MetricResolvedQuery};
 use photon_query::{LabelsResult, MetricSeriesRequest, SeriesResult};
 
-use crate::query_params::QueryParamError;
+use crate::query_params::{QueryParamError, MAX_BUCKETS};
 use crate::AppState;
 
 const DEFAULT_BUCKETS: usize = 200;
-const MAX_BUCKETS: usize = 3000;
 const MIN_STEP_NANOS: i64 = 1_000_000_000; // 1s floor
 
 // ---------- shared helpers ----------

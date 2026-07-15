@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use photon_query::{FieldInfo, FieldKind, LatencyHistogram, SpanHistogramBucket};
 
-use crate::query_params::{build_span_query_request, parse_window};
+use crate::query_params::{build_span_query_request, clamp_buckets, clamp_limit, parse_window};
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -80,7 +80,11 @@ pub(crate) async fn traces_facet(
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    match state.span_query.facet(&p.field, req, p.limit).await {
+    match state
+        .span_query
+        .facet(&p.field, req, clamp_limit(p.limit))
+        .await
+    {
         Ok(r) => Json(json!({
             "values": r.values.iter()
                 .map(|v| json!({ "value": v.value, "count": v.count }))
@@ -132,7 +136,11 @@ pub(crate) async fn traces_histogram(
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    match state.span_query.histogram(req, p.buckets).await {
+    match state
+        .span_query
+        .histogram(req, clamp_buckets(p.buckets))
+        .await
+    {
         Ok(buckets) => Json(
             buckets
                 .iter()
@@ -176,7 +184,11 @@ pub(crate) async fn traces_latency(
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    match state.span_query.latency(req, p.buckets).await {
+    match state
+        .span_query
+        .latency(req, clamp_buckets(p.buckets))
+        .await
+    {
         Ok(hist) => Json(latency_to_json(&hist)).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -296,6 +308,36 @@ mod tests {
         assert_eq!(v["p50"], serde_json::json!("0"));
         assert_eq!(v["p90"], serde_json::json!("0"));
         assert_eq!(v["p99"], serde_json::json!("0"));
+    }
+
+    #[tokio::test]
+    async fn traces_histogram_clamps_a_dos_sized_bucket_count() {
+        let (status, v) = get("/api/traces/histogram?start=0&end=100&buckets=2000000000").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            v.as_array().unwrap().len(),
+            crate::query_params::MAX_BUCKETS
+        );
+    }
+
+    #[tokio::test]
+    async fn traces_latency_clamps_a_dos_sized_bucket_count() {
+        // The doc's literal opening-line repro: `GET /api/traces/latency?buckets=2000000000`
+        // must return 200 promptly instead of allocating ~16 GB.
+        let (status, v) = get("/api/traces/latency?start=0&end=100&buckets=2000000000").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // No survivors on an empty store -> `latency` short-circuits to empty buckets
+        // regardless of the (clamped) bucket count, same as the existing zeroed-histogram test.
+        assert_eq!(v["buckets"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn traces_facet_clamps_a_dos_sized_limit() {
+        let (status, v) =
+            get("/api/traces/facet?field=service.name&start=0&end=100&limit=999999999").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v["values"], serde_json::json!([]));
+        assert_eq!(v["capped"], serde_json::json!(false));
     }
 
     #[tokio::test]

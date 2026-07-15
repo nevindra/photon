@@ -478,6 +478,11 @@ impl MetricsQueryEngine {
         buckets: usize,
     ) -> Result<HostSeries, PhotonError> {
         let (metric, group) = resource.primary();
+        // Defense-in-depth: mirrors `photon-api`'s `MAX_BUCKETS`
+        // (`crates/photon-api/src/query_params.rs`); `photon-query` can't depend on `photon-api`,
+        // so the value is restated here as a literal. `photon-api/src/infra.rs`'s handler already
+        // clamps its own `buckets` param to 500, but this engine method is a public entry point
+        // in its own right and must not trust the caller.
         let req = crate::MetricSeriesRequest {
             metric: metric.to_string(),
             agg: None,
@@ -485,7 +490,7 @@ impl MetricsQueryEngine {
             filter: Some(self.host_filter(host)),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            buckets: buckets.max(1),
+            buckets: buckets.clamp(1, 3000),
         };
         let out = self.query_series(req).await?;
         Ok(HostSeries {
@@ -762,6 +767,25 @@ mod tests {
             if let Some(h) = s.labels.get("host.name") {
                 assert_eq!(h, "web-1");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn infra_host_series_clamps_a_dos_sized_bucket_count() {
+        // Defense-in-depth for `infra_host_series` itself — `photon-api/src/infra.rs`'s handler
+        // already clamps its own `buckets` param to 500, but a direct engine caller must not be
+        // able to drive a multi-million-point series via `buckets`.
+        let (_dir, engine) = super::tests_fixture::two_hosts_cpu().await;
+        let r = engine
+            .infra_host_series("web-1", InfraResource::Cpu, 0, i64::MAX, 10_000_000)
+            .await
+            .unwrap();
+        for s in &r.series {
+            assert!(
+                s.points.len() <= 3000,
+                "buckets must be clamped to MAX_BUCKETS, got {}",
+                s.points.len()
+            );
         }
     }
 }

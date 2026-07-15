@@ -45,8 +45,15 @@ axum-extra = { version = "0.9", features = ["cookie", "cookie-signed"] }
 # it unifies with axum-extra's cookie dependency.
 time = { version = "0.3", default-features = false }
 argon2 = "0.5"
+# subtle is already resolved transitively (via argon2's password-hash dep) at 2.6.1 — pin the
+# same major here so photon-ingest's constant-time token compare doesn't add a second version.
+subtle = "2"
 rust-embed = "8"
 mime_guess = "2"
+# tower-http 0.5 (tracks http 1.0 / axum 0.7). Shared by photon-api (response compression + the
+# RUM CORS layer) and photon-ingest (gzip *request* decompression on the OTLP HTTP front door).
+# Version pinned here; the per-crate `features = [...]` stay in each crate's Cargo.toml.
+tower-http = { version = "0.5" }
 # Uptime vertical (M-uptime). Independent of the arrow/datafusion + otlp/tonic clusters.
 async-trait = "0.1"
 # WS1: jemalloc returns freed pages to the OS (glibc retained them — B1 measured post-idle ≈ peak)

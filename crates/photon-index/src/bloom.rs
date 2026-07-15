@@ -2,6 +2,7 @@
 //! via double hashing (Kirsch-Mitzenmacher): one 64-bit `DefaultHasher` output is split
 //! into two 32-bit halves `(h1, h2)`, and probe `i` lands at `h1 + i * h2 (mod m)`.
 
+use photon_core::PhotonError;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -62,14 +63,34 @@ impl Bloom {
     }
 
     /// Reconstruct a `Bloom` from parts previously produced by `raw_parts` (used by the
-    /// binary `.idx` decoder). No extra validation — the caller (the byte cursor) already
-    /// guarantees `bits.len()` covers the bits it read.
+    /// binary `.idx` decoder). No validation here: every caller MUST call `validate()` on the
+    /// result before using it, so the `% num_bits` in `index_for` and the `bits[idx / 8]` in
+    /// `might_contain` can never divide-by-zero or index out of bounds on a decoded bloom.
     pub(crate) fn from_raw_parts(num_bits: usize, num_hashes: u32, bits: Vec<u8>) -> Bloom {
         Bloom {
             bits,
             num_bits,
             num_hashes,
         }
+    }
+
+    /// Validate the framing invariants a decoded bloom must satisfy before any membership
+    /// probe touches it: `num_bits` must be non-zero (it's a `%` divisor in `index_for`), and
+    /// `bits` must be exactly the byte length `num_bits` implies (it's indexed as `bits[idx / 8]`
+    /// in `might_contain`). Both the binary `.idx` decoder and the legacy `serde_json` decoder
+    /// deserialize a `Bloom`'s fields from untrusted bytes, so BOTH must call this before
+    /// returning a `SkipIndex` — a bloom that fails this check would otherwise panic (divide-by-
+    /// zero or out-of-bounds index) on the first query-time membership probe instead of
+    /// surfacing as a clean decode error.
+    pub(crate) fn validate(&self) -> Result<(), PhotonError> {
+        if self.num_bits == 0 || self.bits.len() != self.num_bits.div_ceil(8) {
+            return Err(PhotonError::Index(format!(
+                "skip index: corrupt bloom framing (num_bits={}, bits_len={})",
+                self.num_bits,
+                self.bits.len()
+            )));
+        }
+        Ok(())
     }
 
     fn index_for(&self, h1: u32, h2: u32, i: u32) -> usize {

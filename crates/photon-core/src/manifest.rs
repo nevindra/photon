@@ -28,6 +28,12 @@ pub struct FileEntry {
     /// segment. Enables `/api/fields` to be metadata, not a scan. Empty for legacy segments.
     #[serde(default)]
     pub attribute_keys: Vec<String>,
+    /// On-disk size in bytes of this file's Parquet, captured at compaction write time so the
+    /// usage sampler's `storage_stats` is manifest arithmetic instead of one `stat()` syscall per
+    /// entry. The `.idx` sidecar is excluded. Legacy segments (written before this field) decode
+    /// as `0`; `storage_stats` falls back to a `stat()` for those so footprint stays accurate.
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -98,6 +104,7 @@ mod tests {
             row_count: 10,
             durable: false,
             attribute_keys: Vec::new(),
+            bytes: 0,
         }
     }
 
@@ -143,6 +150,25 @@ mod tests {
             back.candidates(0, 100)[0].attribute_keys,
             vec!["host.name", "region"]
         );
+    }
+
+    #[test]
+    fn bytes_default_and_roundtrip() {
+        // Legacy JSON with no `bytes` still loads (serde default → 0), so a manifest written
+        // before this field decodes without error and reports a zero footprint for the entry —
+        // `storage_stats` then stat()s it as a fallback.
+        let legacy = r#"{"entries":[{"path":"a.parquet","segment_id":1,"min_ts_nanos":0,
+"max_ts_nanos":100,"min_service":"api","max_service":"web","row_count":10,"durable":false}]}"#;
+        let m = Manifest::from_json(legacy).unwrap();
+        assert_eq!(m.candidates(0, 100)[0].bytes, 0);
+
+        // New field round-trips through JSON.
+        let mut m2 = Manifest::new();
+        let mut e = entry("b.parquet", 2, 0, 100);
+        e.bytes = 4096;
+        m2.add(e);
+        let back = Manifest::from_json(&m2.to_json().unwrap()).unwrap();
+        assert_eq!(back.candidates(0, 100)[0].bytes, 4096);
     }
 
     #[test]

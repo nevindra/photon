@@ -49,6 +49,16 @@ async fn ingest_logs<W: Wal + Send + Sync + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Cheap token check first so an unauthenticated flood is rejected before it ever
+    // competes for an in-flight permit; the permit exists to bound expensive work
+    // (decode→build→append), not free rejections.
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if !check_bearer_token(auth_header, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+
     // WS4 backpressure: acquire an in-flight permit before doing any decode/build/append
     // work; excess requests wait here rather than piling decoded batches on the heap. Held
     // until the handler returns (RAII release on drop). The semaphore is never closed, so
@@ -63,13 +73,6 @@ async fn ingest_logs<W: Wal + Send + Sync + 'static>(
                 .into_response()
         }
     };
-
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if !check_bearer_token(auth_header, &state.token) {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
-    }
 
     let req = match decode_export_request(&body) {
         Ok(req) => req,

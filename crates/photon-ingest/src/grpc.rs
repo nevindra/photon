@@ -30,15 +30,9 @@ impl<W: Wal + Send + Sync + 'static> LogsService for GrpcLogsService<W> {
         &self,
         request: tonic::Request<ExportLogsServiceRequest>,
     ) -> Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
-        // WS4 backpressure: acquire an in-flight permit before doing any decode/build/append
-        // work; excess requests wait here rather than piling decoded batches on the heap.
-        // Held until the handler returns (RAII release on drop). The semaphore is never
-        // closed, so `Err` is not expected in practice, but we still fail gracefully instead
-        // of unwrapping.
-        let _permit = self.in_flight.clone().acquire_owned().await.map_err(|e| {
-            tonic::Status::resource_exhausted(format!("ingest temporarily overloaded: {e}"))
-        })?;
-
+        // Cheap token check first so an unauthenticated flood is rejected before it ever
+        // competes for an in-flight permit; the permit exists to bound expensive work
+        // (decode→build→append), not free rejections.
         let auth_header = request
             .metadata()
             .get("authorization")
@@ -48,6 +42,15 @@ impl<W: Wal + Send + Sync + 'static> LogsService for GrpcLogsService<W> {
                 "missing or invalid bearer token",
             ));
         }
+
+        // WS4 backpressure: acquire an in-flight permit before doing any decode/build/append
+        // work; excess requests wait here rather than piling decoded batches on the heap.
+        // Held until the handler returns (RAII release on drop). The semaphore is never
+        // closed, so `Err` is not expected in practice, but we still fail gracefully instead
+        // of unwrapping.
+        let _permit = self.in_flight.clone().acquire_owned().await.map_err(|e| {
+            tonic::Status::resource_exhausted(format!("ingest temporarily overloaded: {e}"))
+        })?;
 
         let req = request.into_inner();
         let mut builder = RecordBatchBuilder::with_capacity(&self.schema, estimate_rows(&req));

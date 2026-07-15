@@ -7,20 +7,33 @@ edition = "2021"
 photon-core = { path = "../photon-core" }
 photon-wal = { path = "../photon-wal" }
 arrow = { workspace = true }
-tonic = { workspace = true }
+# `gzip` feature enables `CompressionEncoding::Gzip` so the gRPC receivers can `.accept_compressed`
+# gzipped requests (a stock OTel Collector gzips by default). Feature enable, NOT a version bump —
+# tonic stays co-pinned at 0.12 with prost 0.13 / opentelemetry-proto 0.27.
+tonic = { workspace = true, features = ["gzip"] }
 prost = { workspace = true }
 opentelemetry-proto = { workspace = true }
 axum = { workspace = true }
+# `decompression-gzip` adds `RequestDecompressionLayer`, which transparently gunzips gzipped OTLP
+# HTTP request bodies. Version is pinned in `[workspace.dependencies]`.
+tower-http = { workspace = true, features = ["decompression-gzip"] }
 tokio = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snap = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
 criterion = { workspace = true }
+# `tower::ServiceExt::oneshot` drives the merged ingest router through its real middleware stack
+# (decompression + body limit) in the gzip/body-limit interop test.
+tower = "0.5"
+# Produces gzip request bodies in that test (arrives transitively via tower-http's
+# `decompression-gzip` → async-compression anyway, so ~no extra lock churn).
+flate2 = "1"
 
 [[bench]]
 name = "logs_ingest"

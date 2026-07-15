@@ -31,6 +31,12 @@ impl QueryEngine {
         req: QueryRequest,
         limit: usize,
     ) -> Result<FacetResult, PhotonError> {
+        // Defense-in-depth: mirrors `photon-api`'s `MAX_LIMIT` (`crates/photon-api/src/
+        // query_params.rs`); `photon-query` can't depend on `photon-api`, so the value is
+        // restated here as a literal. No floor at 1 (unlike the `buckets` clamps elsewhere in
+        // this crate) — `limit=0` is a pre-existing, legitimate input (zero values back, not
+        // "unlimited"), so only the upper bound is new.
+        let limit = limit.min(1000);
         let value = self.facet_value_expr(field)?;
         match self.survivors_df(&req).await? {
             None => Ok(FacetResult {
@@ -224,5 +230,167 @@ mod tests {
         .unwrap();
         assert!(r.capped);
         assert_eq!(r.values.len(), 2);
+    }
+
+    /// Part 1 fail-loud: the facet `GROUP BY value` is the canonical unbounded-RAM path (the
+    /// grouped hash table holds every distinct value before the limit trims it). Run over a
+    /// context whose DataFusion memory pool is 1 byte, it must ERROR with a `ResourcesExhausted`
+    /// (surfaced as `PhotonError::Query`) instead of building an unbounded table / OOMing. Proves
+    /// `session_with_memory_pool_bytes` actually caps the path, globally, at the engine seam.
+    #[tokio::test]
+    async fn facet_over_tiny_memory_pool_fails_loud_not_oom() {
+        // 300 distinct services ⇒ a grouped hash table that cannot fit in a 1-byte pool.
+        let schema = schema();
+        let mut b = RecordBatchBuilder::new(&schema);
+        for i in 0..300i64 {
+            b.append(&rec(i, &format!("svc-{i}"), &[]));
+        }
+        let ctx = crate::session_with_memory_pool_bytes(1);
+        ctx.register_table(
+            "logs",
+            Arc::new(
+                MemTable::try_new(schema.arrow.clone(), vec![vec![b.finish().unwrap()]]).unwrap(),
+            ),
+        )
+        .unwrap();
+        let df = ctx.table("logs").await.unwrap();
+
+        let result = facet_over(
+            df,
+            crate::base_predicate(&req()),
+            value_expr("service.name"),
+            50,
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("a 1-byte memory pool must make the GROUP BY fail loud, not OOM");
+        };
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("resources exhausted"),
+            "expected a DataFusion ResourcesExhausted error, got: {msg}"
+        );
+    }
+}
+
+/// End-to-end coverage of the public `QueryEngine::facet` entry point against a real compacted
+/// store with more than `MAX_LIMIT` distinct values — proves the defensive clamp actually
+/// truncates, not just that it compiles.
+#[cfg(test)]
+mod engine_tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use arrow::record_batch::RecordBatch;
+    use object_store::local::LocalFileSystem;
+    use photon_compact::Compactor;
+    use photon_core::record::{LogRecord, RecordBatchBuilder};
+    use photon_core::schema::LogSchema;
+    use photon_core::segment::SegmentId;
+    use photon_core::PhotonError;
+    use photon_storage::{Replicator, Storage};
+    use photon_wal::Wal;
+
+    use crate::{QueryEngine, QueryRequest};
+
+    /// Minimal in-memory WAL handing the compactor one pre-built segment, mirroring the
+    /// `FakeWal` fixtures in `infra.rs`/`metric_classic_hist.rs`/`span_latency.rs`.
+    struct FakeWal {
+        segments: Mutex<Vec<(SegmentId, Vec<RecordBatch>)>>,
+    }
+    #[allow(clippy::manual_async_fn)]
+    impl Wal for FakeWal {
+        fn append(
+            &self,
+            _b: RecordBatch,
+        ) -> impl std::future::Future<Output = Result<(), PhotonError>> + Send {
+            async move { unimplemented!() }
+        }
+        fn sync(&self) -> impl std::future::Future<Output = Result<(), PhotonError>> + Send {
+            async move { unimplemented!() }
+        }
+        fn list_closed_segments(&self) -> Result<Vec<SegmentId>, PhotonError> {
+            let mut ids: Vec<SegmentId> = self
+                .segments
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort();
+            Ok(ids)
+        }
+        fn read_segment(
+            &self,
+            id: SegmentId,
+        ) -> impl std::future::Future<Output = Result<Vec<RecordBatch>, PhotonError>> + Send
+        {
+            let batches = self
+                .segments
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(sid, _)| *sid == id)
+                .map(|(_, b)| b.clone())
+                .unwrap_or_default();
+            async move { Ok(batches) }
+        }
+        fn remove_segment(&self, id: SegmentId) -> Result<(), PhotonError> {
+            self.segments.lock().unwrap().retain(|(sid, _)| *sid != id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_clamps_a_dos_sized_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().to_path_buf();
+        let schema = LogSchema::new(&["service.name".to_string()]);
+
+        // 1200 distinct `service.name` values — more than MAX_LIMIT (1000), so an unclamped
+        // `limit=10_000_000` would return all 1200 and an actually-clamped one returns <=1000.
+        let mut b = RecordBatchBuilder::new(&schema);
+        for i in 0..1200 {
+            let mut attributes = BTreeMap::new();
+            attributes.insert("service.name".to_string(), format!("svc-{i}"));
+            b.append(&LogRecord {
+                timestamp_nanos: i as i64,
+                severity_number: Some(9),
+                body: Some("x".into()),
+                attributes,
+                ..Default::default()
+            });
+        }
+        let batch = b.finish().unwrap();
+
+        let storage = Storage {
+            hot: Arc::new(LocalFileSystem::new_with_prefix(&hot).unwrap()),
+            durable: None,
+            hot_dir: Some(hot.clone()),
+        };
+        let wal = Arc::new(FakeWal {
+            segments: Mutex::new(vec![(SegmentId(0), vec![batch])]),
+        });
+        let replicator = Arc::new(Replicator::new(storage.clone()));
+        let compactor = Compactor::new(wal, storage, replicator, schema.clone());
+        while compactor.run_once().await.unwrap().is_some() {}
+
+        let engine = QueryEngine::new(hot, schema).unwrap();
+        let req = QueryRequest {
+            start_ts_nanos: 0,
+            end_ts_nanos: 2000,
+            services: Vec::new(),
+            severities: Vec::new(),
+            text: None,
+            query: None,
+            limit: 0,
+        };
+        let r = engine.facet("service.name", req, 10_000_000).await.unwrap();
+        assert!(
+            r.values.len() <= 1000,
+            "limit must be clamped to MAX_LIMIT, got {}",
+            r.values.len()
+        );
+        assert!(r.capped, "1200 distinct values exceeds the 1000 cap");
     }
 }

@@ -1,7 +1,7 @@
 //! tonic `TraceService`: token check → OTLP→`SpanRecord` mapping → spans-WAL append.
 
 use crate::auth::check_bearer_token;
-use crate::trace_mapping::otlp_traces_to_spans;
+use crate::trace_mapping::{estimate_rows, otlp_traces_into_builder};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     trace_service_server::TraceService, ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
@@ -30,10 +30,9 @@ impl<W: Wal + Send + Sync + 'static> TraceService for GrpcTraceService<W> {
         &self,
         request: tonic::Request<ExportTraceServiceRequest>,
     ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
-        let _permit = self.in_flight.clone().acquire_owned().await.map_err(|e| {
-            tonic::Status::resource_exhausted(format!("ingest temporarily overloaded: {e}"))
-        })?;
-
+        // Cheap token check first so an unauthenticated flood is rejected before it ever
+        // competes for an in-flight permit; the permit exists to bound expensive work
+        // (decode→build→append), not free rejections.
         let auth_header = request
             .metadata()
             .get("authorization")
@@ -44,11 +43,13 @@ impl<W: Wal + Send + Sync + 'static> TraceService for GrpcTraceService<W> {
             ));
         }
 
-        let spans = otlp_traces_to_spans(request.into_inner());
-        let mut builder = SpanBatchBuilder::new(&self.schema);
-        for span in &spans {
-            builder.append(span);
-        }
+        let _permit = self.in_flight.clone().acquire_owned().await.map_err(|e| {
+            tonic::Status::resource_exhausted(format!("ingest temporarily overloaded: {e}"))
+        })?;
+
+        let req = request.into_inner();
+        let mut builder = SpanBatchBuilder::with_capacity(&self.schema, estimate_rows(&req));
+        otlp_traces_into_builder(req, &mut builder);
         let batch = builder
             .finish()
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
