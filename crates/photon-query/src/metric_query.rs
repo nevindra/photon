@@ -703,7 +703,7 @@ impl SeriesAssembler {
             .into_iter()
             .map(|(key, points)| {
                 let mut labels = BTreeMap::new();
-                for (name, val) in group_by.iter().zip(key.into_iter()) {
+                for (name, val) in group_by.iter().zip(key) {
                     if let Some(v) = val {
                         labels.insert(name.clone(), v);
                     }

@@ -1,0 +1,81 @@
+name: CI
+
+# Test the frontend app and the Rust workspace on every push and pull request.
+# The Docker release image is built separately (docker-release.yml, on tags).
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (type-check · test · build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: bun install --frozen-lockfile
+
+      - name: Type-check (vue-tsc)
+        working-directory: frontend
+        run: bun run type-check
+
+      - name: Unit tests (vitest)
+        working-directory: frontend
+        run: bun run test
+
+      - name: Build bundle
+        working-directory: frontend
+        run: bun run build
+
+      # The Rust backend embeds frontend/dist (rust-embed); hand it to the backend job
+      # so photon-api's embed tests compile and pass without rebuilding the frontend.
+      - name: Upload frontend/dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+          if-no-files-found: error
+
+  backend:
+    name: Backend (fmt · clippy · test)
+    runs-on: ubuntu-latest
+    needs: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      # photon-api's embed tests need frontend/dist present at build time.
+      - name: Download frontend/dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace

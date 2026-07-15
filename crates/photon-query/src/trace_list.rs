@@ -198,7 +198,7 @@ impl SpanQueryEngine {
             .filter(col("trace_id").is_not_null())
             .map_err(|e| PhotonError::Query(format!("trace match not-null: {e}")))?
             .sort(vec![
-                col("ts").sort(false, false),      // min(start) DESC — newest traces first
+                col("ts").sort(false, false), // min(start) DESC — newest traces first
                 col("trace_id").sort(true, false), // id ASC — deterministic tiebreak
             ])
             .map_err(|e| PhotonError::Query(format!("trace match sort: {e}")))?

@@ -8,7 +8,7 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use photon_core::config::WalConfig;
 use photon_core::record::{LogRecord, RecordBatchBuilder};
 use photon_core::schema::LogSchema;
-use photon_wal::{DiskWal, Wal};
+use photon_wal::DiskWal;
 use std::collections::BTreeMap;
 
 fn schema() -> LogSchema {
@@ -60,7 +60,7 @@ fn bench_wal_append(c: &mut Criterion) {
                 std::fs::create_dir_all(&p).unwrap();
                 p
             }
-            None => tempfile::tempdir().unwrap().into_path(),
+            None => tempfile::tempdir().unwrap().keep(),
         };
         let wal = rt
             .block_on(DiskWal::open(dir.clone(), schema.clone(), wal_config()))

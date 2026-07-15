@@ -184,10 +184,20 @@ async fn distinct_services_returns_sorted_distinct() {
 async fn distinct_services_empty_store_returns_empty() {
     let dir = TempDir::new().unwrap();
     // No manifest at all (brand-new hot dir).
-    assert!(engine(&dir).distinct_services().await.unwrap().as_ref().is_empty());
+    assert!(engine(&dir)
+        .distinct_services()
+        .await
+        .unwrap()
+        .as_ref()
+        .is_empty());
     // Explicit empty manifest — the exact post-purge state (`{"entries":[]}`).
     write_manifest(dir.path(), vec![]);
-    assert!(engine(&dir).distinct_services().await.unwrap().as_ref().is_empty());
+    assert!(engine(&dir)
+        .distinct_services()
+        .await
+        .unwrap()
+        .as_ref()
+        .is_empty());
 }
 
 /// 1. A time-range search returns only the rows inside the window, newest first.

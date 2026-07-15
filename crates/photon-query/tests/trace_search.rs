@@ -674,8 +674,14 @@ async fn straddling_trace_spans_before_the_window_are_rolled_up_fully() {
     assert_eq!(res.matched_count, 1);
     let t = find(&res.traces, "T");
     // The straddling child span (in the pre-window segment) is now included.
-    assert_eq!(t.span_count, 2, "the straddling child span must be rolled up");
-    assert_eq!(t.error_count, 1, "the straddling error span must be counted");
+    assert_eq!(
+        t.span_count, 2,
+        "the straddling child span must be rolled up"
+    );
+    assert_eq!(
+        t.error_count, 1,
+        "the straddling error span must be counted"
+    );
     assert_eq!(t.services, vec!["api".to_string(), "db".to_string()]);
     // The representative root is unchanged (the in-window parent-less span).
     assert_eq!(t.root_name.as_deref(), Some("GET /"));
