@@ -67,12 +67,13 @@ hidden and `pagehide` — not one request per metric.
 
 ### Attribution (opt-in)
 
-Set `attribution: true` to also capture *why* a vital was slow: LCP's four sub-parts (TTFB,
-resource load delay, resource load time, element render delay) plus the LCP element, INP's target
-+ phase breakdown, and CLS's largest-shift source. This pulls in `web-vitals/attribution` via a
-dynamic `import()`, so the base bundle stays tree-shaken and under budget when you don't opt in.
-The `/rum` UI's page-detail view renders the LCP breakdown as a segmented bar when this data is
-present.
+Set `attribution: true` to also capture *why* **LCP** was slow: its four sub-parts (TTFB, resource
+load delay, resource load time, element render delay) plus the LCP element. This pulls in
+`web-vitals/attribution` via a dynamic `import()`, so the base bundle stays tree-shaken and under
+budget when you don't opt in. The `/rum` UI's page-detail view renders the LCP breakdown as a
+segmented bar when this data is present. (INP and CLS carry no attribution sub-parts: they're
+measured per view by the SPA layer — see below — as a single source of truth across hard and soft
+navigations, so web-vitals' page-lifetime INP/CLS attribution isn't used.)
 
 ### Trace correlation (opt-in)
 
@@ -89,10 +90,11 @@ initPhoton({
 });
 ```
 
-On init, the SDK mints one W3C trace id for the pageview (32 lowercase hex chars via
+On init, the SDK mints one W3C trace id for the current view (32 lowercase hex chars via
 `crypto.getRandomValues`; the module silently no-ops if `crypto` is unavailable) and patches
 `window.fetch` / `XMLHttpRequest` to inject a fresh `traceparent: 00-<trace-id>-<span-id>-01` header
-on each outgoing request that matches `tracePropagationTargets`:
+on each outgoing request that matches `tracePropagationTargets`. A fresh trace id is minted again on
+every soft navigation (see "Single-Page Apps" below), so each route correlates to its own trace:
 
 - Default is `["same-origin"]` — only requests to the page's own origin get the header, so
   `tracing: true` is CORS-safe out of the box with no extra config.
@@ -108,6 +110,59 @@ on each outgoing request that matches `tracePropagationTargets`:
   `fetch`/`XHR` in their normal, un-instrumented state.
 - Lazily loaded: `tracing: true` triggers a dynamic `import("./tracing")`, so it costs nothing
   against the < 5 KB core budget unless you opt in.
+
+## Single-Page Apps (SPA)
+
+**On by default — no flag, no framework adapter.** The SDK patches `history.pushState` /
+`history.replaceState` and listens for `popstate` to detect a real client-side route
+change (`location.pathname`, or `routeOf(path)` if you passed one, actually changing) and rotates
+the logical **view**:
+
+- Every route change gets a fresh `view.id`, an incrementing `view.seq` (ordinal within the
+  session; the landing view is `0`), and `view.previous_route` (the route navigated *from* —
+  omitted on the landing view). Vitals and errors are attributed to the view that was active
+  *when they were collected*, not the view active when the beacon happens to flush.
+- Pure query/hash-only changes (e.g. a search-param update) do **not** rotate the view — only a
+  real path change does.
+- MPAs (no client-side routing) are unaffected: with no History mutations the detector never
+  rotates, so `view.id` behaves exactly as before this feature.
+
+### Per-view vitals
+
+- The **landing** (hard) view reports real `LCP`/`FCP`/`TTFB`/`INP`/`CLS` from `web-vitals`, pinned
+  to the landing view even if a metric (e.g. LCP) finalizes after the user has already
+  soft-navigated away — it's sent as a follow-up beacon for the landing view rather than
+  mis-stamped onto whatever route is now current.
+- Every **soft-navigated** view reports its own `CLS`/`INP` (measured from that view's own
+  `navStart` via per-view `PerformanceObserver`s, reset on each route change) plus a new metric,
+  `web_vitals.route_change` — a DOM-settle heuristic (mutation + long-task + resource quiet-window)
+  measuring in-app transition render time. `FCP`/`TTFB` are omitted for soft navs (there's no
+  document load to measure them against).
+
+**Honesty decision:** `web_vitals.lcp` / `.fcp` / `.ttfb` are never faked for a soft navigation —
+native LCP doesn't fire without a hard document load, and reporting a heuristic under the real LCP
+name would pollute the p75 scorecard. Soft-nav transition time is instead its own honest metric,
+`web_vitals.route_change`.
+
+### Trace correlation, per view
+
+With `tracing: true` (see above), a fresh W3C trace id is minted on **every** view, not just once
+at load — each route's backend requests correlate to that route's own trace.
+
+### Manual control (escape hatch)
+
+Auto-detection covers History-API-based routers out of the box. If you'd rather drive view
+boundaries explicitly — e.g. from TanStack Router's `router.subscribe` — call the exported
+`trackView(route?)`:
+
+```ts
+import { trackView } from "@photon/rum";
+
+router.subscribe("onResolved", () => trackView());
+```
+
+`trackView` runs the same route-change detection the auto-patch uses (a call for the current
+route is a no-op), so it's safe to call alongside auto-detection.
 
 ## Registering an app (server side)
 
@@ -150,11 +205,18 @@ bun run test    # vitest (jsdom)
 bun run size    # gzip the ESM build and fail if it exceeds the 5 KB budget (scripts/size-check.mjs)
 ```
 
-**Layout:** `src/index.ts` (`initPhoton` + vitals/error wiring), `src/session.ts` (in-memory
-session + view id, 30 min idle / 4 h max rotation), `src/context.ts` (UA + connection type),
-`src/errors.ts` (capture + dedup + client-side rate-limit), `src/beacon.ts` (buffer + flush),
+**Layout:** `src/index.ts` (`initPhoton` + vitals/error wiring + the `trackView` re-export),
+`src/view.ts` (the view lifecycle owner: descriptor `{ id, route, path, seq, prevRoute, nav,
+navStart }` + `initView`/`rotateView`/`currentView`/`onViewChange` — the single source of truth for
+the current view, read by the beacon, tracing, and vitals modules), `src/spa.ts` (SPA
+soft-navigation detector: patches `history.pushState`/`replaceState`, listens for
+`popstate`, rotates the view on a real route change, runs per-view CLS (session-window rule) / INP
+`PerformanceObserver`s + the `route_change` DOM-settle heuristic, and exports the manual `trackView`
+escape hatch), `src/session.ts` (in-memory session id, 30 min idle / 4 h max rotation — the view id
+now lives in `view.ts`), `src/context.ts` (UA + connection type), `src/errors.ts` (capture + dedup +
+client-side rate-limit), `src/beacon.ts` (per-view buffer + flush — a fresh buffer per view,
+flushed with the outgoing view's descriptor on each rotation, carrying the view's own `traceId`),
 `src/attribution.ts` (tree-shakeable, dynamically imported only when `attribution: true`),
-`src/trace.ts` (pure trace-id generation + `tracePropagationTargets` matching), `src/traceState.ts`
-(a tiny shared holder so `index.ts` can read the pageview trace id without a static import),
-`src/tracing.ts` (the fetch/XHR patching — tree-shakeable, dynamically imported only when
-`tracing: true`).
+`src/trace.ts` (pure trace-id generation, minted per view and cached on the view descriptor, +
+`tracePropagationTargets` matching), `src/tracing.ts` (the fetch/XHR patching — tree-shakeable,
+dynamically imported only when `tracing: true`).

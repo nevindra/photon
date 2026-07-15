@@ -1,21 +1,20 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { initTracing } from "../src/tracing";
-import { traceState } from "../src/traceState";
+import { currentView } from "../src/view";
 
 describe("initTracing", () => {
   let origFetch: typeof globalThis.fetch;
   beforeEach(() => {
     origFetch = globalThis.fetch;
-    traceState.id = undefined;
   });
   afterEach(() => {
     globalThis.fetch = origFetch;
     vi.restoreAllMocks();
   });
 
-  it("sets the pageview trace id on init", () => {
+  it("mints the current view's trace id on init", () => {
     initTracing();
-    expect(traceState.id).toMatch(/^[0-9a-f]{32}$/);
+    expect(currentView().traceId).toMatch(/^[0-9a-f]{32}$/);
   });
 
   it("injects traceparent on same-origin fetch, not cross-origin", async () => {

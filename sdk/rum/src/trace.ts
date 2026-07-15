@@ -1,6 +1,8 @@
 // Pageview-scoped W3C trace context. Pure, feature-detected, never throws. Reachable only via the
 // opt-in tracing chunk (never index.ts), so id-gen stays off the measured core bundle.
 
+import { currentView, onViewChange } from "./view";
+
 const hasCrypto = typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function";
 
 /** `bytes` random bytes as lowercase hex, or "" if crypto is unavailable (tracing then no-ops). */
@@ -28,13 +30,23 @@ export function traceparent(traceId: string, spanId: string): string {
   return `00-${traceId}-${spanId}-01`;
 }
 
-// Pageview-scoped trace id, minted once (matches viewId's module lifetime today).
-let pageTrace = "";
-
-/** Current pageview trace id ("" if crypto unavailable → tracing no-ops). */
+// Current pageview trace id: minted per view and cached on the view descriptor.
 export function pageTraceId(): string {
-  if (!pageTrace) pageTrace = newTraceId();
-  return pageTrace;
+  const v = currentView();
+  if (!v.traceId) v.traceId = newTraceId();
+  return v.traceId;
+}
+
+// Subscribe so every view rotation mints a fresh trace id, cached on the new view descriptor. The
+// beacon reads it via `descriptor.traceId` and the fetch/XHR header via `pageTraceId()` (both off the
+// current view), so there is no separate published copy to keep in sync. Call once from initTracing.
+export function bindTraceToViews(): void {
+  pageTraceId();   // ensure the current (landing) view has a trace id
+  onViewChange((_ended, started) => {
+    try {
+      if (!started.traceId) started.traceId = newTraceId();
+    } catch { /* never throw */ }
+  });
 }
 
 /**

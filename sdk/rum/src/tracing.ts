@@ -1,8 +1,7 @@
 // Opt-in: patch fetch + XHR to inject a W3C `traceparent` on same-origin (or configured) requests,
 // so each backend entry span parents to the pageview trace. Wrapped so it never throws — a failure
 // restores/bypasses cleanly and the host app's requests are untouched.
-import { pageTraceId, newSpanId, traceparent, matchesTarget } from "./trace";
-import { traceState } from "./traceState";
+import { pageTraceId, newSpanId, traceparent, matchesTarget, bindTraceToViews } from "./trace";
 
 export interface TracingOptions {
   tracePropagationTargets?: (string | RegExp)[];
@@ -11,7 +10,7 @@ export interface TracingOptions {
 export function initTracing(opts: TracingOptions = {}): void {
   const id = pageTraceId();
   if (!id) return; // crypto unavailable → no-op
-  traceState.id = id;
+  bindTraceToViews();          // ensures the current view has a trace id, and rotates it per view
   patchFetch(opts.tracePropagationTargets);
   patchXhr(opts.tracePropagationTargets);
 }

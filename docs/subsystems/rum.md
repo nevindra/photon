@@ -28,20 +28,39 @@ code depends on these exact strings):
 | CLS   | `web_vitals.cls`   | `1` (unitless)|
 | FCP   | `web_vitals.fcp`   | `ms`          |
 | TTFB  | `web_vitals.ttfb`  | `ms`          |
+| Route change (soft nav) | `web_vitals.route_change` | `ms` |
+| View duration (time-on-view) | `web_vitals.view_duration` | `ms` |
 
 Attributes on every vital point: `service.name`, `browser.route` (route pattern, e.g. `/product/:id`),
-`url.path`, `device.type`, `browser.name`, `network.connection`, `session.id`, `view.id`
-(plus optional `geo.country`). LCP attribution sub-parts are stored as their own gauge metrics
-(`web_vitals.lcp.ttfb`, `.resource_load_delay`, `.resource_load_time`, `.element_render_delay`) so
-they aggregate cleanly for the attribution bar; the LCP element selector / URL, INP target, and CLS
-source ride as string attributes on the vital's point.
+`url.path`, `device.type`, `browser.name`, `network.connection`, `session.id`, `view.id`, `nav`
+(`hard` | `soft`), `view.seq` (ordinal within the session), `view.previous_route` (absent on the
+landing view) (plus optional `geo.country`). LCP attribution sub-parts are stored as their own gauge
+metrics (`web_vitals.lcp.ttfb`, `.resource_load_delay`, `.resource_load_time`,
+`.element_render_delay`) so they aggregate cleanly for the attribution bar; the LCP element selector
+/ URL ride as string attributes on the vital's point. INP and CLS carry **no** attribution sub-parts
+— they are measured per view by the SDK's `spa.ts` (one source of truth across hard + soft
+navigations), so web-vitals' page-lifetime INP/CLS attribution is deliberately not collected.
+
+`web_vitals.route_change` and `web_vitals.view_duration` are additive (older SDKs simply never emit
+them; `photon-core::rum::beacon_to_metric_points` skips whatever a beacon omits). **Honesty
+decision:** `web_vitals.lcp` / `.fcp` / `.ttfb` are never faked for a soft navigation — native LCP
+doesn't fire without a hard document load, and reporting a heuristic under the real LCP name would
+pollute the p75 scorecard. Soft-nav transition time is instead its own honest metric,
+`web_vitals.route_change` (a DOM-settle heuristic: mutation + long-task + resource quiet-window,
+measured from the view's `navStart`); `.fcp`/`.ttfb` are simply omitted for soft-navigated views.
+`web_vitals.view_duration` is the view's time-on-view (its own `navStart` → the next rotation or
+`pagehide`), emitted for every view, hard or soft.
 
 ### JS errors → logs (`LogRecord`, severity ERROR)
 
 Each error is one log row: `severity_number = 17` / `severity_text = "ERROR"`, `body = <message>`,
 attributes `service.name`, `exception.type`, `exception.message`, `exception.stacktrace`,
 `error.kind` (`exception` | `unhandledrejection`), `browser.route`, `url.path`, `browser.name`,
-`device.type`, `session.id`, `view.id`, and a server-computed **`rum.error.fingerprint`**.
+`device.type`, `session.id`, `view.id`, `nav` (`hard` | `soft`), `view.seq`, `view.previous_route`
+(absent on the landing view), and a server-computed **`rum.error.fingerprint`**. `nav`/`view.seq`/
+`view.previous_route` are stamped by the same shared `photon_core::rum::common_attrs` helper that
+builds the vitals' base attributes above, so errors and vitals from the same view carry identical
+SPA context.
 
 **Fingerprint** = stable FNV-1a hash of `exception.type` + normalized message (digit runs masked, so
 "chunk 12" / "chunk 99" collapse) + top in-app stack frame. Computed **server-side at ingest** and
@@ -50,8 +69,21 @@ no bespoke error store.
 
 ### Sessions & pageviews
 
-`session.id` and `view.id` are generated **client-side** (in-memory; session rotates after 30 min
-idle or 4 h max). "Sessions affected" is a `COUNT(DISTINCT session.id)` at query time.
+`session.id` is generated **client-side** (in-memory; rotates after 30 min idle or 4 h max).
+"Sessions affected" is a `COUNT(DISTINCT session.id)` at query time.
+
+`view.id` is a **logical pageview**, not a document load, and is owned by the SDK's `view.ts`
+module (no longer `session.ts`). It **rotates on every real client-side route change** —
+`history.pushState`/`replaceState`/`popstate`, auto-detected by `spa.ts`, on by
+default, no config flag. A route change means `location.pathname` (or `routeOf(path)`, if
+configured) actually changed; pure query/hash-only changes do **not** rotate the view. MPAs are
+unaffected — with no History mutations the detector never fires, so `view.id` behaves exactly as
+it did before this feature. Each view carries `seq` (an incrementing ordinal within the session;
+the landing view is `0`), `prevRoute` (the route navigated from; absent on the landing view), `nav`
+(`hard` for the initial document load, `soft` for every subsequent route), and its own `navStart`
+for time-on-view. Vitals and errors are attributed to the view that was active **when they were
+collected** — by construction, via a per-view beacon buffer flushed on each rotation, not by
+flush-time timing.
 
 ## Transport, ingest & browser auth
 
@@ -64,22 +96,33 @@ pageview's vitals + errors:
 ```json
 {
   "app": "web-storefront", "key": "pk_live_…",
-  "session": "018f…", "view": { "id": "018f…", "route": "/checkout", "path": "/checkout" },
+  "session": "018f…",
+  "view": { "id": "018f…", "route": "/checkout", "path": "/checkout", "seq": 2, "prev": "/cart", "nav": "soft", "dur": 4210 },
   "ctx": { "ua": "<raw user-agent>", "conn": "4g" },
-  "vitals": [ { "n": "LCP", "v": 4300 }, { "n": "CLS", "v": 0.06 } ],
+  "vitals": [ { "n": "CLS", "v": 0.06 }, { "n": "route_change", "v": 180 } ],
   "errors": [ { "kind": "exception", "type": "TypeError", "msg": "…", "stack": "…", "src": "checkout.js", "line": 214 } ],
   "trace": "4bf92f3577b34da6a3ce929d0e0e4736"
 }
 ```
 
+The `view` object's `seq`/`prev`/`nav`/`dur` fields are all wire-optional (`#[serde(default)]`
+server-side, so older SDKs simply omit them and behave exactly as before this feature): `seq` is
+the view's ordinal within the session (landing = `0`), `prev` is the route navigated from (omitted
+on the landing view), `nav` is `hard` (initial document load) or `soft` (a client-side route
+change), and `dur` is the view's time-on-view in ms. The server copies `nav`/`seq`/`prev` onto
+every vital point *and* every error log from this beacon as the `nav` / `view.seq` /
+`view.previous_route` attributes (`photon_core::rum::common_attrs`); `dur` becomes its own gauge
+point, `web_vitals.view_duration`.
+
 `trace` is **optional** (`#[serde(default)]` — absent from beacons sent by SDKs without the opt-in
-`tracing` module, or by older SDK versions) and, when present, is the pageview's W3C trace id. The
-server validates/normalizes it (`photon-core::rum::normalize_trace_id`) — exactly 32 hex digits,
-lowercased, rejecting the all-zero id — before stamping it onto every error row's **native**
-`LogRecord.trace_id` column (no schema change; malformed values are silently dropped, never
-partial-written). Web Vitals points don't carry a trace id. **This means `trace_id` is only populated
-for errors ingested after the SDK's `tracing` module shipped** — rows ingested by older SDKs simply
-have no trace id.
+`tracing` module, or by older SDK versions) and, when present, is the current view's W3C trace id —
+a fresh id is minted per view, including per soft-navigated view, so each route's backend requests
+correlate to their own trace. The server validates/normalizes it
+(`photon-core::rum::normalize_trace_id`) — exactly 32 hex digits, lowercased, rejecting the
+all-zero id — before stamping it onto every error row's **native** `LogRecord.trace_id` column (no
+schema change; malformed values are silently dropped, never partial-written). Web Vitals points
+don't carry a trace id. **This means `trace_id` is only populated for errors ingested after the
+SDK's `tracing` module shipped** — rows ingested by older SDKs simply have no trace id.
 
 The server **derives `service.name` from the registered `app`** (never trusts a client-set service
 name), parses the **raw UA server-side** into `device.type`/`browser.*` (keeps the SDK tiny and the
@@ -171,6 +214,11 @@ Thin RUM helpers over the existing engine — no new storage reads:
 | FCP   | 1.8 s  | 3.0 s  |
 | TTFB  | 800 ms | 1.8 s  |
 
+The same `thresholds()` function also carries a Photon-defined (non-Google) pair for the SPA
+soft-nav metric: `web_vitals.route_change` good ≤ 1 s / poor > 3 s — there's no official CWV
+guidance for in-app transition time. `web_vitals.view_duration` has no threshold entry: it's an
+unscored engagement measure, not a rated vital.
+
 ## API (`photon-api`, session-authed like the rest of `/api`)
 
 | Route | Purpose |
@@ -180,7 +228,7 @@ Thin RUM helpers over the existing engine — no new storage reads:
 | `PATCH /api/rum/apps/:name` | update an app's origins/sampling/rate limit |
 | `POST /api/rum/apps/:name/rotate-key` | rotate an app's public key |
 | `DELETE /api/rum/apps/:name` | unregister an app |
-| `GET /api/rum/vitals` | the 5 scorecards (p75 + distribution + trend) |
+| `GET /api/rum/vitals` | the vital scorecards — the 5 Core Web Vitals plus `route_change` whenever the window has soft-nav samples (p75 + distribution + trend) |
 | `GET /api/rum/vitals/breakdown` | breakdown table by `dimension` |
 | `GET /api/rum/pages` | pages list |
 | `GET /api/rum/pages/detail` | page detail (vitals + attribution + breakdown + errors) |
@@ -208,22 +256,37 @@ initPhoton({
 });
 ```
 
-**Trace propagation (opt-in, `tracing: true`)** — mints one W3C trace id per pageview (32 lowercase
+**SPA / soft-navigation tracking (on by default)** — `view.id` is a logical pageview, not a document
+load: `spa.ts` patches `history.pushState`/`replaceState` and listens for `popstate` to
+detect a real client-side route change and rotate the view (query/hash-only changes don't rotate;
+MPAs are unaffected). Each soft-navigated view gets its own `CLS`/`INP` plus a `route_change`
+DOM-settle heuristic, its own trace id (see below), and the beacon fields `seq`/`prev`/`nav`/`dur` —
+see "Sessions & pageviews" and "The beacon" above for the full model. Routers that want to drive the
+boundary themselves (instead of relying on auto-detection) can call the exported
+`trackView(route?)` escape hatch.
+
+**Trace propagation (opt-in, `tracing: true`)** — mints one W3C trace id per view (32 lowercase
 hex via `crypto.getRandomValues`; a no-op if `crypto` is unavailable) and patches `window.fetch` +
 `XMLHttpRequest` to inject a fresh `traceparent: 00-<trace-id>-<span-id>-01` header on each outgoing
 request matching `tracePropagationTargets` — default `["same-origin"]`; other strings are
 exact-origin matches, `RegExp`s test the full resolved URL, and off-list origins are never touched
-(so an unexpected header can never trip CORS). Once initialized, every beacon from that pageview
-(vitals *and* errors) also carries the trace id as `trace` (see "The beacon" above), which is what
+(so an unexpected header can never trip CORS). A fresh trace id is minted again on every soft
+navigation, so each route gets its own trace. Once initialized, every beacon from the current view
+(vitals *and* errors) also carries its trace id as `trace` (see "The beacon" above), which is what
 lets an error's "Related ▾" menu jump straight to its backend trace waterfall. Same never-throw
 contract as the rest of the SDK: any internal failure leaves `fetch`/`XHR` un-instrumented.
 
-**Layout:** `src/index.ts` (`initPhoton` + vitals/error wiring), `session.ts` (in-memory session +
-view id), `context.ts` (UA + connection), `errors.ts` (capture + dedup + rate-limit),
-`beacon.ts` (buffer + flush), `attribution.ts` (tree-shakeable, dynamically imported), `trace.ts` /
-`traceState.ts` / `tracing.ts` (opt-in W3C trace propagation — id-gen + target matching, a shared
-holder so `index.ts` can read the trace id without a static import, and the fetch/XHR patching;
-tree-shakeable, dynamically imported only when `tracing: true`).
+**Layout:** `src/index.ts` (`initPhoton` + vitals/error wiring + the `trackView` re-export),
+`view.ts` (the view lifecycle owner: descriptor `{ id, route, path, seq, prevRoute, nav, navStart }`
++ `initView`/`rotateView`/`currentView`/`onViewChange` — the single source of truth for the current
+view), `spa.ts` (the SPA soft-navigation detector: History-API patching, per-view CLS/INP
+observers, the `route_change` DOM-settle heuristic, and the `trackView` export), `session.ts`
+(in-memory session id — the view id now lives in `view.ts`), `context.ts` (UA + connection),
+`errors.ts` (capture + dedup + rate-limit), `beacon.ts` (per-view buffer + flush — a fresh buffer
+per view, flushed with the outgoing view's descriptor on each rotation, carrying the view's own trace
+id), `attribution.ts` (tree-shakeable, dynamically imported), `trace.ts` / `tracing.ts` (opt-in W3C
+trace propagation — id-gen (per view, cached on the view descriptor) + target matching, and the
+fetch/XHR patching; tree-shakeable, dynamically imported only when `tracing: true`).
 
 **Distribution — two builds, one codebase** (`tsup.config.ts`):
 
@@ -296,7 +359,8 @@ panel's checked state, and the result list can never desync. A malformed `q` sur
 - `photon-query/src/rum_vitals.rs` + `rum_errors.rs` — the query helpers (`rum_errors`,
   `rum_error_detail`).
 - `photon-server/src/main.rs` — `RumWalSink` (writes to the existing metrics + logs WALs) + wiring.
-- `sdk/rum/` — the SDK (incl. the opt-in `trace.ts`/`traceState.ts`/`tracing.ts` trio).
+- `sdk/rum/` — the SDK (the `view.ts`/`spa.ts` view-lifecycle + soft-navigation duo, incl. the
+  opt-in `trace.ts`/`tracing.ts` trace-propagation pair).
   `frontend/src/{views,components/rum,lib/rum/rumQueries.ts}` — the UI.
 
 ## Non-goals (deferred)

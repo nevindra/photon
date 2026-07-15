@@ -3,8 +3,8 @@
 //! Built on the metrics `survivors_df` + `metric_base_predicate` + `approx_percentile_cont`
 //! (t-digest), following `red.rs` / `span_latency.rs`.
 //!
-//! Web Vitals are stored as gauge metrics named `web_vitals.{lcp,inp,cls,fcp,ttfb}` with a
-//! Float64 `value`; `service.name` is a promoted column, the dimensional attributes
+//! Web Vitals are stored as gauge metrics named `web_vitals.{lcp,inp,cls,fcp,ttfb,route_change}`
+//! with a Float64 `value`; `service.name` is a promoted column, the dimensional attributes
 //! (`device.type`, `browser.name`, `browser.route`, ...) live in the attributes map. The rating
 //! thresholds come from `photon_core::rum::thresholds` — one source of truth shared with the UI.
 
@@ -19,6 +19,7 @@ use photon_core::metric_schema;
 use photon_core::rum::{
     thresholds, ATTR_LCP_ELEMENT, ATTR_ROUTE, ATTR_SERVICE, METRIC_LCP_ELEMENT_RENDER_DELAY,
     METRIC_LCP_RESOURCE_LOAD_DELAY, METRIC_LCP_RESOURCE_LOAD_TIME, METRIC_LCP_TTFB,
+    METRIC_ROUTE_CHANGE,
 };
 use photon_core::PhotonError;
 
@@ -26,13 +27,15 @@ use crate::col_ref;
 use crate::metric_engine::{metric_base_predicate, MetricRequest};
 use crate::MetricsQueryEngine;
 
-/// The five Core Web Vitals metric names, in display order. Each has a `thresholds` entry.
-const VITALS: [&str; 5] = [
+/// The five Core Web Vitals metric names plus the SPA soft-navigation `route_change` gauge, in
+/// display order. Each has a `thresholds` entry.
+const VITALS: [&str; 6] = [
     "web_vitals.lcp",
     "web_vitals.inp",
     "web_vitals.cls",
     "web_vitals.fcp",
     "web_vitals.ttfb",
+    METRIC_ROUTE_CHANGE,
 ];
 
 /// Per-vital summary for one app over one window: the 75th-percentile value plus the Google
@@ -527,6 +530,27 @@ mod tests {
         assert_eq!(lcp.count, 4);
         // Only LCP has samples; the other four vitals are omitted (no data).
         assert_eq!(out.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_change_scorecard_is_produced() {
+        // Mirrors `vitals_p75_and_rating_distribution` above, but for the SPA soft-navigation
+        // `web_vitals.route_change` gauge (thresholds (1000, 3000) per `photon_core::rum::thresholds`).
+        let engine = engine_with_points(vec![
+            vp("web_vitals.route_change", "web", "mobile", 800.0),
+            vp("web_vitals.route_change", "web", "mobile", 2500.0),
+        ]);
+        let out = engine.rum_vitals("web", 0, i64::MAX).await.unwrap();
+        let rc = out
+            .iter()
+            .find(|v| v.metric == "web_vitals.route_change")
+            .expect("route_change scorecard");
+        assert!(rc.p75.is_finite());
+        assert_eq!(rc.count, 2);
+        assert_eq!(rc.good + rc.needs + rc.poor, 2);
+        assert_eq!(rc.good, 1); // 800 <= good_max(1000)
+        assert_eq!(rc.needs, 1); // 1000 < 2500 <= poor_min(3000)
+        assert_eq!(rc.poor, 0);
     }
 
     #[tokio::test]

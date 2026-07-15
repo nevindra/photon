@@ -13,6 +13,7 @@
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
+    "type-check": "tsc --noEmit",
     "size": "node scripts/size-check.mjs"
   },
   "dependencies": { "web-vitals": "^4" },

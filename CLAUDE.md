@@ -94,7 +94,12 @@ the cross-signal landing dashboard), `/logs`, `/traces` (+ `/traces/:traceId` wa
 sub-routes: `/rum/:appId` vitals, `/pages[/:route]`, `/errors` (search bar + fixed facet panel), and
 `/errors/:fingerprint` issue detail), `/uptime`, `/infra` (+ `/infra/:host` host detail — host/GPU
 resource monitoring), `/data`, plus `/login` and `/onboarding`, behind a `beforeEach` auth guard
-(`router/index.js`) gated on reactive flags (`lib/core/auth.ts`). `NavRail` groups these into ownership
+(`router/index.js`) gated on reactive flags (`lib/core/auth.ts`). The `@photon/rum` browser SDK
+(`sdk/rum/`) behind `/rum` auto-detects SPA client-side navigation (History API —
+`pushState`/`replaceState`/`popstate` — on by default; MPAs unaffected) and rotates a
+per-view identity (`view.id`/`seq`/`previous_route`) with its own Web Vitals and, with `tracing:
+true`, its own backend trace per route; the exported `trackView(route?)` is a manual escape hatch
+for routers that prefer to drive the boundary themselves. `NavRail` groups these into ownership
 **worlds** (Home; Frontend → `/rum`, Backend → `/services`, Infrastructure → **Hosts** `/infra` +
 **Ops** `/uptime`), an **Explore** section (Logs/Traces/Metrics), and **Manage** (Data), with `AppShell`
 deriving the highlighted group from the route. Cross-view correlation (log→trace, span/trace→logs,
