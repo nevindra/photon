@@ -5,6 +5,32 @@ All notable changes to Photon are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Soft-navigated routes missing from the RUM pages list.** Two compounding drops hid
+  clean soft views (no layout shift, no slow interaction) from `/rum/:app/pages`:
+  - *SDK*: `beacon.flush()` skipped views whose buffers were empty, so such a view never
+    reached the server at all. The first flush of a view is now its **finalizing beacon**,
+    sent even with empty buffers so its `view.dur` → `web_vitals.view_duration` pageview
+    marker always lands — and `dur` is now emitted **exactly once per view id** (repeat
+    flushes, e.g. `visibilitychange` then `pagehide`, previously double-counted
+    `view_duration` when new vitals accrued in between).
+  - *Query*: the pages breakdown (`rum_breakdown`) counted pageviews only from
+    LCP/INP/CLS sample counts — but soft views never emit LCP and emit CLS/INP only when
+    nonzero, so a route reached exclusively by clean soft navigations stored
+    `route_change`/`view_duration` points the pages list never looked at.
+    `web_vitals.view_duration` (one point per finalized view — the true pageview count)
+    now joins the merge.
+- **Idle WAL segments never became queryable.** Age-based segment rotation ran only
+  after a commit, so on a low-traffic instance the data in the active segment stayed
+  invisible to the compactor — and to every query — until the *next* write happened to
+  arrive, no matter how long you waited. The WAL writer's idle wait now wakes at the
+  active segment's age deadline and seals it, so ingested data always becomes queryable
+  within ~`segment_max_age_secs` even with zero follow-up traffic. Applies to all three
+  WALs (logs, spans, metrics); no config change.
+
 ## [1.2.0] - 2026-07-15
 
 A feature release adding first-class Single-Page-App (SPA) support to the RUM SDK,

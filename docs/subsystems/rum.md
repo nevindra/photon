@@ -85,6 +85,13 @@ for time-on-view. Vitals and errors are attributed to the view that was active *
 collected** — by construction, via a per-view beacon buffer flushed on each rotation, not by
 flush-time timing.
 
+**Every view records a pageview.** The first flush of a view (rotation or tab-hide) is its
+*finalizing* beacon and is sent **even when nothing accrued** — a clean soft view with no layout
+shift, no slow interaction, and an unsettled `route_change` still ships `view.dur`, whose
+`web_vitals.view_duration` point is the pageview marker the pages breakdown counts. `dur` is
+emitted exactly once per view id (repeat flushes — e.g. `visibilitychange` then `pagehide` — send
+only newly-buffered items, without `dur`).
+
 ## Transport, ingest & browser auth
 
 ### The beacon
@@ -184,7 +191,9 @@ Thin RUM helpers over the existing engine — no new storage reads:
   series. *Note:* `Agg` exposes P50/P90/P99 but not P75, so RUM computes 0.75 directly rather than
   extending the metrics `Agg` enum.
 - **`rum_breakdown`** — the same vitals grouped by one dimension (route / device / browser / country
-  / connection).
+  / connection). A group's `pageviews` is the max per-metric sample count across LCP/INP/CLS **and
+  `web_vitals.view_duration`** — the latter is one point per finalized view, so routes reached only
+  by clean soft navigations (which emit no LCP/INP/CLS) still rank in the pages list.
 - **`rum_page_detail`** — vitals + attribution sub-part aggregates + per-segment breakdown + top
   error issues, scoped to one route.
 - **`rum_errors`** — group ERROR rows by `rum.error.fingerprint` into `ErrorIssue { fingerprint,

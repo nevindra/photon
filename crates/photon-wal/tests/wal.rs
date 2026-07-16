@@ -260,6 +260,51 @@ async fn rotation_splits_data_across_segments() {
     assert_eq!(got, expected);
 }
 
+// Idle age-rotation: a non-empty active segment must seal once it exceeds
+// `segment_max_age_secs` even when NO further append/sync ever arrives — otherwise the
+// tail of ingested data on a low-traffic instance stays invisible to the compactor (and
+// therefore to queries) until the next unrelated write happens to land.
+#[tokio::test]
+async fn idle_segment_seals_by_age_without_further_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = schema();
+    let wal = DiskWal::open(dir.path(), schema.clone(), cfg(1 << 20, 1, 0))
+        .await
+        .unwrap();
+
+    let b = batch(&schema, &[(1, "svc", "lonely-last-write")]);
+    let expected = rows_of(&b);
+    wal.append(b).await.unwrap();
+    assert!(
+        wal.list_closed_segments().unwrap().is_empty(),
+        "fresh segment must not seal before its age bound"
+    );
+
+    // No further traffic. The writer's idle wake must seal the aged segment on its own
+    // (age bound 1s + the wake's 1s retry floor; 4s gives comfortable slack on slow CI).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let closed = loop {
+        let closed = wal.list_closed_segments().unwrap();
+        if !closed.is_empty() {
+            break closed;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "idle segment was never sealed by age"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(closed.len(), 1);
+    assert_eq!(
+        all_rows(&wal.read_segment(closed[0]).await.unwrap()),
+        expected
+    );
+
+    // The successor segment is empty and must NOT be age-sealed in turn.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert_eq!(wal.list_closed_segments().unwrap().len(), 1);
+}
+
 // 5. reopen: append, drop, reopen from the same dir; closed segments stay readable, and
 //    remove_segment is idempotent.
 #[tokio::test]

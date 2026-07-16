@@ -13,7 +13,9 @@
 //! ## Rotation & recovery
 //!
 //! After a commit the active segment is sealed (moved to the closed set, a fresh active
-//! segment is opened) once it exceeds `segment_max_bytes` or `segment_max_age_secs`. On
+//! segment is opened) once it exceeds `segment_max_bytes` or `segment_max_age_secs`; the
+//! writer's idle wait also wakes at the age deadline, so a non-empty segment on an idle
+//! instance still seals on time without waiting for the next write. On
 //! `open`, every pre-existing segment file is enumerated; the highest-id one may have a
 //! torn tail from a crash, so it is scanned and physically truncated to its last valid
 //! frame. If it still holds data it is sealed as a closed segment and a new empty active
@@ -481,6 +483,22 @@ impl Writer {
         Ok(())
     }
 
+    /// When the active segment holds data, the instant its age bound expires — the writer's
+    /// idle wait wakes then to seal it, so the tail of ingested data becomes readable by the
+    /// compactor even when no further traffic ever arrives. `None` while empty (an empty
+    /// segment never age-rotates, so there is nothing to wake up for).
+    ///
+    /// Floored at 1s from now: if the deadline is already past (a prior idle rotation attempt
+    /// failed — e.g. successor creation failed on a failing disk), the wake retries at a 1s
+    /// cadence instead of spinning hot on an immediately-elapsed timer.
+    fn age_deadline(&self) -> Option<TokioInstant> {
+        if self.size == 0 {
+            return None;
+        }
+        let deadline = TokioInstant::from_std(self.created + self.max_age);
+        Some(deadline.max(TokioInstant::now() + Duration::from_secs(1)))
+    }
+
     /// Fallback when [`roll_back_to_committed`] itself fails (the disk is genuinely gone):
     /// rotate onto a fresh segment using the same successor-first pattern as [`maybe_rotate`]
     /// — create the successor first, then flip state — so a later failure can't strand the
@@ -512,12 +530,25 @@ impl Writer {
     }
 }
 
-/// The writer task: block for one command, coalesce the group-commit window, commit once.
+/// The writer task: wait for a command, coalesce the group-commit window, commit once.
+/// The idle wait wakes at the active segment's age deadline: a plain `recv().await` would
+/// sleep until the NEXT write arrives, so on a low-traffic instance the tail of ingested
+/// data would sit in the active segment — invisible to the compactor, and therefore to
+/// queries — indefinitely (age rotation used to run only after a commit).
 async fn run_writer(mut writer: Writer, mut rx: mpsc::Receiver<Command>, delay_ms: u64) {
     loop {
-        let first = match rx.recv().await {
-            Some(cmd) => cmd,
-            None => break, // all senders dropped -> shut down
+        let first = loop {
+            match writer.age_deadline() {
+                Some(deadline) => match timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(cmd)) => break cmd,
+                    Ok(None) => return, // all senders dropped -> shut down
+                    Err(_) => writer.maybe_rotate().await, // aged while idle -> seal it
+                },
+                None => match rx.recv().await {
+                    Some(cmd) => break cmd,
+                    None => return, // all senders dropped -> shut down
+                },
+            }
         };
         let mut pending = Pending::new();
         pending.push(first);
