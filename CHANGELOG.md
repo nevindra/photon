@@ -5,6 +5,25 @@ All notable changes to Photon are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Soft-navigated routes missing from the RUM pages list.** Two compounding drops hid
+  clean soft views (no layout shift, no slow interaction) from `/rum/:app/pages`:
+  - *SDK*: `beacon.flush()` skipped views whose buffers were empty, so such a view never
+    reached the server at all. The first flush of a view is now its **finalizing beacon**,
+    sent even with empty buffers so its `view.dur` → `web_vitals.view_duration` pageview
+    marker always lands — and `dur` is now emitted **exactly once per view id** (repeat
+    flushes, e.g. `visibilitychange` then `pagehide`, previously double-counted
+    `view_duration` when new vitals accrued in between).
+  - *Query*: the pages breakdown (`rum_breakdown`) counted pageviews only from
+    LCP/INP/CLS sample counts — but soft views never emit LCP and emit CLS/INP only when
+    nonzero, so a route reached exclusively by clean soft navigations stored
+    `route_change`/`view_duration` points the pages list never looked at.
+    `web_vitals.view_duration` (one point per finalized view — the true pageview count)
+    now joins the merge.
+
 ## [1.2.0] - 2026-07-15
 
 A feature release adding first-class Single-Page-App (SPA) support to the RUM SDK,

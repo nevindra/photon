@@ -19,6 +19,10 @@ export interface Beacon {
 export function makeBeacon(endpoint: string, staticBase: () => object): Beacon {
   const url = endpoint.replace(/\/$/, "") + "/api/rum";
   let vitals: any[] = [], errors: any[] = [];
+  // View ids whose finalizing (dur-carrying) beacon has been sent. flush() can run more than once
+  // for one view (visibilitychange(hidden) then pagehide, or hide → return → navigate), and
+  // view_duration must be emitted exactly once per view.
+  const finalized = new Set<string>();
 
   const post = (body: string) => {
     try {
@@ -30,7 +34,8 @@ export function makeBeacon(endpoint: string, staticBase: () => object): Beacon {
   };
 
   const send = (descriptor: ViewDescriptor, vs: any[], es: any[], includeDur: boolean) => {
-    if (!vs.length && !es.length) return;
+    // An empty payload is only worth a request when it finalizes the view (carries `dur`).
+    if (!vs.length && !es.length && !includeDur) return;
     try {
       const body: any = { ...staticBase(), view: viewObject(descriptor, includeDur), vitals: vs, errors: es };
       if (descriptor.traceId) body.trace = descriptor.traceId;
@@ -39,10 +44,15 @@ export function makeBeacon(endpoint: string, staticBase: () => object): Beacon {
   };
 
   const flush = (descriptor: ViewDescriptor) => {
-    if (!vitals.length && !errors.length) return;
+    // The first flush of a view finalizes it — sent even with empty buffers, so a clean soft view
+    // (no layout shift, no slow interaction, route_change unsettled) still records a pageview via
+    // its `dur` → view_duration. Later flushes of the same view send only what accumulated.
+    const first = !finalized.has(descriptor.id);
+    if (!vitals.length && !errors.length && !first) return;
+    finalized.add(descriptor.id);
     const vs = vitals, es = errors;
     vitals = []; errors = [];
-    send(descriptor, vs, es, true);   // a flush finalizes the view → carries view_duration
+    send(descriptor, vs, es, first);
   };
 
   const sendImmediate = (descriptor: ViewDescriptor, payload: { vitals?: any[]; errors?: any[] }) =>

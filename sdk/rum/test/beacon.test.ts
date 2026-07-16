@@ -28,10 +28,32 @@ describe("per-view beacon", () => {
     expect(first.vitals).toEqual([{ n: "LCP", v: 1 }]);
   });
 
-  it("flush with an empty buffer sends nothing", () => {
+  it("first flush of a view finalizes it even with empty buffers — a clean soft view is still a pageview", async () => {
     const b = makeBeacon("https://x.test", () => ({ app: "a", key: "k", session: "s", ctx: {} }));
-    b.flush(desc());
-    expect(sent.length).toBe(0);
+    b.flush(desc({ id: "CLEAN", route: "/settings", nav: "soft" }));
+    expect(sent.length).toBe(1);
+    const body = JSON.parse(await (sent[0] as any).text());
+    expect(body.view.id).toBe("CLEAN");
+    expect(typeof body.view.dur).toBe("number"); // dur → view_duration = the pageview marker
+    expect(body.vitals).toEqual([]);
+    expect(body.errors).toEqual([]);
+  });
+
+  it("repeat flushes of one view are not re-finalized: dur exactly once, empty repeats send nothing", async () => {
+    const b = makeBeacon("https://x.test", () => ({ app: "a", key: "k", session: "s", ctx: {} }));
+    const v = desc({ id: "V" });
+    b.vital({ n: "CLS", v: 0.2 });
+    b.flush(v);                                  // visibilitychange(hidden): finalizes, carries dur
+    b.flush(v);                                  // pagehide right after: nothing new → no beacon
+    expect(sent.length).toBe(1);
+    b.vital({ n: "INP", v: 120 });               // tab shown again, user interacts
+    b.flush(v);                                  // hidden again: sends the INP but must NOT re-send dur
+    expect(sent.length).toBe(2);
+    const first = JSON.parse(await (sent[0] as any).text());
+    const second = JSON.parse(await (sent[1] as any).text());
+    expect(typeof first.view.dur).toBe("number");
+    expect(second.view.dur).toBeUndefined();
+    expect(second.vitals).toEqual([{ n: "INP", v: 120 }]);
   });
 
   it("sendImmediate emits a one-off beacon for a specific descriptor without touching the buffer", async () => {

@@ -19,7 +19,7 @@ use photon_core::metric_schema;
 use photon_core::rum::{
     thresholds, ATTR_LCP_ELEMENT, ATTR_ROUTE, ATTR_SERVICE, METRIC_LCP_ELEMENT_RENDER_DELAY,
     METRIC_LCP_RESOURCE_LOAD_DELAY, METRIC_LCP_RESOURCE_LOAD_TIME, METRIC_LCP_TTFB,
-    METRIC_ROUTE_CHANGE,
+    METRIC_ROUTE_CHANGE, METRIC_VIEW_DURATION,
 };
 use photon_core::PhotonError;
 
@@ -63,7 +63,9 @@ pub struct VitalSummary {
 pub struct BreakdownRow {
     /// The dimension value this row aggregates (e.g. `"mobile"`, `"Chrome"`, `"/checkout"`).
     pub key: String,
-    /// The largest per-vital sample count seen in the group — a proxy for its pageview volume.
+    /// The largest per-metric sample count seen in the group across LCP/INP/CLS and
+    /// `view_duration` (one point per finalized view — the true pageview count when present;
+    /// the vitals keep old data from SDKs that predate `view_duration` counted).
     pub pageviews: i64,
     pub lcp_p75: Option<f64>,
     pub inp_p75: Option<f64>,
@@ -94,6 +96,9 @@ enum Vital {
     Lcp,
     Inp,
     Cls,
+    /// `web_vitals.view_duration` — one point per finalized view, so its sample count is the true
+    /// pageview count. Contributes only to `pageviews`; it has no p75 column in `BreakdownRow`.
+    ViewDuration,
 }
 
 /// A conditional `SUM(0/1)` over rows whose `value` is non-null and lands in the rating band
@@ -234,10 +239,14 @@ impl MetricsQueryEngine {
             })?;
 
         let mut rows: BTreeMap<String, BreakdownRow> = BTreeMap::new();
+        // `view_duration` is in the merge so soft navigations count as pageviews: a clean soft
+        // view (no layout shift, no slow interaction) emits NO LCP/INP/CLS point — only its
+        // finalizing `view_duration` — and would otherwise be invisible in the pages breakdown.
         for (name, which) in [
             ("web_vitals.lcp", Vital::Lcp),
             ("web_vitals.inp", Vital::Inp),
             ("web_vitals.cls", Vital::Cls),
+            (METRIC_VIEW_DURATION, Vital::ViewDuration),
         ] {
             let req = MetricRequest {
                 metric: name.to_string(),
@@ -316,6 +325,7 @@ impl MetricsQueryEngine {
                         Vital::Lcp => entry.lcp_p75 = p75,
                         Vital::Inp => entry.inp_p75 = p75,
                         Vital::Cls => entry.cls_p75 = p75,
+                        Vital::ViewDuration => {} // pageview counting only (via the max above)
                     }
                 }
             }
@@ -607,6 +617,39 @@ mod tests {
         let mobile = scoped.iter().find(|r| r.key == "mobile").unwrap();
         assert_eq!(mobile.pageviews, 1); // only the /checkout mobile row
         assert!(mobile.lcp_p75.unwrap() > 4000.0);
+    }
+
+    #[tokio::test]
+    async fn breakdown_counts_soft_views_without_core_vitals_as_pageviews() {
+        // A clean SPA soft navigation emits NO LCP/INP/CLS — only its finalizing
+        // `view_duration` (and usually `route_change`, which the breakdown ignores).
+        // Such a route must still appear in the by-route pages breakdown.
+        let engine = engine_with_points(vec![
+            // hard landing on /home: LCP + a view_duration
+            vp_route("web_vitals.lcp", "web", "/home", "desktop", 2000.0),
+            vp_route("web_vitals.view_duration", "web", "/home", "desktop", 12000.0),
+            // two clean soft views of /settings: view_duration only
+            vp_route("web_vitals.view_duration", "web", "/settings", "desktop", 3000.0),
+            vp_route("web_vitals.view_duration", "web", "/settings", "desktop", 4500.0),
+        ]);
+        let rows = engine
+            .rum_breakdown("web", "browser.route", 0, i64::MAX, None)
+            .await
+            .unwrap();
+
+        // /settings shows up purely from view_duration, with no vital p75s.
+        let settings = rows.iter().find(|r| r.key == "/settings").expect(
+            "route with only view_duration samples must appear in the pages breakdown",
+        );
+        assert_eq!(settings.pageviews, 2);
+        assert_eq!(settings.lcp_p75, None);
+        assert_eq!(settings.inp_p75, None);
+        assert_eq!(settings.cls_p75, None);
+
+        // /home merges both sources: max(1 lcp, 1 view_duration) = 1, and keeps its LCP p75.
+        let home = rows.iter().find(|r| r.key == "/home").unwrap();
+        assert_eq!(home.pageviews, 1);
+        assert!(home.lcp_p75.is_some());
     }
 
     // ---- Task F2: LCP attribution ---------------------------------------------------------
