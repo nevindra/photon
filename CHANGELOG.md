@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `route_change`/`view_duration` points the pages list never looked at.
     `web_vitals.view_duration` (one point per finalized view — the true pageview count)
     now joins the merge.
+- **Idle WAL segments never became queryable.** Age-based segment rotation ran only
+  after a commit, so on a low-traffic instance the data in the active segment stayed
+  invisible to the compactor — and to every query — until the *next* write happened to
+  arrive, no matter how long you waited. The WAL writer's idle wait now wakes at the
+  active segment's age deadline and seals it, so ingested data always becomes queryable
+  within ~`segment_max_age_secs` even with zero follow-up traffic. Applies to all three
+  WALs (logs, spans, metrics); no config change.
 
 ## [1.2.0] - 2026-07-15
 
