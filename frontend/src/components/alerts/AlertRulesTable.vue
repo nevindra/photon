@@ -5,7 +5,7 @@
 // for its data. Mirrors uptime/MonitorTable.vue's plain-Table-primitives shape (no TanStack Table:
 // this list is small, unpaginated, and never virtualized).
 import { computed } from 'vue'
-import { Plus } from 'lucide-vue-next'
+import { Plus, LayoutTemplate } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Table, TableHeader, TableBody, TableRow, TableHead } from '@/components/ui/table'
 import { EmptyState } from '@/components/ui/empty-state'
@@ -14,7 +14,7 @@ import { useRules, useChannels } from '@/lib/alertsQueries'
 import AlertRuleRow from './AlertRuleRow.vue'
 import type { AlertRule } from '@/lib/core/api'
 
-defineEmits<{ 'open-create': []; edit: [rule: AlertRule] }>()
+defineEmits<{ 'open-create': []; 'browse-templates': []; edit: [rule: AlertRule] }>()
 
 const rulesQuery = useRules()
 const channelsQuery = useChannels()
@@ -26,7 +26,16 @@ const isError = computed(() => rulesQuery.isError.value)
 
 <template>
   <div>
-    <div class="mb-3 flex justify-end">
+    <div class="mb-3 flex justify-end gap-2">
+      <Button
+        size="sm"
+        variant="secondary"
+        data-testid="alert-browse-templates"
+        @click="$emit('browse-templates')"
+      >
+        <LayoutTemplate class="mr-1.5 size-3.5" />
+        Browse templates
+      </Button>
       <Button size="sm" data-testid="alert-new-rule" @click="$emit('open-create')">
         <Plus class="mr-1.5 size-3.5" />
         New alert
@@ -38,8 +47,16 @@ const isError = computed(() => rulesQuery.isError.value)
     <EmptyState
       v-else-if="!rules.length"
       title="No alert rules yet"
-      description="Create your first rule to get notified when a condition is met."
-    />
+      description="Start from a template, or create one from scratch."
+    >
+      <div class="mt-3 flex justify-center gap-2">
+        <Button size="sm" @click="$emit('browse-templates')">
+          <LayoutTemplate class="mr-1.5 size-3.5" />
+          Browse templates
+        </Button>
+        <Button size="sm" variant="secondary" @click="$emit('open-create')">New alert</Button>
+      </div>
+    </EmptyState>
     <div v-else class="overflow-x-auto rounded-lg border border-border bg-card shadow-1">
       <Table>
         <TableHeader>

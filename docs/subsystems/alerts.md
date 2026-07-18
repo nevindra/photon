@@ -192,6 +192,36 @@ condition) + create/update/delete/toggle/test mutations for rules and channels �
 `api.*` call already returns the non-throwing `{ ok, error }` shape, so `onSuccess` both invalidates
 the relevant query key and toasts, branching on the result.
 
+### Templates / quick setup
+
+A **"Browse templates"** button on the Rules tab (and the empty state's "No rules yet — start from a
+template" link) opens `TemplatePickerDialog.vue`: a **target-first** flow — pick a target type
+(`Segmented`: Service · RUM app · Host · Global), then, for Service/App/Host, a concrete instance
+from live data (`useServices`/`useRumApps`/the infra hosts query) — and the matching templates render
+as `TemplateRow.vue` rows (plain-English condition + severity pill). Per row: **Apply** builds a
+`RuleInput` from the template with the target substituted in and POSTs it straight through the
+existing `POST /api/alerts/rules`; **Customize** instead opens the existing `AlertRuleDialog`
+pre-seeded from the same draft (its new `:seed` prop, honored only in create mode). A shared "Notify"
+channel multiselect on the picker feeds Apply (default none; a hint explains an empty rule is fine if
+no channels exist yet).
+
+This is **entirely frontend-only** — a static, read-only catalog of **23 templates**
+(`frontend/src/lib/alertTemplates.ts`: 7 Service, 6 RUM app, 6 Host, 4 Global), each a typed constant
+with a `build(target)` function that performs the substitution. No backend, no new API, no new
+storage — every applied template is just seed data flowing through the create path that already
+exists. Target substitution: **Service** → traces `service` + logs `service.name:<svc>` prepended to
+`query`; **App** → rum `app_id`; **Host** → metrics `label_filters: { 'host.name': <host> }`;
+**Global** → metrics `group_by: ['host.name']` (one series per host, no filter). Host templates work
+unmodified because `alerts_source.rs::sample_metrics` already compiles `label_filters` into the query
+filter (see the `ConditionSource` table above) — no backend change was needed.
+
+`ConditionBuilder` now round-trips metric `label_filters`: seeded from the condition, re-emitted in
+`builtCondition`, and rendered as removable key=value chips next to the existing group-by chips — so
+Customizing a Host template keeps its `host.name` scope instead of silently losing it.
+
+**Non-goal (explicit):** provider-native channel formatting (Slack/Discord/Teams/PagerDuty) — a
+booked follow-up. Channels remain the single generic `Webhook` kind either way.
+
 ## Known limitations (v1)
 
 - **Near-real-time, not instant** for metrics/logs/traces/RUM (see the data-freshness caveat above);

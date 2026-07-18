@@ -94,8 +94,9 @@ the cross-signal landing dashboard), `/logs`, `/traces` (+ `/traces/:traceId` wa
 sub-routes: `/rum/:appId` vitals, `/pages[/:route]`, `/errors` (search bar + fixed facet panel), and
 `/errors/:fingerprint` issue detail), `/uptime`, `/infra` (+ `/infra/:host` host detail — host/GPU
 resource monitoring), `/data`, `/alerts` (the cross-signal webhook alert engine — rules over
-metrics/logs/traces/RUM, incidents, notification channels), plus `/login` and `/onboarding`, behind a
-`beforeEach` auth guard
+metrics/logs/traces/RUM, incidents, notification channels, plus a "Browse templates" quick-setup
+on-ramp: target-first Apply/Customize over a frontend-only, 23-template seed catalog), plus `/login`
+and `/onboarding`, behind a `beforeEach` auth guard
 (`router/index.js`) gated on reactive flags (`lib/core/auth.ts`). The `@photon/rum` browser SDK
 (`sdk/rum/`) behind `/rum` auto-detects SPA client-side navigation (History API —
 `pushState`/`replaceState`/`popstate` — on by default; MPAs unaffected) and rotates a

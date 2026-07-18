@@ -25,10 +25,11 @@ import { toast } from '@/components/ui/toast'
 import { useCreateRule, useUpdateRule, useTestRule, useChannels } from '@/lib/alertsQueries'
 import type { AlertRule, AlertRuleInput, AlertCondition, AlertSeverity, MutationResult } from '@/lib/core/api'
 
-const props = defineProps<{ open: boolean; rule?: AlertRule | null }>()
+const props = defineProps<{ open: boolean; rule?: AlertRule | null; seed?: AlertRuleInput | null }>()
 const emit = defineEmits<{ 'update:open': [boolean] }>()
 
 const isEdit = computed(() => !!props.rule)
+const createNonce = ref(0)
 
 const SEVERITIES: { value: AlertSeverity; label: string }[] = [
   { value: 'info', label: 'info' },
@@ -59,32 +60,45 @@ const blank = () => ({
 const form = reactive(blank())
 const condition = ref<AlertCondition | null>(null)
 
+function applyCreateDraft() {
+  // create mode: pre-fill from `seed` if present, else blank
+  const s = props.seed
+  Object.assign(form, {
+    name: s?.name ?? '',
+    description: s?.description ?? '',
+    severity: s?.severity ?? ('warning' as AlertSeverity),
+    for_secs: s?.for_secs ?? 300,
+    channel_ids: s?.channel_ids ? [...s.channel_ids] : [],
+  })
+  condition.value = s?.condition ?? defaultCondition()
+}
+
 watch(
   () => props.rule,
   (r) => {
-    Object.assign(
-      form,
-      r
-        ? {
-            name: r.name,
-            description: r.description ?? '',
-            severity: r.severity,
-            for_secs: r.for_secs,
-            channel_ids: [...r.channel_ids],
-          }
-        : blank(),
-    )
-    condition.value = r ? r.condition : defaultCondition()
+    if (r) {
+      Object.assign(form, {
+        name: r.name,
+        description: r.description ?? '',
+        severity: r.severity,
+        for_secs: r.for_secs,
+        channel_ids: [...r.channel_ids],
+      })
+      condition.value = r.condition
+    } else {
+      applyCreateDraft()
+    }
   },
   { immediate: true },
 )
 
-// Reset the draft the moment the dialog closes in create mode, so reopening "+ New alert" right
-// after doesn't flash the previous draft (mirrors ChannelDialog's identical close-reset guard).
 watch(
   () => props.open,
   (isOpen) => {
-    if (!isOpen && !props.rule) {
+    if (isOpen && !props.rule) {
+      applyCreateDraft() // re-apply seed each open so a new template draft takes effect
+      createNonce.value++ // force ConditionBuilder to remount + reseed from the new condition
+    } else if (!isOpen && !props.rule) {
       Object.assign(form, blank())
       condition.value = defaultCondition()
     }
@@ -173,7 +187,7 @@ function testNow() {
 
         <div class="space-y-1.5">
           <span class="text-xs font-medium uppercase tracking-wider text-muted-foreground">Condition</span>
-          <ConditionBuilder :key="rule?.id ?? 'new'" ref="conditionBuilderRef" v-model:condition="condition" />
+          <ConditionBuilder :key="rule?.id ?? `new-${createNonce}`" ref="conditionBuilderRef" v-model:condition="condition" />
         </div>
 
         <FormField label="Notify" hint="Where the webhook is sent when this rule triggers or resolves.">

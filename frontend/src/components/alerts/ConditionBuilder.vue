@@ -106,6 +106,7 @@ const RUM_KIND_OPTIONS: { value: RumCondition['kind']; label: string }[] = [
 
 interface FormState {
   metric_name: string
+  label_filters: Record<string, string>
   group_by: string[]
   agg: MetricsCondition['agg']
   query: string
@@ -130,6 +131,7 @@ const SIGNAL_DEFAULTS: Record<AlertSignal, Partial<FormState>> = {
 function blankForm(): FormState {
   return {
     metric_name: '',
+    label_filters: {},
     group_by: [],
     agg: 'avg',
     query: '',
@@ -152,6 +154,7 @@ function seed(c: AlertCondition | null): { signal: AlertSignal; form: FormState 
     switch (c.signal) {
       case 'metrics':
         form.metric_name = c.metric_name
+        form.label_filters = c.label_filters ? { ...c.label_filters } : {}
         form.group_by = c.group_by ? [...c.group_by] : []
         form.agg = c.agg
         break
@@ -204,6 +207,29 @@ function removeGroupBy(i: number) {
   form.group_by.splice(i, 1)
 }
 
+// --- Label-filter chips (metrics only) -------------------------------------------------------
+
+const labelFilterDraft = ref('')
+function addLabelFilter() {
+  const raw = labelFilterDraft.value.trim()
+  const eq = raw.indexOf('=')
+  if (eq > 0) {
+    const k = raw.slice(0, eq).trim()
+    const v = raw.slice(eq + 1).trim()
+    if (k && v) form.label_filters[k] = v
+  }
+  labelFilterDraft.value = ''
+}
+function onLabelFilterKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter' || e.key === ',') {
+    e.preventDefault()
+    addLabelFilter()
+  }
+}
+function removeLabelFilter(k: string) {
+  delete form.label_filters[k]
+}
+
 // --- Autocomplete sources ---------------------------------------------------------------------
 
 const catalogQuery = useMetricCatalog(startNs, endNs)
@@ -245,6 +271,7 @@ const builtCondition = computed<AlertCondition>(() => {
       return {
         signal: 'metrics',
         metric_name: form.metric_name,
+        label_filters: Object.keys(form.label_filters).length ? { ...form.label_filters } : undefined,
         agg: form.agg,
         group_by: form.group_by.length ? [...form.group_by] : undefined,
         ...shared,
@@ -418,6 +445,35 @@ defineExpose({ isValid, previewSeries })
           <Input id="rum-route" v-model="form.route" placeholder="e.g. /checkout (leave empty for all routes)" autocomplete="off" />
         </FormField>
       </template>
+
+      <!-- Label-filter chips (metrics only) -->
+      <FormField
+        v-if="signal === 'metrics'"
+        label="Filter labels"
+        :optional="true"
+        hint="Restrict to matching label values, e.g. host.name=web-01."
+        class="mt-3"
+      >
+        <div class="flex flex-wrap items-center gap-1.5">
+          <span
+            v-for="(v, k) in form.label_filters"
+            :key="k"
+            class="inline-flex items-center gap-1 rounded-md border border-border bg-muted px-2 py-1 text-xs font-mono"
+          >
+            {{ k }}={{ v }}
+            <button type="button" class="text-muted-foreground hover:text-foreground" @click="removeLabelFilter(k)">
+              <X class="size-3" />
+            </button>
+          </span>
+          <input
+            v-model="labelFilterDraft"
+            placeholder="host.name=web-01…"
+            class="h-7 w-40 rounded-md border border-input bg-background px-2 font-mono text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            @keydown="onLabelFilterKeydown"
+            @blur="addLabelFilter"
+          >
+        </div>
+      </FormField>
 
       <!-- Group-by chips (metrics only) -->
       <FormField

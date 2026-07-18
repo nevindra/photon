@@ -116,9 +116,14 @@ pushes to.
   [`subsystems/`](subsystems/) for the file lists). `infra/` (host/GPU resource monitoring):
   `HostTable.vue` (host list rows — CPU/memory meters + GPU flag), `HostResourcePanels.vue`
   (per-resource `MetricChart` panels for one host). `alerts/` (the webhook alert engine, cross-signal):
-  `AlertStatBand`, `AlertRulesTable`/`AlertRuleRow`, `AlertRuleDialog`/`ConditionBuilder` (the
-  plain-English condition builder), `IncidentsTable`, `ChannelsGrid`/`ChannelCard`/`ChannelDialog` —
-  see [`subsystems/alerts.md`](subsystems/alerts.md).
+  `AlertStatBand`, `AlertRulesTable`/`AlertRuleRow` (its "Browse templates" button + empty-state link
+  open the quick-setup picker), `AlertRuleDialog`/`ConditionBuilder` (the plain-English condition
+  builder — `AlertRuleDialog` also accepts an optional `:seed` prop, a partial `RuleInput` that
+  pre-fills *create* mode, honored only when `:rule` is null), `TemplatePickerDialog`/`TemplateRow`
+  (the target-first template quick-setup picker: pick Service/App/Host/Global → Apply directly or
+  Customize into a `:seed`-ed `AlertRuleDialog`; templates come from `lib/alertTemplates.ts`),
+  `IncidentsTable`, `ChannelsGrid`/`ChannelCard`/`ChannelDialog` — see
+  [`subsystems/alerts.md`](subsystems/alerts.md).
 - **`ui/`** — the shared primitive library (below).
 
 ## The `ui/` primitive library
@@ -201,6 +206,9 @@ follow the same contract) plus its signal-specific helpers:
 - `alertsQueries.ts` (root `lib/`, not a per-signal folder — the alert engine spans metrics/logs/
   traces/RUM) — `useRules`/`useChannels`/`useIncidents`/`usePreview` (all poll ~15s except the
   on-demand preview) + create/update/delete/toggle/test mutations for rules and channels.
+- `alertTemplates.ts` (root `lib/`) — the static, read-only 23-template quick-setup catalog (Service/
+  App/Host/Global) + `build(target)` target substitution, consumed by `TemplatePickerDialog`; frontend-
+  only, no backend counterpart.
 
 ## Conventions
 

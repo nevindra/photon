@@ -12,10 +12,11 @@ import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import AppShell from '@/components/common/AppShell.vue'
 import { NavTabs, NavTabItem } from '@/components/ui/nav-tabs'
-import { api, type AlertRule } from '@/lib/core/api'
+import { api, type AlertRule, type AlertRuleInput } from '@/lib/core/api'
 import AlertStatBand from '@/components/alerts/AlertStatBand.vue'
 import AlertRulesTable from '@/components/alerts/AlertRulesTable.vue'
 import AlertRuleDialog from '@/components/alerts/AlertRuleDialog.vue'
+import TemplatePickerDialog from '@/components/alerts/TemplatePickerDialog.vue'
 import IncidentsTable from '@/components/alerts/IncidentsTable.vue'
 import ChannelsGrid from '@/components/alerts/ChannelsGrid.vue'
 
@@ -34,13 +35,24 @@ const tab = computed<AlertsTab>(() =>
 // which rule (if any) it's open for.
 const dialogOpen = ref(false)
 const editingRule = ref<AlertRule | null>(null)
+const pickerOpen = ref(false)
+const templateSeed = ref<AlertRuleInput | null>(null)
 
 function openCreate() {
   editingRule.value = null
+  templateSeed.value = null // ensure a blank draft, not a lingering template
   dialogOpen.value = true
 }
 function openEdit(rule: AlertRule) {
   editingRule.value = rule
+  dialogOpen.value = true
+}
+function openBrowseTemplates() {
+  pickerOpen.value = true
+}
+function onCustomizeTemplate(seed: AlertRuleInput) {
+  editingRule.value = null
+  templateSeed.value = seed
   dialogOpen.value = true
 }
 </script>
@@ -83,11 +95,26 @@ function openEdit(rule: AlertRule) {
         </NavTabItem>
       </NavTabs>
 
-      <AlertRulesTable v-if="tab === 'rules'" @open-create="openCreate" @edit="openEdit" />
+      <AlertRulesTable
+        v-if="tab === 'rules'"
+        @open-create="openCreate"
+        @browse-templates="openBrowseTemplates"
+        @edit="openEdit"
+      />
       <IncidentsTable v-else-if="tab === 'incidents'" />
       <ChannelsGrid v-else-if="tab === 'channels'" />
 
-      <AlertRuleDialog :open="dialogOpen" :rule="editingRule" @update:open="dialogOpen = $event" />
+      <TemplatePickerDialog
+        :open="pickerOpen"
+        @update:open="pickerOpen = $event"
+        @customize="onCustomizeTemplate"
+      />
+      <AlertRuleDialog
+        :open="dialogOpen"
+        :rule="editingRule"
+        :seed="templateSeed"
+        @update:open="dialogOpen = $event"
+      />
     </section>
   </AppShell>
 </template>
