@@ -79,6 +79,7 @@ corpus (`lib/core/mock.ts`) on a **network** failure, while still surfacing real
 | `/uptime` | `UptimeDashboard.vue` | Uptime |
 | `/infra` · `/infra/:host` | `InfraHostsView.vue` · `InfraHostDetailView.vue` | Infrastructure (host/GPU resource monitoring) |
 | `/data` | `DataView.vue` | Usage / storage / retention |
+| `/alerts` | `AlertsView.vue` | Alerts (webhook rules, incidents, channels) |
 | `/login` · `/onboarding` | `LoginView.vue` · `OnboardingView.vue` | Auth (public) |
 
 `router/index.js` has a global `beforeEach` guard: cached `hydrate()` auth probe, onboarding-first
@@ -90,7 +91,8 @@ per-signal list: an ungrouped **Home** entry, then three worlds — **Frontend**
 (→ `/services`), **Infrastructure** (two items: **Hosts** → `/infra`, **Ops** → `/uptime`) — Frontend
 and Backend are each today a single landing item into an existing route (room to grow their own
 sub-nav later), then **Explore** (Logs · Traces · Metrics, the raw per-signal browsers) and **Manage**
-(Data). `AppShell.vue` derives which group to highlight from the route via a `ROUTE_GROUP` map (e.g.
+(Data, then Alerts — the cross-signal webhook alert engine). `AppShell.vue` derives which group to
+highlight from the route via a `ROUTE_GROUP` map (e.g.
 `/rum` → `frontend`, `/infra` → `infra`) and the inverse `LANDING` map picks the route a NavRail click
 pushes to.
 
@@ -109,10 +111,14 @@ pushes to.
   input + autocomplete), `RelatedMenu` ("Related ▾" cross-signal destination dropdown),
   `TimeRangePicker`, `ColumnPicker`, `LiveControl` (refresh mode), `ThemeToggle`, `SettingsDialog`,
   `SettingsUsers`.
-- **`logs/` · `traces/` · `services/` · `metrics/` · `uptime/` · `data/` · `rum/` · `infra/`** — the
-  per-signal domain components (see the per-feature docs in [`subsystems/`](subsystems/) for the file
-  lists). `infra/` (host/GPU resource monitoring): `HostTable.vue` (host list rows — CPU/memory
-  meters + GPU flag), `HostResourcePanels.vue` (per-resource `MetricChart` panels for one host).
+- **`logs/` · `traces/` · `services/` · `metrics/` · `uptime/` · `data/` · `rum/` · `infra/` ·
+  `alerts/`** — the per-signal domain components (see the per-feature docs in
+  [`subsystems/`](subsystems/) for the file lists). `infra/` (host/GPU resource monitoring):
+  `HostTable.vue` (host list rows — CPU/memory meters + GPU flag), `HostResourcePanels.vue`
+  (per-resource `MetricChart` panels for one host). `alerts/` (the webhook alert engine, cross-signal):
+  `AlertStatBand`, `AlertRulesTable`/`AlertRuleRow`, `AlertRuleDialog`/`ConditionBuilder` (the
+  plain-English condition builder), `IncidentsTable`, `ChannelsGrid`/`ChannelCard`/`ChannelDialog` —
+  see [`subsystems/alerts.md`](subsystems/alerts.md).
 - **`ui/`** — the shared primitive library (below).
 
 ## The `ui/` primitive library
@@ -190,6 +196,11 @@ follow the same contract) plus its signal-specific helpers:
 - **`uptime/`** — `uptimeQueries.ts`.
 - **`data/`** — `dataQueries.ts`.
 - **`infra/`** — `infraQueries.ts` (`useInfraHosts`/`useInfraHost`/`useInfraHostSeries`).
+
+**Cross-signal:**
+- `alertsQueries.ts` (root `lib/`, not a per-signal folder — the alert engine spans metrics/logs/
+  traces/RUM) — `useRules`/`useChannels`/`useIncidents`/`usePreview` (all poll ~15s except the
+  on-demand preview) + create/update/delete/toggle/test mutations for rules and channels.
 
 ## Conventions
 

@@ -144,6 +144,54 @@ async fn prune_incidents_and_stats() {
 }
 
 #[tokio::test]
+async fn channel_ids_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("uptime.db");
+    let store = SqliteStore::open(path.to_str().unwrap()).unwrap();
+
+    // Create with a channel id → persisted as a JSON TEXT column, decoded back on read.
+    let input: MonitorInput = serde_json::from_str(
+        r#"{"name":"api","type":"http","target":"https://x.test",
+        "interval_secs":30,"timeout_secs":5,"retries":2,"channel_ids":["c1"]}"#,
+    )
+    .unwrap();
+    let m = store.create_monitor(input).await.unwrap();
+    assert_eq!(m.channel_ids, vec!["c1".to_string()]);
+    let got = store.get_monitor(&m.id).await.unwrap().unwrap();
+    assert_eq!(got.channel_ids, vec!["c1".to_string()]);
+
+    // The update path persists channel_ids too.
+    let edit: MonitorInput = serde_json::from_str(
+        r#"{"name":"api","type":"http","target":"https://x.test",
+        "interval_secs":30,"timeout_secs":5,"retries":2,"channel_ids":["c1","c2"]}"#,
+    )
+    .unwrap();
+    let up = store.update_monitor(&m.id, edit).await.unwrap().unwrap();
+    assert_eq!(up.channel_ids, vec!["c1".to_string(), "c2".to_string()]);
+    let got2 = store.get_monitor(&m.id).await.unwrap().unwrap();
+    assert_eq!(got2.channel_ids, vec!["c1".to_string(), "c2".to_string()]);
+
+    // A monitor created without channel_ids reads back as an empty list (NULL → vec![]).
+    let m2 = store.create_monitor(input_no_channels()).await.unwrap();
+    assert!(m2.channel_ids.is_empty());
+    assert!(store
+        .get_monitor(&m2.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .channel_ids
+        .is_empty());
+}
+
+fn input_no_channels() -> MonitorInput {
+    serde_json::from_str(
+        r#"{"name":"api2","type":"tcp","target":"127.0.0.1:80",
+        "interval_secs":30,"timeout_secs":5,"retries":2}"#,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
 async fn open_creates_missing_parent_dirs() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nested/sub/uptime.db");

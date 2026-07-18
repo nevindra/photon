@@ -112,6 +112,7 @@ mod tests {
             ignore_tls: false,
             follow_redirects: true,
             webhook_url: webhook.map(String::from),
+            channel_ids: vec![],
             enabled: true,
             last_state: MonitorState::Up,
             last_check_at: None,

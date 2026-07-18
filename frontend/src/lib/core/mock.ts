@@ -3,6 +3,21 @@
 
 import { fieldValues, removeField } from '@/lib/core/queryLang'
 import type { InfraHost, InfraHostsResult, InfraHostDetail, InfraSeriesResult } from '@/lib/core/api'
+import type {
+  AlertRule,
+  AlertRuleInput,
+  AlertChannel,
+  AlertChannelInput,
+  AlertIncident,
+  AlertIncidentsFilter,
+  AlertCondition,
+  AlertPreviewResult,
+  AlertPreviewSeries,
+  AlertRuleResult,
+  AlertChannelResult,
+  AlertTestRuleResult,
+  MutationResult,
+} from '@/lib/core/api'
 
 export const SERVICES = ['api', 'web', 'worker', 'auth-svc', 'ingestor', 'postgres']
 
@@ -1695,4 +1710,324 @@ export function mockInfraHostSeries(host: string, resource: string, startNs: str
     return { labels, points, exemplars: [] }
   })
   return { resource, series }
+}
+
+// ---- Alerts (webhook alert & notification engine) fixtures ---------------------------------
+// Field names/shapes mirror GET/POST /api/alerts/* exactly (see api.ts's Alert* types, the
+// canonical wire contract — imported type-only above, following the corrected infra-fixture
+// convention rather than re-declaring the shapes here). A few rules/channels/incidents across all
+// four signals so the Alerts view's rules table, channel grid, and incident history all have
+// something real to render in demo mode.
+
+let mockAlertChannelsData: AlertChannel[] = [
+  {
+    id: 'chan-1',
+    name: 'Ops webhook bridge',
+    kind: 'webhook',
+    url: 'https://hooks.example.com/services/mock/webhook',
+    secret: 'whsec_mock_1a2b3c',
+    headers: null,
+    created_at: 1_700_000_000_000,
+    updated_at: 1_700_000_000_000,
+  },
+  {
+    id: 'chan-2',
+    name: 'PagerDuty inbound',
+    kind: 'webhook',
+    url: 'https://events.pagerduty.example.com/v2/enqueue',
+    secret: null,
+    headers: { Authorization: 'Bearer mock-token' },
+    created_at: 1_700_000_500_000,
+    updated_at: 1_700_000_500_000,
+  },
+]
+
+let mockAlertRulesData: AlertRule[] = [
+  {
+    id: 'rule-1',
+    name: 'High CPU (web fleet)',
+    description: 'Sustained CPU pressure across web hosts',
+    enabled: true,
+    signal: 'metrics',
+    condition: {
+      signal: 'metrics',
+      metric_name: 'system.cpu.utilization',
+      label_filters: {},
+      group_by: ['host.name'],
+      agg: 'avg',
+      window_secs: 300,
+      cmp: 'gt',
+      threshold: 0.9,
+    },
+    for_secs: 300,
+    interval_secs: 60,
+    severity: 'warning',
+    channel_ids: ['chan-1'],
+    created_at: 1_700_001_000_000,
+    updated_at: 1_700_001_000_000,
+  },
+  {
+    id: 'rule-2',
+    name: 'Checkout error spike',
+    description: null,
+    enabled: true,
+    signal: 'logs',
+    condition: {
+      signal: 'logs',
+      query: 'severity:error service.name:checkout-api',
+      group_by: null,
+      window_secs: 600,
+      cmp: 'gt',
+      threshold: 100,
+    },
+    for_secs: 0,
+    interval_secs: 60,
+    severity: 'critical',
+    channel_ids: ['chan-1', 'chan-2'],
+    created_at: 1_700_002_000_000,
+    updated_at: 1_700_002_000_000,
+  },
+  {
+    id: 'rule-3',
+    name: 'Storefront LCP regression',
+    description: 'Largest Contentful Paint p75 above budget',
+    enabled: false,
+    signal: 'rum',
+    condition: {
+      signal: 'rum',
+      app_id: 'web-storefront',
+      route: null,
+      kind: 'vital_lcp_p75',
+      window_secs: 900,
+      cmp: 'gt',
+      threshold: 2500,
+    },
+    for_secs: 600,
+    interval_secs: 60,
+    severity: 'warning',
+    channel_ids: ['chan-2'],
+    created_at: 1_700_003_000_000,
+    updated_at: 1_700_003_000_000,
+  },
+  {
+    id: 'rule-4',
+    name: 'checkout-api error rate',
+    description: null,
+    enabled: true,
+    signal: 'traces',
+    condition: {
+      signal: 'traces',
+      service: 'checkout-api',
+      operation: null,
+      kind: 'error_rate',
+      window_secs: 300,
+      cmp: 'gt',
+      threshold: 5.0,
+    },
+    for_secs: 120,
+    interval_secs: 60,
+    severity: 'critical',
+    channel_ids: ['chan-1'],
+    created_at: 1_700_004_000_000,
+    updated_at: 1_700_004_000_000,
+  },
+]
+
+let mockAlertIncidentsData: AlertIncident[] = [
+  {
+    id: 1,
+    rule_id: 'rule-1',
+    series_key: 'host.name=web-2',
+    started_at: Date.now() - 15 * 60_000,
+    ended_at: null,
+    peak_value: 0.94,
+    severity: 'warning',
+    summary: 'avg(system.cpu.utilization)=0.94 > 0.90',
+  },
+  {
+    id: 2,
+    rule_id: 'rule-2',
+    series_key: '',
+    started_at: Date.now() - 6 * 3_600_000,
+    ended_at: Date.now() - 5 * 3_600_000,
+    peak_value: 142,
+    severity: 'critical',
+    summary: 'count(severity:error service.name:checkout-api)=142 > 100',
+  },
+  {
+    id: 3,
+    rule_id: 'rule-4',
+    series_key: '',
+    started_at: Date.now() - 2 * 3_600_000,
+    ended_at: Date.now() - 2 * 3_600_000 + 8 * 60_000,
+    peak_value: 7.2,
+    severity: 'critical',
+    summary: 'error_rate(checkout-api)=7.2% > 5.0%',
+  },
+]
+
+function compareCmp(cmp: string, value: number, threshold: number): boolean {
+  switch (cmp) {
+    case 'gt': return value > threshold
+    case 'gte': return value >= threshold
+    case 'lt': return value < threshold
+    case 'lte': return value <= threshold
+    default: return false
+  }
+}
+
+// The label key a draft condition would group series by, if any — drives how many synthetic
+// series `mockAlertPreview` fabricates (empty `group_by` → one aggregate series, matching the
+// backend's documented "empty group_by → a single aggregate series (key = [])" rule).
+function conditionGroupKey(condition: AlertCondition): string | null {
+  if (condition.signal === 'metrics') return condition.group_by?.[0] ?? null
+  if (condition.signal === 'logs') return condition.group_by ?? null
+  return null
+}
+
+export function mockAlertRules(): AlertRule[] {
+  return [...mockAlertRulesData]
+}
+
+export function mockAlertRule(id: string): AlertRule | undefined {
+  return mockAlertRulesData.find((r) => r.id === id)
+}
+
+export function mockCreateAlertRule(input: AlertRuleInput): AlertRuleResult {
+  const name = (input.name ?? '').trim()
+  if (!name) return { ok: false, error: 'name must not be empty' }
+  if (!input.signal || !input.condition) return { ok: false, error: 'signal and condition are required' }
+  if (mockAlertRulesData.some((r) => r.name === name)) return { ok: false, error: 'a rule with that name already exists' }
+  const now = Date.now()
+  const rule: AlertRule = {
+    id: `rule-mock${Math.random().toString(16).slice(2, 10)}`,
+    name,
+    description: input.description ?? null,
+    enabled: input.enabled ?? true,
+    signal: input.signal,
+    condition: input.condition,
+    for_secs: input.for_secs ?? 0,
+    interval_secs: input.interval_secs ?? 60,
+    severity: input.severity ?? 'warning',
+    channel_ids: input.channel_ids ?? [],
+    created_at: now,
+    updated_at: now,
+  }
+  mockAlertRulesData = [...mockAlertRulesData, rule]
+  return { ok: true, rule }
+}
+
+export function mockUpdateAlertRule(id: string, input: AlertRuleInput): AlertRuleResult {
+  const existing = mockAlertRulesData.find((r) => r.id === id)
+  if (!existing) return { ok: false, error: 'no such rule' }
+  const updated: AlertRule = {
+    ...existing,
+    name: input.name ?? existing.name,
+    description: input.description !== undefined ? input.description : existing.description,
+    enabled: input.enabled ?? existing.enabled,
+    signal: input.signal ?? existing.signal,
+    condition: input.condition ?? existing.condition,
+    for_secs: input.for_secs ?? existing.for_secs,
+    interval_secs: input.interval_secs ?? existing.interval_secs,
+    severity: input.severity ?? existing.severity,
+    channel_ids: input.channel_ids ?? existing.channel_ids,
+    updated_at: Date.now(),
+  }
+  mockAlertRulesData = mockAlertRulesData.map((r) => (r.id === id ? updated : r))
+  return { ok: true, rule: updated }
+}
+
+export function mockDeleteAlertRule(id: string): MutationResult {
+  if (!mockAlertRulesData.some((r) => r.id === id)) return { ok: false, error: 'no such rule' }
+  mockAlertRulesData = mockAlertRulesData.filter((r) => r.id !== id)
+  return { ok: true }
+}
+
+export function mockTestAlertRule(id: string): AlertTestRuleResult {
+  const rule = mockAlertRule(id)
+  if (!rule) return { ok: false, error: 'no such rule' }
+  return { ok: true, series: mockAlertPreview(rule.condition).series }
+}
+
+// Dry-run a draft condition against a small deterministic corpus: 1-3 synthetic series hovering
+// near the threshold (seeded on the condition JSON, so repeated renders of the same draft are
+// stable), each flagged `breaching` per the same `cmp` the real evaluator would use.
+export function mockAlertPreview(condition: AlertCondition): AlertPreviewResult {
+  const rnd = seeded(hashSeed(JSON.stringify(condition)))
+  const groupKey = conditionGroupKey(condition)
+  const seriesKeys: Record<string, string>[] = groupKey
+    ? [{ [groupKey]: `${groupKey}-1` }, { [groupKey]: `${groupKey}-2` }]
+    : [{}]
+  const threshold = condition.threshold
+  const series: AlertPreviewSeries[] = seriesKeys.map((series_key) => {
+    const noise = (rnd() - 0.5) * Math.max(Math.abs(threshold), 1) * 0.5
+    const value = Math.round((threshold + noise) * 1000) / 1000
+    return { series_key, value, breaching: compareCmp(condition.cmp, value, threshold) }
+  })
+  return { series }
+}
+
+export function mockAlertChannels(): AlertChannel[] {
+  return [...mockAlertChannelsData]
+}
+
+export function mockAlertChannel(id: string): AlertChannel | undefined {
+  return mockAlertChannelsData.find((c) => c.id === id)
+}
+
+export function mockCreateAlertChannel(input: AlertChannelInput): AlertChannelResult {
+  const name = (input.name ?? '').trim()
+  if (!name) return { ok: false, error: 'name must not be empty' }
+  if (!input.url) return { ok: false, error: 'url is required' }
+  if (mockAlertChannelsData.some((c) => c.name === name)) return { ok: false, error: 'a channel with that name already exists' }
+  const now = Date.now()
+  const channel: AlertChannel = {
+    id: `chan-mock${Math.random().toString(16).slice(2, 10)}`,
+    name,
+    kind: input.kind ?? 'webhook',
+    url: input.url,
+    secret: input.secret ?? null,
+    headers: input.headers ?? null,
+    created_at: now,
+    updated_at: now,
+  }
+  mockAlertChannelsData = [...mockAlertChannelsData, channel]
+  return { ok: true, channel }
+}
+
+export function mockUpdateAlertChannel(id: string, input: AlertChannelInput): AlertChannelResult {
+  const existing = mockAlertChannelsData.find((c) => c.id === id)
+  if (!existing) return { ok: false, error: 'no such channel' }
+  const updated: AlertChannel = {
+    ...existing,
+    name: input.name ?? existing.name,
+    kind: input.kind ?? existing.kind,
+    url: input.url ?? existing.url,
+    secret: input.secret !== undefined ? input.secret : existing.secret,
+    headers: input.headers !== undefined ? input.headers : existing.headers,
+    updated_at: Date.now(),
+  }
+  mockAlertChannelsData = mockAlertChannelsData.map((c) => (c.id === id ? updated : c))
+  return { ok: true, channel: updated }
+}
+
+export function mockDeleteAlertChannel(id: string): MutationResult {
+  if (!mockAlertChannelsData.some((c) => c.id === id)) return { ok: false, error: 'no such channel' }
+  mockAlertChannelsData = mockAlertChannelsData.filter((c) => c.id !== id)
+  return { ok: true }
+}
+
+export function mockTestAlertChannel(id: string): MutationResult {
+  if (!mockAlertChannelsData.some((c) => c.id === id)) return { ok: false, error: 'no such channel' }
+  return { ok: true }
+}
+
+export function mockAlertIncidents(filters: AlertIncidentsFilter = {}): AlertIncident[] {
+  let rows = [...mockAlertIncidentsData]
+  if (filters.status === 'triggered') rows = rows.filter((i) => i.ended_at == null)
+  else if (filters.status === 'resolved') rows = rows.filter((i) => i.ended_at != null)
+  if (filters.rule_id) rows = rows.filter((i) => i.rule_id === filters.rule_id)
+  rows = rows.sort((a, b) => b.started_at - a.started_at)
+  if (filters.limit) rows = rows.slice(0, filters.limit)
+  return rows
 }

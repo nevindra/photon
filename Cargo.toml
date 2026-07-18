@@ -13,6 +13,7 @@ members = [
     "crates/photon-loadgen",
     "crates/photon-uptime",
     "crates/photon-agent",
+    "crates/photon-alerts",
 ]
 
 [workspace.dependencies]
@@ -66,6 +67,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 surge-ping = "0.8"
 uuid = { version = "1", features = ["v4"] }
+# Alerts vertical (M-alerts): HMAC-SHA256 webhook payload signing.
+hmac = "0.12"
+sha2 = "0.10"
 # Dev-only micro-benchmark harness (Phase-A write-path benches). default-features off drops
 # rayon + plotters/gnuplot; cargo_bench_support keeps `cargo bench`. Not a runtime dep.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

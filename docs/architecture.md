@@ -8,11 +8,12 @@ write/read path, or anything touching storage and durability.
 Photon is a **single Rust binary** = a Cargo **workspace of small crates**. The crate graph _is_ the
 architecture: dependencies point one way, toward `photon-core`, and the compiler forbids cycles and
 cross-boundary reach. One `photon-server` process runs the OTLP receivers, three per-signal compactor
-loops, the query engine, the uptime scheduler, the background replicator, and the axum API that also
-serves the embedded Vue UI.
+loops, the query engine, the uptime scheduler, the alert-engine evaluation loop, the background
+replicator, and the axum API that also serves the embedded Vue UI.
 
 It carries **five signals** — logs, traces (spans), metrics, uptime, and RUM — plus data
-retention/purge, usage/storage accounting, live-tail SSE, and hot→durable replication.
+retention/purge, usage/storage accounting, live-tail SSE, hot→durable replication, and a
+cross-signal webhook **alert engine**.
 
 > **Signal isolation by duplication.** Logs, spans, and metrics each get their **own** WAL, Arrow
 > schema, compactor, and manifest object. This is a deliberate, documented "accepted structural cost"
@@ -30,12 +31,13 @@ photon-core   ← leaf: domain types only, no I/O. Everything depends on it; it 
   │  │  │  └── photon-wal      → core        group-commit WAL (the durability boundary)
   │  │  └───── photon-index    → core        skip-index format (bloom + min/max), pure
   │  └──────── photon-storage  → core        hot + durable object stores + background replicator
-  └─────────── photon-uptime   → core        self-contained SQLite monitoring vertical
+  ├─────────── photon-uptime   → core        self-contained SQLite monitoring vertical
+  └─────────── photon-alerts   → core        system-wide webhook alert engine (SQLite rules/channels)
 
 photon-compact → core, wal, index, storage   WAL segment → sorted Parquet + skip index → manifest
 photon-query   → core, index, storage        manifest + skip-index pruning, then DataFusion
 photon-ingest  → core, wal                    OTLP gRPC + HTTP receivers, OTLP→record mapping
-photon-api     → core, query, uptime          axum REST + session auth + embedded Vue UI
+photon-api     → core, query, uptime, alerts  axum REST + session auth + embedded Vue UI
 photon-loadgen → ingest                        dev-only OTLP load generator
 photon-agent   → (standalone, no internal deps) host/GPU sampler, OTLP/HTTP client
 photon-server  → all of the above             the binary: config, wiring, task supervision
@@ -45,6 +47,9 @@ photon-server  → all of the above             the binary: config, wiring, task
 (`RumSink`, `UsageStore`, `ReplicationStatus`, `DataAdmin`, `UserStore`) that `photon-server`
 implements over the real WALs. `photon-query` does **not** depend on `photon-compact`/`photon-wal` at
 runtime (dev-dep only). `photon-loadgen` depends only on `photon-ingest` (reuses its OTLP mapping).
+`photon-alerts` does **not** depend on `photon-query` — it defines a `ConditionSource` trait seam
+that `photon-server` implements (`EngineConditionSource`, `crates/photon-server/src/alerts_source.rs`)
+over the three query engines, the same seam pattern as `Wal`/`UptimeStore`/`RumSink`.
 `photon-server` is the sole crate that touches every layer.
 
 ## Crate reference
@@ -58,11 +63,12 @@ runtime (dev-dep only). `photon-loadgen` depends only on `photon-ingest` (reuses
 | **photon-compact** | Drains closed WAL segments → sorted zstd Parquet (`[storage] zstd_level`) + skip-index sidecar → manifest (`FileEntry.bytes` recorded at write time) → enqueue replication; `merge_once` consolidates small files (bounded per pass); `purge_before` enforces retention; both enqueue durable deletes for unlinked objects. **Three parallel compactors, one per signal.** | `Compactor` (logs), `SpanCompactor`, `MetricsCompactor` |
 | **photon-query** | Prune (manifest time overlap + skip-index bloom/min-max — our code) then read only surviving **local** Parquet with DataFusion 43. **Three engines, one per signal.** | `QueryEngine` (logs), `SpanQueryEngine` (traces), `MetricsQueryEngine` (metrics + RUM vitals) |
 | **photon-ingest** | OTLP receivers for all three write signals: gRPC (`LogsService`/`TraceService`/`MetricsService`) + HTTP (`/v1/logs`, `/v1/traces`, `/v1/metrics`); plus a Prometheus remote-write 1.0 receiver (`POST /api/v1/write`, snappy+protobuf → the metrics WAL). Holds three WALs + three schemas sharing one bearer token; per-signal `max_in_flight` semaphore. Both front doors accept **gzipped** requests (HTTP `RequestDecompressionLayer`; gRPC `accept_compressed(Gzip)` — a stock OTel Collector gzips by default) and enforce one shared `max_body_bytes` cap on the *decompressed* size (HTTP `DefaultBodyLimit`, gRPC `max_decoding_message_size`, snappy remote-write decompress cap). | `IngestServer`; pure cores `otlp_logs_to_records`, `otlp_traces_to_spans`, `otlp_metrics_to_points` |
-| **photon-api** | axum REST + embedded Vue UI + argon2 signed-cookie sessions. `ApiServer` holds the three query engines + optional builder-attached subsystems (`with_uptime`, `with_data_admin`, `with_live_hub`, `with_usage`, `with_rum`) — each `None` ⇒ its routes 404. | `ApiServer`; trait seams `RumSink`, `RumAppStore`, `UserStore`, `UsageStore`, `ReplicationStatus`, `DataAdmin` |
-| **photon-server** | The single binary. Wires everything; spawns ingest, **three** compactor loops, the usage sampler, the uptime scheduler + retention, the replicator flush, and builds `ApiServer`. Also `hash-password <pw>` and `healthcheck` subcommands. | `main` |
+| **photon-api** | axum REST + embedded Vue UI + argon2 signed-cookie sessions. `ApiServer` holds the three query engines + optional builder-attached subsystems (`with_uptime`, `with_data_admin`, `with_live_hub`, `with_usage`, `with_rum`, `with_alerts`) — each `None` ⇒ its routes 404. | `ApiServer`; trait seams `RumSink`, `RumAppStore`, `UserStore`, `UsageStore`, `ReplicationStatus`, `DataAdmin` |
+| **photon-server** | The single binary. Wires everything; spawns ingest, **three** compactor loops, the usage sampler, the uptime scheduler + retention, the alert-engine scheduler (`spawn_alerts`, before `spawn_uptime` so both share one `AlertStore`), the replicator flush, and builds `ApiServer`. Also `hash-password <pw>` and `healthcheck` subcommands. | `main` |
 | **photon-loadgen** | Standalone OTLP/HTTP load generator (`logs`/`traces`/`metrics` subcommands): steady-rate soak or max-concurrency ceiling, reporting throughput/ack-latency. | `main` |
 | **photon-agent** | Standalone host/GPU resource-metrics agent (its own binary, like `photon-loadgen`): samples the host (`sysinfo`) + NVIDIA GPU (`nvml-wrapper`, `gpu` feature default-on, graceful fallback when no driver is present), maps to OTLP `system.*`/`system.gpu.*` metrics tagged `host.name`/`host.id`/`os.type`, and POSTs them to `/v1/metrics`. Not compiled by `cargo build -p photon-server`. | `main` |
-| **photon-uptime** | Self-contained active-monitoring vertical: schedules HTTP(S)/TCP/ICMP probes, records up/down + latency to embedded SQLite, tracks incidents, fires webhook alerts. | trait **`UptimeStore`**; `probe`/`scheduler`/`state`/`notify` |
+| **photon-uptime** | Self-contained active-monitoring vertical: schedules HTTP(S)/TCP/ICMP probes, records up/down + latency to embedded SQLite, tracks incidents, fires webhook alerts (and, via `photon-server`'s `UptimeAlertBridge`, bridges each transition onto the shared alerts incident store + channels). | trait **`UptimeStore`**; `probe`/`scheduler`/`state`/`notify` |
+| **photon-alerts** | System-wide webhook alert engine: per-signal rules (metrics/logs/traces/RUM) evaluated on a near-real-time loop against a `ConditionSource` seam, a pure `Ok→Pending→Triggered` state machine per (rule, series), SQLite-backed rules/channels/incidents, and generic-JSON webhook delivery (optional HMAC). See [`subsystems/alerts.md`](subsystems/alerts.md). | trait **`ConditionSource`**, **`AlertStore`**; `state::apply`, `scheduler::run`, `notify::WebhookNotifier` |
 
 > **Trait seams vs. structs — get the names right.** The real trait boundaries are `Wal`,
 > `UptimeStore`, and the photon-api seams `RumSink`/`RumAppStore`/`UserStore`/`UsageStore`/
@@ -208,6 +214,12 @@ Handlers live in `crates/photon-api/src/*.rs`; the aggregation logic they call l
   /api/rum/apps/:name/rotate-key` (mint a fresh key), `DELETE /api/rum/apps/:name` (unregister).
 - **Uptime:** `GET/POST /api/monitors`, `GET/PATCH/DELETE /api/monitors/:id`,
   `POST /api/monitors/:id/pause|resume`, `GET /api/monitors/:id/heartbeats|incidents`.
+- **Alerts:** `GET/POST /api/alerts/rules`, `GET/PATCH/DELETE /api/alerts/rules/:id`,
+  `POST /api/alerts/rules/:id/test` (evaluate a saved rule now), `POST /api/alerts/preview`
+  (dry-run a draft condition), `GET/POST /api/alerts/channels`,
+  `GET/PATCH/DELETE /api/alerts/channels/:id`, `POST /api/alerts/channels/:id/test` (send a sample
+  webhook), `GET /api/alerts/incidents` (`?status=triggered|resolved&rule_id=&limit=`) — see
+  [`subsystems/alerts.md`](subsystems/alerts.md).
 - **Data / usage / retention:** `GET /api/storage`, `GET /api/usage/series`, `GET/PUT /api/retention`,
   `POST /api/data/purge`.
 - **Auth / users:** `POST /api/logout`, `GET/POST /api/users`, `DELETE /api/users/:username`.

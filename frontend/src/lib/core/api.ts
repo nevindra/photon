@@ -41,6 +41,20 @@ import {
   mockInfraHosts,
   mockInfraHost,
   mockInfraHostSeries,
+  mockAlertRules,
+  mockAlertRule,
+  mockCreateAlertRule,
+  mockUpdateAlertRule,
+  mockDeleteAlertRule,
+  mockTestAlertRule,
+  mockAlertPreview,
+  mockAlertChannels,
+  mockAlertChannel,
+  mockCreateAlertChannel,
+  mockUpdateAlertChannel,
+  mockDeleteAlertChannel,
+  mockTestAlertChannel,
+  mockAlertIncidents,
 } from '@/lib/core/mock'
 
 // ---------------------------------------------------------------------------
@@ -588,6 +602,137 @@ export interface InfraHostDetail {
 export interface InfraSeriesResult {
   resource: string
   series: MetricSeries[]
+}
+
+// --- Alerts (webhook alert & notification engine) ---
+// Field names/shapes mirror docs/superpowers/specs/2026-07-18-webhook-alert-notifications-design.md
+// §5 (data model) and §5.1 (per-signal `condition` JSON) exactly — the backend (not yet built)
+// is expected to match this contract.
+export type AlertSignal = 'metrics' | 'logs' | 'traces' | 'rum'
+export type AlertCmp = 'gt' | 'gte' | 'lt' | 'lte'
+export type AlertSeverity = 'info' | 'warning' | 'critical'
+
+export interface MetricsCondition {
+  signal: 'metrics'
+  metric_name: string
+  label_filters?: Record<string, string>
+  group_by?: string[]
+  agg: 'avg' | 'min' | 'max' | 'sum' | 'last' | 'p50' | 'p90' | 'p95' | 'p99' | 'rate' | 'increase'
+  window_secs: number
+  cmp: AlertCmp
+  threshold: number
+}
+export interface LogsCondition {
+  signal: 'logs'
+  query: string
+  group_by?: string | null
+  window_secs: number
+  cmp: AlertCmp
+  threshold: number
+}
+export interface TracesCondition {
+  signal: 'traces'
+  service: string
+  operation?: string | null
+  kind: 'error_rate' | 'latency_p50' | 'latency_p90' | 'latency_p95' | 'latency_p99' | 'request_rate'
+  window_secs: number
+  cmp: AlertCmp
+  threshold: number
+}
+export interface RumCondition {
+  signal: 'rum'
+  app_id: string
+  route?: string | null
+  kind: 'vital_lcp_p75' | 'vital_inp_p75' | 'vital_cls_p75' | 'vital_fcp_p75' | 'vital_ttfb_p75' | 'error_count'
+  window_secs: number
+  cmp: AlertCmp
+  threshold: number
+}
+// Discriminated on `signal`, matching the Rust `#[serde(tag = "signal")] enum Condition`.
+export type AlertCondition = MetricsCondition | LogsCondition | TracesCondition | RumCondition
+
+export interface AlertRule {
+  id: string
+  name: string
+  description: string | null
+  enabled: boolean
+  signal: AlertSignal
+  condition: AlertCondition
+  for_secs: number
+  interval_secs: number
+  severity: AlertSeverity
+  channel_ids: string[]
+  created_at: number
+  updated_at: number
+}
+// Editable rule payload for create/update (form body — all optional so the same type covers both
+// a full create submit and a partial PATCH, e.g. the enable/pause toggle sending only `enabled`).
+export interface AlertRuleInput {
+  name?: string
+  description?: string | null
+  enabled?: boolean
+  signal?: AlertSignal
+  condition?: AlertCondition
+  for_secs?: number
+  interval_secs?: number
+  severity?: AlertSeverity
+  channel_ids?: string[]
+}
+
+export interface AlertChannel {
+  id: string
+  name: string
+  kind: string // 'webhook' — the only value in v1
+  url: string
+  secret: string | null
+  headers: Record<string, string> | null
+  created_at: number
+  updated_at: number
+}
+export interface AlertChannelInput {
+  name?: string
+  kind?: string
+  url?: string
+  secret?: string | null
+  headers?: Record<string, string> | null
+}
+
+export interface AlertIncident {
+  id: number
+  rule_id: string
+  series_key: string
+  started_at: number
+  ended_at: number | null
+  peak_value: number
+  severity: AlertSeverity
+  summary: string
+}
+export interface AlertIncidentsFilter {
+  status?: 'triggered' | 'resolved'
+  rule_id?: string
+  limit?: number
+}
+
+// One series' current value from a condition evaluation — powers the "will trigger on N series
+// now" live preview in the create/edit dialog (`POST /api/alerts/preview`) and the saved-rule test
+// action (`POST /api/alerts/rules/:id/test`).
+export interface AlertPreviewSeries {
+  series_key: Record<string, string>
+  value: number
+  breaching: boolean
+}
+export interface AlertPreviewResult {
+  series: AlertPreviewSeries[]
+}
+
+export interface AlertRuleResult extends MutationResult {
+  rule?: AlertRule
+}
+export interface AlertChannelResult extends MutationResult {
+  channel?: AlertChannel
+}
+export interface AlertTestRuleResult extends MutationResult {
+  series?: AlertPreviewSeries[]
 }
 
 // The per-signal grain of a live-tail stream (matches the search path it merges into).
@@ -1375,6 +1520,189 @@ export const api = {
       if (e.status === 400) throw e
       api.mock = true
       return mockInfraHostSeries(host, resource, startNs, endNs) as InfraSeriesResult
+    }
+  },
+
+  // --- Alerts (webhook alert & notification engine) ---
+  // Every mutating method here returns the non-throwing `{ ok, error }` contract (mirrors
+  // `rum*App`/`setRetention`/`purgeData`) rather than the throw-and-let-`onError`-catch pattern
+  // `createMonitor`/`updateMonitor` use — the alertsQueries.ts mutations depend on this to never
+  // reject. Reads (`alertRules`/`getAlertRule`/`alertChannels`/`getAlertChannel`/`alertIncidents`)
+  // follow the usual read-then-mock-fallback shape used by `listMonitors`/`getMonitor`.
+
+  async alertRules(opts: RequestOpts = {}): Promise<AlertRule[]> {
+    try {
+      return await http.get('alerts/rules', { signal: opts.signal }).json<AlertRule[]>()
+    } catch {
+      api.mock = true
+      return mockAlertRules() as AlertRule[]
+    }
+  },
+
+  async getAlertRule(id: string, opts: RequestOpts = {}): Promise<AlertRule> {
+    try {
+      return await http.get(`alerts/rules/${encodeURIComponent(id)}`, { signal: opts.signal }).json<AlertRule>()
+    } catch (e: any) {
+      if (e.status === 404) throw e // real "rule not found" — surface it, don't mock
+      api.mock = true
+      const r = mockAlertRule(id)
+      if (!r) { const err = new Error('rule not found') as ApiError; err.status = 404; throw err }
+      return r as AlertRule
+    }
+  },
+
+  async createAlertRule(input: AlertRuleInput, opts: RequestOpts = {}): Promise<AlertRuleResult> {
+    try {
+      const rule = await http.post('alerts/rules', { json: input, signal: opts.signal }).json<AlertRule>()
+      return { ok: true, rule }
+    } catch (e: any) {
+      if (e.status === 400 || e.status === 409) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockCreateAlertRule(input) as AlertRuleResult
+    }
+  },
+
+  async updateAlertRule(id: string, input: AlertRuleInput, opts: RequestOpts = {}): Promise<AlertRuleResult> {
+    try {
+      const rule = await http
+        .patch(`alerts/rules/${encodeURIComponent(id)}`, { json: input, signal: opts.signal })
+        .json<AlertRule>()
+      return { ok: true, rule }
+    } catch (e: any) {
+      if (e.status === 400 || e.status === 404) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockUpdateAlertRule(id, input) as AlertRuleResult
+    }
+  },
+
+  async deleteAlertRule(id: string, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.delete(`alerts/rules/${encodeURIComponent(id)}`, { signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      if (e.status === 404) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockDeleteAlertRule(id) as MutationResult
+    }
+  },
+
+  // No dedicated pause/resume route like monitors — toggling a rule is a PATCH of just `enabled`.
+  async toggleAlertRule(id: string, enabled: boolean, opts: RequestOpts = {}): Promise<AlertRuleResult> {
+    try {
+      const rule = await http
+        .patch(`alerts/rules/${encodeURIComponent(id)}`, { json: { enabled }, signal: opts.signal })
+        .json<AlertRule>()
+      return { ok: true, rule }
+    } catch (e: any) {
+      if (e.status === 400 || e.status === 404) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockUpdateAlertRule(id, { enabled }) as AlertRuleResult
+    }
+  },
+
+  async testAlertRule(id: string, opts: RequestOpts = {}): Promise<AlertTestRuleResult> {
+    try {
+      const res = await http
+        .post(`alerts/rules/${encodeURIComponent(id)}/test`, { signal: opts.signal })
+        .json<AlertPreviewResult>()
+      return { ok: true, series: res.series }
+    } catch (e: any) {
+      if (e.status === 404) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockTestAlertRule(id) as AlertTestRuleResult
+    }
+  },
+
+  // Dry-run a draft condition → current series+values. Used as a live QUERY (usePreview), not a
+  // mutation: an invalid draft condition (400, e.g. mid-edit) is surfaced so the dialog can render
+  // it, not swallowed into a mock success.
+  async alertPreview(condition: AlertCondition, opts: RequestOpts = {}): Promise<AlertPreviewResult> {
+    try {
+      return await http.post('alerts/preview', { json: condition, signal: opts.signal }).json<AlertPreviewResult>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      api.mock = true
+      return mockAlertPreview(condition) as AlertPreviewResult
+    }
+  },
+
+  async alertChannels(opts: RequestOpts = {}): Promise<AlertChannel[]> {
+    try {
+      return await http.get('alerts/channels', { signal: opts.signal }).json<AlertChannel[]>()
+    } catch {
+      api.mock = true
+      return mockAlertChannels() as AlertChannel[]
+    }
+  },
+
+  async getAlertChannel(id: string, opts: RequestOpts = {}): Promise<AlertChannel> {
+    try {
+      return await http.get(`alerts/channels/${encodeURIComponent(id)}`, { signal: opts.signal }).json<AlertChannel>()
+    } catch (e: any) {
+      if (e.status === 404) throw e
+      api.mock = true
+      const c = mockAlertChannel(id)
+      if (!c) { const err = new Error('channel not found') as ApiError; err.status = 404; throw err }
+      return c as AlertChannel
+    }
+  },
+
+  async createAlertChannel(input: AlertChannelInput, opts: RequestOpts = {}): Promise<AlertChannelResult> {
+    try {
+      const channel = await http.post('alerts/channels', { json: input, signal: opts.signal }).json<AlertChannel>()
+      return { ok: true, channel }
+    } catch (e: any) {
+      if (e.status === 400 || e.status === 409) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockCreateAlertChannel(input) as AlertChannelResult
+    }
+  },
+
+  async updateAlertChannel(id: string, input: AlertChannelInput, opts: RequestOpts = {}): Promise<AlertChannelResult> {
+    try {
+      const channel = await http
+        .patch(`alerts/channels/${encodeURIComponent(id)}`, { json: input, signal: opts.signal })
+        .json<AlertChannel>()
+      return { ok: true, channel }
+    } catch (e: any) {
+      if (e.status === 400 || e.status === 404) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockUpdateAlertChannel(id, input) as AlertChannelResult
+    }
+  },
+
+  async deleteAlertChannel(id: string, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.delete(`alerts/channels/${encodeURIComponent(id)}`, { signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      if (e.status === 404) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockDeleteAlertChannel(id) as MutationResult
+    }
+  },
+
+  async testAlertChannel(id: string, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.post(`alerts/channels/${encodeURIComponent(id)}/test`, { signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      if (e.status === 404) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockTestAlertChannel(id) as MutationResult
+    }
+  },
+
+  async alertIncidents(filters: AlertIncidentsFilter = {}, opts: RequestOpts = {}): Promise<AlertIncident[]> {
+    const searchParams: Record<string, string | number> = {}
+    if (filters.status) searchParams.status = filters.status
+    if (filters.rule_id) searchParams.rule_id = filters.rule_id
+    if (filters.limit) searchParams.limit = filters.limit
+    try {
+      return await http.get('alerts/incidents', { searchParams, signal: opts.signal }).json<AlertIncident[]>()
+    } catch {
+      api.mock = true
+      return mockAlertIncidents(filters) as AlertIncident[]
     }
   },
 }

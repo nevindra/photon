@@ -71,6 +71,7 @@ pub fn monitor_from_input(id: MonitorId, input: MonitorInput, now: i64) -> Monit
         ignore_tls: input.ignore_tls,
         follow_redirects: input.follow_redirects,
         webhook_url: input.webhook_url,
+        channel_ids: input.channel_ids,
         enabled: input.enabled,
         last_state: MonitorState::Pending,
         last_check_at: None,

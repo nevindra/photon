@@ -10,6 +10,7 @@ import {
   Waypoints,
   BarChart3,
   Database,
+  Bell,
   Settings,
   LogOut,
 } from 'lucide-vue-next'
@@ -69,7 +70,13 @@ const NAV_GROUPS = [
       { key: 'metrics', label: 'Metrics', icon: BarChart3, route: '/metrics' },
     ],
   },
-  { label: 'Manage', items: [{ key: 'data', label: 'Data', icon: Database, route: '/data' }] },
+  {
+    label: 'Manage',
+    items: [
+      { key: 'data', label: 'Data', icon: Database, route: '/data' },
+      { key: 'alerts', label: 'Alerts', icon: Bell, route: '/alerts' },
+    ],
+  },
 ]
 
 function onSelect(item) {

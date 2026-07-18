@@ -82,20 +82,25 @@ impl SqliteStore {
         )
         .map_err(err)?;
         conn.execute_batch(SCHEMA).map_err(err)?;
+        // Additive migration: monitors gained `channel_ids` (JSON array) for the alerts bridge.
+        // The `let _ =` swallows the "duplicate column" error on already-migrated DBs — the
+        // standard rusqlite additive-migration idiom.
+        let _ = conn.execute("ALTER TABLE monitors ADD COLUMN channel_ids TEXT", []);
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
     fn insert_monitor(conn: &Connection, m: &Monitor) -> Result<(), PhotonError> {
+        let channel_ids = serde_json::to_string(&m.channel_ids).map_err(err)?;
         conn.execute(
             "INSERT OR REPLACE INTO monitors (id,name,type,target,interval_secs,timeout_secs,retries,
-                http_method,expect_status,keyword,ignore_tls,follow_redirects,webhook_url,enabled,
+                http_method,expect_status,keyword,ignore_tls,follow_redirects,webhook_url,channel_ids,enabled,
                 last_state,last_check_at,last_latency_ms,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![m.id, m.name, type_to_str(m.check_type), m.target, m.interval_secs, m.timeout_secs, m.retries,
                 m.http_method, m.expect_status, m.keyword, m.ignore_tls as i64, m.follow_redirects as i64, m.webhook_url,
-                m.enabled as i64, state_to_str(m.last_state), m.last_check_at, m.last_latency_ms, m.created_at, m.updated_at],
+                channel_ids, m.enabled as i64, state_to_str(m.last_state), m.last_check_at, m.last_latency_ms, m.created_at, m.updated_at],
         ).map_err(err)?;
         Ok(())
     }
@@ -116,6 +121,11 @@ fn row_to_monitor(r: &Row) -> rusqlite::Result<Monitor> {
         ignore_tls: r.get::<_, i64>("ignore_tls")? != 0,
         follow_redirects: r.get::<_, i64>("follow_redirects")? != 0,
         webhook_url: r.get("webhook_url")?,
+        // NULL (pre-migration rows) or invalid JSON → empty list, conservatively.
+        channel_ids: r
+            .get::<_, Option<String>>("channel_ids")?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
         enabled: r.get::<_, i64>("enabled")? != 0,
         last_state: state_from_str(&r.get::<_, String>("last_state")?),
         last_check_at: r.get("last_check_at")?,

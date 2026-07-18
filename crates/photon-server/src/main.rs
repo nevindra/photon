@@ -20,6 +20,13 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// The alerts `ConditionSource` seam over the three query engines (wired into the scheduler in a
+/// later task). Kept as a module so it can carry its own tests without bloating `main`.
+mod alerts_source;
+/// Adapter that mirrors uptime up/down transitions onto the shared alerts store + channels while
+/// preserving the legacy per-monitor webhook. Kept as a module so it can carry its own tests.
+mod uptime_bridge;
+
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
@@ -390,9 +397,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         photon_api::users::SqliteUserStore::open(&cfg.storage.db_path)?,
     );
 
+    // Alerts subsystem: the always-on webhook alert engine. Its `ConditionSource` seam is the three
+    // read engines (all `Clone`, Arc-backed — see `alerts_source.rs`), so clone them here exactly
+    // like the usage sampler above; the originals still move into `ApiServer::new`. `spawn_alerts`
+    // opens the SQLite rule/channel store, launches the scheduler as a background task, and returns
+    // the `AlertsApi` (store + live-reload command channel + source) to hand to the API layer.
+    // Spawned before uptime so the uptime→alerts bridge can share the same `AlertStore`.
+    let alerts_source = Arc::new(alerts_source::EngineConditionSource {
+        logs: query.clone(),
+        spans: span_query.clone(),
+        metrics: metrics_query.clone(),
+    });
+    let alerts_api = spawn_alerts(&cfg.alerts, &cfg.storage.db_path, alerts_source)?;
+
     // Uptime monitoring is always on: the scheduler + prune tasks run and the uptime tables are
-    // opened in the shared control-plane SQLite. With no monitors configured it stays idle (no probes).
-    let uptime_api = spawn_uptime(&cfg.uptime, &cfg.storage.db_path, retention.clone())?;
+    // opened in the shared control-plane SQLite. With no monitors configured it stays idle (no
+    // probes). It shares the alerts store so a monitor going down/up also opens/closes a shared
+    // alert incident and delivers to its `channel_ids` (see `uptime_bridge`).
+    let uptime_api = spawn_uptime(
+        &cfg.uptime,
+        &cfg.storage.db_path,
+        retention.clone(),
+        alerts_api.store.clone(),
+    )?;
 
     // Data & retention admin handle: purge channels into the compactors, the live retention
     // atomics, and the persistence store. `uptime_enabled` gates the `uptime` retention key.
@@ -433,6 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cfg.auth.session_secret,
     )
     .with_uptime(Some(uptime_api))
+    .with_alerts(Some(alerts_api))
     .with_data_admin(Some(data_admin))
     .with_live_hub(live_hub)
     .with_usage(usage.clone(), repl_status.clone())
@@ -775,12 +803,17 @@ fn spawn_usage_sampler(
 }
 
 /// If `[uptime]` is configured, open the store, spawn the scheduler + an hourly retention
-/// prune, and return the `UptimeApi` to hand to the API layer.
+/// prune, and return the `UptimeApi` to hand to the API layer. `alert_store` is the shared alerts
+/// store: the scheduler's notifier is the `UptimeAlertBridge`, which keeps the legacy per-monitor
+/// webhook AND opens/closes a shared alert incident + delivers to `channel_ids` on each transition.
 fn spawn_uptime(
     cfg: &photon_core::config::UptimeConfig,
     db_path: &str,
     retention: Arc<RetentionAtomics>,
+    alert_store: Arc<dyn photon_alerts::store::AlertStore>,
 ) -> Result<photon_api::uptime::UptimeApi, Box<dyn std::error::Error>> {
+    use crate::uptime_bridge::UptimeAlertBridge;
+    use photon_alerts::notify::Notifier as AlertNotifier;
     use photon_api::uptime::UptimeApi;
     use photon_uptime::model::SchedulerCommand;
     use photon_uptime::notify::WebhookNotifier;
@@ -793,7 +826,15 @@ fn spawn_uptime(
     let store = Arc::new(SqliteStore::open(db_path)?);
     let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(256);
     let prober = Arc::new(NetworkProber::new());
-    let notifier = Arc::new(WebhookNotifier::new(cfg.webhook_url.clone()));
+    // The bridge wraps the legacy uptime webhook (per-monitor + `[uptime].webhook_url` global) and
+    // fans each transition out to the shared alerts store + channels.
+    let alerts_notifier: Arc<dyn AlertNotifier> =
+        Arc::new(photon_alerts::notify::WebhookNotifier::new());
+    let notifier = Arc::new(UptimeAlertBridge::new(
+        WebhookNotifier::new(cfg.webhook_url.clone()),
+        alert_store,
+        alerts_notifier,
+    ));
     let concurrency = cfg.worker_concurrency;
 
     {
@@ -826,6 +867,50 @@ fn spawn_uptime(
         store: store as Arc<dyn photon_uptime::store::UptimeStore>,
         cmd_tx,
         retention_days: cfg.retention_days,
+    })
+}
+
+/// Open the alerts rule/channel store, spawn the evaluation scheduler as a background task, and
+/// return the `AlertsApi` (store + the scheduler's live-reload command channel + the
+/// `ConditionSource` seam) to hand to the API layer. Mirrors [`spawn_uptime`]. The alerts engine
+/// is always on; with no rules configured the scheduler simply idles. `source` is the three read
+/// engines behind the `ConditionSource` seam, built by the caller from engine clones.
+///
+/// Generic over the concrete `C`: the scheduler's `run<S, C, N>` takes `Arc<C>` with an implicit
+/// `C: Sized` bound, so it cannot accept an `Arc<dyn ConditionSource>` trait object directly. We
+/// therefore take the concrete `Arc<C>`, hand a clone to the scheduler (`C` stays sized), and
+/// unsize the same `Arc` into the `Arc<dyn ConditionSource>` the `AlertsApi` (and API handlers)
+/// need — one source, shared by both.
+fn spawn_alerts<C: photon_alerts::source::ConditionSource>(
+    cfg: &photon_core::config::AlertsConfig,
+    db_path: &str,
+    source: Arc<C>,
+) -> Result<photon_api::alerts::AlertsApi, Box<dyn std::error::Error>> {
+    use photon_alerts::model::SchedulerCommand;
+    use photon_alerts::notify::WebhookNotifier;
+    use photon_alerts::scheduler;
+    use photon_alerts::source::ConditionSource;
+    use photon_alerts::store::sqlite::SqliteAlertStore;
+    use photon_alerts::store::AlertStore;
+    use tokio::sync::mpsc;
+
+    let store = Arc::new(SqliteAlertStore::open(db_path)?);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(256);
+    let notifier = Arc::new(WebhookNotifier::new());
+    let concurrency = cfg.worker_concurrency;
+
+    {
+        let store = store.clone();
+        let source = source.clone();
+        tokio::spawn(async move {
+            scheduler::run(store, source, notifier, cmd_rx, concurrency).await;
+        });
+    }
+
+    Ok(photon_api::alerts::AlertsApi {
+        store: store as Arc<dyn AlertStore>,
+        cmd_tx,
+        source: source as Arc<dyn ConditionSource>,
     })
 }
 
