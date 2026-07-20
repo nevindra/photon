@@ -25,7 +25,7 @@ fn json_err(e: serde_json::Error) -> rusqlite::Error {
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS alert_channels (
   id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
-  url TEXT NOT NULL, secret TEXT, headers TEXT, created_at INTEGER, updated_at INTEGER);
+  url TEXT NOT NULL, secret TEXT, headers TEXT, config TEXT, created_at INTEGER, updated_at INTEGER);
 CREATE TABLE IF NOT EXISTS alert_rules (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, enabled INTEGER NOT NULL,
   signal TEXT NOT NULL, condition TEXT NOT NULL, for_secs INTEGER NOT NULL,
@@ -55,10 +55,9 @@ fn severity_from_str(s: &str) -> Severity {
 fn kind_to_str(k: ChannelKind) -> &'static str {
     match k {
         ChannelKind::Webhook => "webhook",
+        ChannelKind::Discord => "discord",
+        ChannelKind::Telegram => "telegram",
     }
-}
-fn kind_from_str(_s: &str) -> ChannelKind {
-    ChannelKind::Webhook
 }
 
 impl SqliteAlertStore {
@@ -77,22 +76,43 @@ impl SqliteAlertStore {
         )
         .map_err(err)?;
         conn.execute_batch(SCHEMA).map_err(err)?;
+        // Additive migration for pre-existing DBs (the `let _ =` swallows the duplicate-column
+        // error on already-migrated DBs — the standard rusqlite idiom, mirrors photon-uptime).
+        let _ = conn.execute("ALTER TABLE alert_channels ADD COLUMN config TEXT", []);
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
     fn insert_channel(conn: &Connection, ch: &Channel) -> Result<(), PhotonError> {
-        let headers = ch
-            .headers
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(err)?;
+        let config = serde_json::to_string(&ch.config).map_err(err)?;
+        // Keep the legacy columns populated for display/back-compat: `url` = the effective POST
+        // endpoint; `secret`/`headers` only meaningful for the Generic kind.
+        let (url, secret, headers) = match &ch.config {
+            ChannelConfig::Webhook {
+                url,
+                secret,
+                headers,
+            } => (
+                url.clone(),
+                secret.clone(),
+                headers
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(err)?,
+            ),
+            ChannelConfig::Discord { webhook_url } => (webhook_url.clone(), None, None),
+            ChannelConfig::Telegram { bot_token, .. } => (
+                format!("https://api.telegram.org/bot{bot_token}/sendMessage"),
+                None,
+                None,
+            ),
+        };
         conn.execute(
-            "INSERT OR REPLACE INTO alert_channels (id,name,kind,url,secret,headers,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![ch.id, ch.name, kind_to_str(ch.kind), ch.url, ch.secret, headers, ch.created_at, ch.updated_at],
+            "INSERT OR REPLACE INTO alert_channels (id,name,kind,url,secret,headers,config,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![ch.id, ch.name, kind_to_str(ch.kind), url, secret, headers, config, ch.created_at, ch.updated_at],
         ).map_err(err)?;
         Ok(())
     }
@@ -112,18 +132,29 @@ impl SqliteAlertStore {
 }
 
 fn row_to_channel(row: &Row) -> rusqlite::Result<Channel> {
-    let headers: Option<String> = row.get("headers")?;
-    let headers = headers
-        .map(|h| serde_json::from_str(&h))
-        .transpose()
-        .map_err(json_err)?;
+    // `config` is the source of truth; a NULL `config` means a pre-migration row → synthesize a
+    // Webhook config from the legacy `url`/`secret`/`headers` columns.
+    let config_json: Option<String> = row.get("config")?;
+    let config = match config_json {
+        Some(j) => serde_json::from_str(&j).map_err(json_err)?,
+        None => {
+            let headers: Option<String> = row.get("headers")?;
+            let headers = headers
+                .map(|h| serde_json::from_str(&h))
+                .transpose()
+                .map_err(json_err)?;
+            ChannelConfig::Webhook {
+                url: row.get("url")?,
+                secret: row.get("secret")?,
+                headers,
+            }
+        }
+    };
     Ok(Channel {
         id: row.get("id")?,
         name: row.get("name")?,
-        kind: kind_from_str(&row.get::<_, String>("kind")?),
-        url: row.get("url")?,
-        secret: row.get("secret")?,
-        headers,
+        kind: config.kind(),
+        config,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -191,10 +222,8 @@ impl AlertStore for SqliteAlertStore {
         let ch = Channel {
             id: gen_id("ch"),
             name: input.name,
-            kind: input.kind,
-            url: input.url,
-            secret: input.secret,
-            headers: input.headers,
+            kind: input.config.kind(),
+            config: input.config,
             created_at: now,
             updated_at: now,
         };
@@ -221,10 +250,8 @@ impl AlertStore for SqliteAlertStore {
         let ch = Channel {
             id: id.to_string(),
             name: input.name,
-            kind: input.kind,
-            url: input.url,
-            secret: input.secret,
-            headers: input.headers,
+            kind: input.config.kind(),
+            config: input.config,
             created_at: existing.created_at,
             updated_at: now_ms(),
         };
@@ -523,36 +550,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_crud_roundtrips() {
+    async fn channel_crud_roundtrips_all_kinds() {
         let s = SqliteAlertStore::open(&tmp()).unwrap();
-        let input = ChannelInput {
-            name: "ops".into(),
-            kind: ChannelKind::Webhook,
-            url: "http://x".into(),
-            secret: Some("shh".into()),
-            headers: Some(serde_json::json!({"Authorization": "Bearer x"})),
-        };
-        let ch = s.create_channel(input).await.unwrap();
-        assert_eq!(s.list_channels().await.unwrap().len(), 1);
-        let got = s.get_channel(&ch.id).await.unwrap().unwrap();
-        assert_eq!(
-            got.headers,
-            Some(serde_json::json!({"Authorization": "Bearer x"}))
-        );
+        let discord = s
+            .create_channel(ChannelInput {
+                name: "discord-ops".into(),
+                config: ChannelConfig::Discord {
+                    webhook_url: "https://discord.com/api/webhooks/1/abc".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(discord.kind, ChannelKind::Discord);
+        let got = s.get_channel(&discord.id).await.unwrap().unwrap();
+        assert!(matches!(got.config, ChannelConfig::Discord { .. }));
 
-        let update = ChannelInput {
-            name: "ops-renamed".into(),
-            kind: ChannelKind::Webhook,
-            url: "http://y".into(),
-            secret: None,
-            headers: None,
-        };
-        let updated = s.update_channel(&ch.id, update).await.unwrap().unwrap();
-        assert_eq!(updated.name, "ops-renamed");
-        assert_eq!(updated.created_at, ch.created_at);
+        let tg = s
+            .create_channel(ChannelInput {
+                name: "tg".into(),
+                config: ChannelConfig::Telegram {
+                    bot_token: "1:x".into(),
+                    chat_id: "9".into(),
+                },
+            })
+            .await
+            .unwrap();
+        let got = s.get_channel(&tg.id).await.unwrap().unwrap();
+        assert!(matches!(got.config, ChannelConfig::Telegram { .. }));
+        assert!(s.delete_channel(&tg.id).await.unwrap());
+    }
 
-        assert!(s.delete_channel(&ch.id).await.unwrap());
-        assert!(s.list_channels().await.unwrap().is_empty());
+    #[tokio::test]
+    async fn legacy_channel_row_without_config_loads_as_webhook() {
+        let path = tmp();
+        let s = SqliteAlertStore::open(&path).unwrap();
+        // Simulate a pre-migration row: kind='webhook', url/secret/headers set, config NULL.
+        {
+            let c = s.conn.lock().unwrap();
+            c.execute(
+                "INSERT INTO alert_channels (id,name,kind,url,secret,headers,created_at,updated_at)
+                 VALUES ('c-old','old','webhook','https://legacy/hook','shh','{\"X-A\":\"1\"}',1,1)",
+                [],
+            )
+            .unwrap();
+        }
+        let got = s.get_channel("c-old").await.unwrap().unwrap();
+        match got.config {
+            ChannelConfig::Webhook {
+                url,
+                secret,
+                headers,
+            } => {
+                assert_eq!(url, "https://legacy/hook");
+                assert_eq!(secret.as_deref(), Some("shh"));
+                assert_eq!(headers, Some(serde_json::json!({"X-A": "1"})));
+            }
+            _ => panic!("legacy row must decode as Webhook"),
+        }
+        assert_eq!(got.kind, ChannelKind::Webhook);
     }
 
     #[tokio::test]

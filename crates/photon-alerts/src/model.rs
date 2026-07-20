@@ -1,4 +1,5 @@
 //! Pure domain types for the alerts vertical. No I/O. All timestamps are Unix ms.
+use photon_core::PhotonError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,20 +18,44 @@ pub type ChannelId = String;
 #[serde(rename_all = "lowercase")]
 pub enum ChannelKind {
     Webhook,
+    Discord,
+    Telegram,
+}
+
+/// Per-preset delivery config. The tag (`type`) doubles as the channel kind.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ChannelConfig {
+    /// Generic JSON webhook: the original v1 behavior. HMAC `secret` + custom `headers` live ONLY here.
+    Webhook {
+        url: String,
+        #[serde(default)]
+        secret: Option<String>,
+        #[serde(default)]
+        headers: Option<serde_json::Value>,
+    },
+    /// Discord incoming webhook — one URL; Photon POSTs an embed.
+    Discord { webhook_url: String },
+    /// Telegram Bot API — token + chat; Photon POSTs to `…/bot<token>/sendMessage`.
+    Telegram { bot_token: String, chat_id: String },
+}
+impl ChannelConfig {
+    pub fn kind(&self) -> ChannelKind {
+        match self {
+            ChannelConfig::Webhook { .. } => ChannelKind::Webhook,
+            ChannelConfig::Discord { .. } => ChannelKind::Discord,
+            ChannelConfig::Telegram { .. } => ChannelKind::Telegram,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Channel {
     pub id: ChannelId,
     pub name: String,
-    #[serde(rename = "type")]
+    /// Derived from `config` on construction; carried for the UI's convenience.
     pub kind: ChannelKind,
-    pub url: String,
-    #[serde(default)]
-    pub secret: Option<String>,
-    /// Extra request headers as a JSON object, e.g. `{"Authorization":"Bearer x"}`.
-    #[serde(default)]
-    pub headers: Option<serde_json::Value>,
+    pub config: ChannelConfig,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -42,17 +67,71 @@ fn default_true() -> bool {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ChannelInput {
     pub name: String,
-    #[serde(rename = "type", default = "ChannelInput::default_kind")]
-    pub kind: ChannelKind,
-    pub url: String,
-    #[serde(default)]
-    pub secret: Option<String>,
-    #[serde(default)]
-    pub headers: Option<serde_json::Value>,
+    pub config: ChannelConfig,
 }
 impl ChannelInput {
-    fn default_kind() -> ChannelKind {
-        ChannelKind::Webhook
+    /// Shape-validate the preset inputs. Discord is host-locked to Discord's own hosts (turning it
+    /// SSRF-free); Telegram's endpoint is server-constructed (also SSRF-free); Generic is the only
+    /// SSRF-bearing kind. Pure — no network.
+    pub fn validate(&self) -> Result<(), PhotonError> {
+        if self.name.trim().is_empty() {
+            return Err(PhotonError::Alerts("channel name is required".into()));
+        }
+        match &self.config {
+            ChannelConfig::Webhook { url, .. } => {
+                if !is_http_url(url) {
+                    return Err(PhotonError::Alerts("webhook url must be http(s)".into()));
+                }
+            }
+            ChannelConfig::Discord { webhook_url } => {
+                if !discord_host_ok(webhook_url) {
+                    return Err(PhotonError::Alerts(
+                        "Discord webhook URL must be an https discord.com / discordapp.com URL"
+                            .into(),
+                    ));
+                }
+            }
+            ChannelConfig::Telegram { bot_token, chat_id } => {
+                if !telegram_token_ok(bot_token) {
+                    return Err(PhotonError::Alerts(
+                        "Telegram bot token must look like <digits>:<token>".into(),
+                    ));
+                }
+                if chat_id.trim().is_empty() {
+                    return Err(PhotonError::Alerts("Telegram chat id is required".into()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `true` for a non-empty `http://`/`https://` URL.
+fn is_http_url(u: &str) -> bool {
+    (u.starts_with("https://") || u.starts_with("http://")) && u.len() > "https://".len()
+}
+
+/// Host-lock a Discord webhook URL to Discord's own hosts (no dep — hand-parse the authority).
+fn discord_host_ok(u: &str) -> bool {
+    let Some(rest) = u.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.split('@').next_back().unwrap_or(""); // drop any userinfo
+    let host = host.split(':').next().unwrap_or(""); // drop any port
+    matches!(
+        host,
+        "discord.com" | "discordapp.com" | "ptb.discord.com" | "canary.discord.com"
+    )
+}
+
+/// `true` when `t` looks like `<digits>:<non-empty>` (Telegram bot token shape).
+fn telegram_token_ok(t: &str) -> bool {
+    match t.split_once(':') {
+        Some((id, secret)) => {
+            !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) && !secret.is_empty()
+        }
+        None => false,
     }
 }
 
@@ -397,5 +476,67 @@ mod tests {
         let c: Condition = serde_json::from_str(j).unwrap();
         assert_eq!(c.signal(), "metrics");
         assert_eq!(c.threshold(), 0.9);
+    }
+
+    #[test]
+    fn channel_config_roundtrips_and_derives_kind() {
+        let d: ChannelConfig = serde_json::from_str(
+            r#"{"type":"discord","webhook_url":"https://discord.com/api/webhooks/1/abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(d.kind(), ChannelKind::Discord);
+        let t: ChannelConfig =
+            serde_json::from_str(r#"{"type":"telegram","bot_token":"123:abc","chat_id":"-100"}"#)
+                .unwrap();
+        assert_eq!(t.kind(), ChannelKind::Telegram);
+        // Generic webhook secret/headers are optional.
+        let w: ChannelConfig =
+            serde_json::from_str(r#"{"type":"webhook","url":"https://x"}"#).unwrap();
+        assert_eq!(w.kind(), ChannelKind::Webhook);
+    }
+
+    #[test]
+    fn validate_rejects_bad_preset_inputs() {
+        let bad_discord = ChannelInput {
+            name: "d".into(),
+            config: ChannelConfig::Discord {
+                webhook_url: "https://evil.example.com/x".into(),
+            },
+        };
+        assert!(bad_discord.validate().is_err());
+        let ok_discord = ChannelInput {
+            name: "d".into(),
+            config: ChannelConfig::Discord {
+                webhook_url: "https://discord.com/api/webhooks/1/abc".into(),
+            },
+        };
+        assert!(ok_discord.validate().is_ok());
+
+        let bad_tg = ChannelInput {
+            name: "t".into(),
+            config: ChannelConfig::Telegram {
+                bot_token: "not-a-token".into(),
+                chat_id: "1".into(),
+            },
+        };
+        assert!(bad_tg.validate().is_err());
+        let ok_tg = ChannelInput {
+            name: "t".into(),
+            config: ChannelConfig::Telegram {
+                bot_token: "123456:AAbbCC-_".into(),
+                chat_id: "-100123".into(),
+            },
+        };
+        assert!(ok_tg.validate().is_ok());
+
+        let empty_name = ChannelInput {
+            name: "  ".into(),
+            config: ChannelConfig::Webhook {
+                url: "https://x".into(),
+                secret: None,
+                headers: None,
+            },
+        };
+        assert!(empty_name.validate().is_err());
     }
 }

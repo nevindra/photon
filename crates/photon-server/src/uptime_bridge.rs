@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use photon_alerts::format::AlertEvent;
 use photon_alerts::model::Severity;
 use photon_alerts::notify::{Notifier as AlertNotifier, NotifyStatus};
 use photon_alerts::store::AlertStore;
@@ -56,40 +57,34 @@ impl UptimeAlertBridge {
     }
 }
 
-/// Build the alert webhook payload for one uptime transition. Mirrors the shape of
-/// `photon_alerts::notify::build_payload` (status / rule / series / condition / value / …) so an
-/// uptime alert and a metric/log/trace alert look the same to a downstream webhook receiver.
-fn build_payload(
-    monitor: &Monitor,
-    status: NotifyStatus,
-    at: i64,
-    incident_id: i64,
-    error: Option<&str>,
-) -> serde_json::Value {
-    let status_str = match status {
-        NotifyStatus::Triggered => "triggered",
-        NotifyStatus::Resolved => "resolved",
-    };
-    serde_json::json!({
-        "status": status_str,
-        "rule": {
-            "id": UptimeAlertBridge::rule_id(monitor),
-            "name": monitor.name,
-            "severity": UPTIME_SEVERITY,
-            "signal": "uptime",
-        },
-        "series": {
+/// Build the shared `AlertEvent` for one uptime transition. Using the same event type as
+/// metric/log/trace alerts means an uptime alert renders identically through every channel preset
+/// (Generic webhook / Discord / Telegram). The unified event has no uptime-specific `error` field —
+/// the failure reason lives on the incident, not the delivered payload — so uptime webhooks now
+/// carry the same fields as every other alert.
+fn build_event(monitor: &Monitor, status: NotifyStatus, at: i64, incident_id: i64) -> AlertEvent {
+    AlertEvent {
+        rule_id: UptimeAlertBridge::rule_id(monitor),
+        rule_name: monitor.name.clone(),
+        severity: UPTIME_SEVERITY,
+        signal: "uptime".to_string(),
+        condition_summary: format!("{} down", monitor.name),
+        labels: serde_json::json!({
             "monitor.id": monitor.id,
             "monitor.name": monitor.name,
             "target": monitor.target,
+        }),
+        status,
+        value: if matches!(status, NotifyStatus::Triggered) {
+            1.0
+        } else {
+            0.0
         },
-        "condition": format!("{} down", monitor.name),
-        "value": if matches!(status, NotifyStatus::Triggered) { 1.0 } else { 0.0 },
-        "threshold": 1.0,
-        "at": at,
-        "incident_id": incident_id,
-        "error": error,
-    })
+        threshold: 1.0,
+        started_at: at,
+        at,
+        incident_id,
+    }
 }
 
 #[async_trait]
@@ -129,10 +124,10 @@ impl Notifier for UptimeAlertBridge {
         if monitor.channel_ids.is_empty() {
             return Ok(());
         }
-        let payload = build_payload(monitor, status, at, incident_id, ev.result.error.as_deref());
+        let event = build_event(monitor, status, at, incident_id);
         for cid in &monitor.channel_ids {
             match self.store.get_channel(cid).await {
-                Ok(Some(ch)) => self.alerts_notifier.deliver(&ch, payload.clone()).await,
+                Ok(Some(ch)) => self.alerts_notifier.deliver(&ch, event.clone()).await,
                 Ok(None) => {} // channel deleted since the monitor referenced it — skip.
                 Err(e) => eprintln!("uptime->alerts: channel {cid} lookup failed: {e}"),
             }
@@ -183,16 +178,18 @@ mod tests {
     }
 
     #[test]
-    fn payload_mirrors_alerts_shape() {
+    fn event_mirrors_alerts_shape() {
         let m = monitor(vec![]);
-        let p = build_payload(&m, NotifyStatus::Triggered, 2000, 7, Some("boom"));
+        let ev = build_event(&m, NotifyStatus::Triggered, 2000, 7);
+        // Render it through the shared generic-webhook formatter and assert the wire shape matches
+        // a metric/log/trace alert (uptime alerts must be indistinguishable to a webhook receiver).
+        let p = photon_alerts::format::build_generic_payload(&ev);
         assert_eq!(p["status"], "triggered");
         assert_eq!(p["rule"]["id"], "uptime:m1");
         assert_eq!(p["rule"]["signal"], "uptime");
         assert_eq!(p["rule"]["severity"], "critical");
         assert_eq!(p["series"]["target"], "https://x.test");
         assert_eq!(p["incident_id"], 7);
-        assert_eq!(p["error"], "boom");
     }
 
     #[tokio::test]
@@ -251,7 +248,7 @@ mod tests {
         let ch = store
             .create_channel(
                 serde_json::from_value::<ChannelInput>(serde_json::json!({
-                    "name": "ops", "type": "webhook", "url": "http://x"
+                    "name": "ops", "config": { "type": "webhook", "url": "http://x" }
                 }))
                 .unwrap(),
             )

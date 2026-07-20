@@ -1,45 +1,25 @@
-//! Alert delivery. v1 = a generic JSON webhook per channel, optional HMAC-SHA256 signature and
-//! custom headers. Delivery is detached, retried ≤3×, non-fatal — never blocks the eval loop.
-use crate::model::{Channel, Rule};
+//! Alert delivery. Renders each alert into its channel's provider-native request (`format::render`)
+//! then POSTs it. `deliver` is fire-and-forget (detached, retried ≤3×, non-fatal); `deliver_once`
+//! is a single awaited POST used by the synchronous channel-test route.
+use crate::format::{render, AlertEvent};
+use crate::model::Channel;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::Duration;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum NotifyStatus {
     Triggered,
     Resolved,
 }
 impl NotifyStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             NotifyStatus::Triggered => "triggered",
             NotifyStatus::Resolved => "resolved",
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_payload(
-    rule: &Rule,
-    labels: &serde_json::Value,
-    status: NotifyStatus,
-    value: f64,
-    threshold: f64,
-    started_at: i64,
-    at: i64,
-    incident_id: i64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "status": status.as_str(),
-        "rule": { "id": rule.id, "name": rule.name,
-                  "severity": rule.severity, "signal": rule.condition.signal() },
-        "series": labels,
-        "condition": rule.condition.summary(),
-        "value": value, "threshold": threshold,
-        "started_at": started_at, "at": at, "incident_id": incident_id,
-    })
 }
 
 /// `sha256=<hex>` HMAC of `body` under `secret`.
@@ -56,8 +36,8 @@ pub fn sign(secret: &str, body: &[u8]) -> String {
 
 #[async_trait]
 pub trait Notifier: Send + Sync {
-    /// Fire-and-forget: returns immediately; delivery + retries happen in a detached task.
-    async fn deliver(&self, channel: &Channel, payload: serde_json::Value);
+    /// Fire-and-forget: returns immediately; render + POST + retries happen in a detached task.
+    async fn deliver(&self, channel: &Channel, event: AlertEvent);
 }
 
 pub struct WebhookNotifier {
@@ -79,37 +59,54 @@ impl Default for WebhookNotifier {
     }
 }
 
+impl WebhookNotifier {
+    /// Render + POST exactly once, awaited, returning the real outcome. Used by the channel-test
+    /// route so the UI can show whether a preset's URL/token actually works.
+    pub async fn deliver_once(&self, channel: &Channel, event: &AlertEvent) -> Result<(), String> {
+        let req = render(channel, event);
+        let mut b = self
+            .client
+            .post(&req.url)
+            .header("content-type", req.content_type)
+            .body(req.body);
+        for (k, v) in req.headers {
+            b = b.header(k, v);
+        }
+        match b.send().await {
+            Ok(r) if r.status().is_success() => Ok(()),
+            Ok(r) => {
+                let code = r.status();
+                let snippet = r.text().await.unwrap_or_default();
+                let snippet: String = snippet.chars().take(200).collect();
+                Err(format!("HTTP {code}: {snippet}"))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 #[async_trait]
 impl Notifier for WebhookNotifier {
-    async fn deliver(&self, channel: &Channel, payload: serde_json::Value) {
+    async fn deliver(&self, channel: &Channel, event: AlertEvent) {
         let client = self.client.clone();
-        let url = channel.url.clone();
-        let secret = channel.secret.clone();
-        let headers = channel.headers.clone();
-        let body = serde_json::to_vec(&payload).unwrap_or_default();
+        let req = render(channel, &event);
         tokio::spawn(async move {
             for attempt in 1..=3u32 {
-                let mut req = client
-                    .post(&url)
-                    .header("content-type", "application/json")
-                    .body(body.clone());
-                if let Some(s) = &secret {
-                    req = req.header("X-Photon-Signature", sign(s, &body));
+                let mut b = client
+                    .post(&req.url)
+                    .header("content-type", req.content_type)
+                    .body(req.body.clone());
+                for (k, v) in &req.headers {
+                    b = b.header(k, v);
                 }
-                if let Some(serde_json::Value::Object(map)) = &headers {
-                    for (k, v) in map {
-                        if let Some(v) = v.as_str() {
-                            req = req.header(k, v);
-                        }
-                    }
-                }
-                match req.send().await {
+                match b.send().await {
                     Ok(r) if r.status().is_success() => return,
                     Ok(r) => eprintln!(
-                        "alert webhook {url}: HTTP {} (attempt {attempt})",
+                        "alert webhook {}: HTTP {} (attempt {attempt})",
+                        req.url,
                         r.status()
                     ),
-                    Err(e) => eprintln!("alert webhook {url}: {e} (attempt {attempt})"),
+                    Err(e) => eprintln!("alert webhook {}: {e} (attempt {attempt})", req.url),
                 }
                 if attempt < 3 {
                     tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
@@ -126,67 +123,43 @@ pub struct FakeNotifier {
 }
 #[async_trait]
 impl Notifier for FakeNotifier {
-    async fn deliver(&self, channel: &Channel, payload: serde_json::Value) {
-        let status = payload
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+    async fn deliver(&self, channel: &Channel, event: AlertEvent) {
         self.calls
             .lock()
             .unwrap()
-            .push((channel.id.clone(), status));
+            .push((channel.id.clone(), event.status.as_str().to_string()));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::{build_generic_payload, AlertEvent};
     use crate::model::*;
 
-    fn rule() -> Rule {
-        Rule {
-            id: "r1".into(),
-            name: "High CPU".into(),
-            description: None,
-            enabled: true,
-            condition: Condition::Metrics(MetricCondition {
-                metric_name: "system.cpu.utilization".into(),
-                label_filters: Default::default(),
-                group_by: vec!["host.name".into()],
-                agg: MetricAgg::Avg,
-                window_secs: 300,
-                cmp: Cmp::Gt,
-                threshold: 0.9,
-            }),
-            for_secs: 300,
-            interval_secs: 60,
+    fn ev() -> AlertEvent {
+        AlertEvent {
+            rule_id: "r1".into(),
+            rule_name: "High CPU".into(),
             severity: Severity::Warning,
-            channel_ids: vec!["c1".into()],
-            created_at: 0,
-            updated_at: 0,
+            signal: "metrics".into(),
+            condition_summary: "Avg(system.cpu.utilization) > 0.9".into(),
+            labels: serde_json::json!({ "host.name": "web-01" }),
+            status: NotifyStatus::Triggered,
+            value: 0.94,
+            threshold: 0.9,
+            started_at: 1000,
+            at: 2000,
+            incident_id: 7,
         }
     }
 
     #[test]
-    fn payload_has_stable_shape_and_status() {
-        let labels = serde_json::json!({ "host.name": "web-01" });
-        let p = build_payload(
-            &rule(),
-            &labels,
-            NotifyStatus::Triggered,
-            0.94,
-            0.90,
-            1000,
-            2000,
-            7,
-        );
+    fn generic_payload_has_stable_shape() {
+        let p = build_generic_payload(&ev());
         assert_eq!(p["status"], "triggered");
         assert_eq!(p["rule"]["name"], "High CPU");
-        assert_eq!(p["rule"]["signal"], "metrics");
         assert_eq!(p["series"]["host.name"], "web-01");
-        assert_eq!(p["value"], 0.94);
-        assert_eq!(p["threshold"], 0.90);
         assert_eq!(p["incident_id"], 7);
     }
 
@@ -199,20 +172,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_notifier_records() {
+    async fn fake_notifier_records_status() {
         let n = FakeNotifier::default();
         let ch = Channel {
             id: "c1".into(),
             name: "ops".into(),
             kind: ChannelKind::Webhook,
-            url: "http://x".into(),
-            secret: None,
-            headers: None,
+            config: ChannelConfig::Webhook {
+                url: "http://x".into(),
+                secret: None,
+                headers: None,
+            },
             created_at: 0,
             updated_at: 0,
         };
-        n.deliver(&ch, serde_json::json!({"status":"resolved"}))
-            .await;
+        let mut resolved = ev();
+        resolved.status = NotifyStatus::Resolved;
+        n.deliver(&ch, resolved).await;
         assert_eq!(
             n.calls.lock().unwrap().as_slice(),
             &[("c1".to_string(), "resolved".to_string())]

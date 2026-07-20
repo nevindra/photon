@@ -679,22 +679,24 @@ export interface AlertRuleInput {
   channel_ids?: string[]
 }
 
+export type ChannelKind = 'webhook' | 'discord' | 'telegram'
+
+export type ChannelConfig =
+  | { type: 'webhook'; url: string; secret?: string | null; headers?: Record<string, string> | null }
+  | { type: 'discord'; webhook_url: string }
+  | { type: 'telegram'; bot_token: string; chat_id: string }
+
 export interface AlertChannel {
   id: string
   name: string
-  kind: string // 'webhook' — the only value in v1
-  url: string
-  secret: string | null
-  headers: Record<string, string> | null
+  kind: ChannelKind
+  config: ChannelConfig
   created_at: number
   updated_at: number
 }
 export interface AlertChannelInput {
-  name?: string
-  kind?: string
-  url?: string
-  secret?: string | null
-  headers?: Record<string, string> | null
+  name: string
+  config: ChannelConfig
 }
 
 export interface AlertIncident {
@@ -1684,12 +1686,28 @@ export const api = {
 
   async testAlertChannel(id: string, opts: RequestOpts = {}): Promise<MutationResult> {
     try {
-      await http.post(`alerts/channels/${encodeURIComponent(id)}/test`, { signal: opts.signal })
-      return { ok: true }
+      const r = await http
+        .post(`alerts/channels/${encodeURIComponent(id)}/test`, { signal: opts.signal })
+        .json<{ delivered: boolean; error?: string }>()
+      return r.delivered ? { ok: true } : { ok: false, error: r.error ?? 'delivery failed' }
     } catch (e: any) {
       if (e.status === 404) return { ok: false, error: e.body?.error }
       api.mock = true
       return mockTestAlertChannel(id) as MutationResult
+    }
+  },
+
+  async testAlertChannelDraft(input: AlertChannelInput, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      const r = await http
+        .post('alerts/channels/test', { json: input, signal: opts.signal })
+        .json<{ delivered: boolean; error?: string }>()
+      return r.delivered ? { ok: true } : { ok: false, error: r.error ?? 'delivery failed' }
+    } catch (e: any) {
+      if (e.status === 400) return { ok: false, error: e.body?.error }
+      // Offline/mock mode can't actually POST anywhere — treat a draft test as a no-op success.
+      api.mock = true
+      return { ok: true }
     }
   },
 

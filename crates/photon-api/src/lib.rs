@@ -324,6 +324,7 @@ impl ApiServer {
                     .delete(alerts::delete_channel),
             )
             .route("/alerts/channels/:id/test", post(alerts::test_channel))
+            .route("/alerts/channels/test", post(alerts::test_channel_draft))
             .route("/alerts/incidents", get(alerts::list_incidents))
             .route("/logout", post(auth::logout))
             .route("/users", get(auth::list_users).post(auth::create_user))

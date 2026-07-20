@@ -48,10 +48,8 @@ impl AlertStore for MemStore {
         let ch = Channel {
             id: gen_id("ch"),
             name: input.name,
-            kind: input.kind,
-            url: input.url,
-            secret: input.secret,
-            headers: input.headers,
+            kind: input.config.kind(),
+            config: input.config,
             created_at: now,
             updated_at: now,
         };
@@ -74,10 +72,8 @@ impl AlertStore for MemStore {
         let ch = Channel {
             id: id.to_string(),
             name: input.name,
-            kind: input.kind,
-            url: input.url,
-            secret: input.secret,
-            headers: input.headers,
+            kind: input.config.kind(),
+            config: input.config,
             created_at: existing.created_at,
             updated_at: now_ms(),
         };
@@ -293,10 +289,11 @@ mod tests {
         let s = MemStore::new();
         let input = ChannelInput {
             name: "ops".into(),
-            kind: ChannelKind::Webhook,
-            url: "http://x".into(),
-            secret: None,
-            headers: None,
+            config: ChannelConfig::Webhook {
+                url: "http://x".into(),
+                secret: None,
+                headers: None,
+            },
         };
         let ch = s.create_channel(input).await.unwrap();
         assert_eq!(s.list_channels().await.unwrap().len(), 1);

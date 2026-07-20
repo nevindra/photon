@@ -330,7 +330,7 @@ async fn alert_triggers_and_resolves_end_to_end() {
     let ch = client
         .post(server.url("/api/alerts/channels"))
         .header(reqwest::header::COOKIE, &cookie)
-        .json(&json!({ "name": "ops", "type": "webhook", "url": webhook_url }))
+        .json(&json!({ "name": "ops", "config": { "type": "webhook", "url": webhook_url } }))
         .send()
         .await
         .unwrap();

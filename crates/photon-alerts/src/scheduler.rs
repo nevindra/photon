@@ -1,8 +1,9 @@
 //! The alert evaluation loop: owns per-(rule,series) state, samples due rules via `ConditionSource`,
 //! folds each series through `apply`, opens/closes incidents, and fans deliveries out to channels.
 //! Mirrors `photon-uptime::scheduler`. Non-fatal: an eval/query error leaves state unchanged.
+use crate::format::AlertEvent;
 use crate::model::*;
-use crate::notify::{build_payload, Notifier, NotifyStatus};
+use crate::notify::{Notifier, NotifyStatus};
 use crate::source::ConditionSource;
 use crate::state::apply;
 use crate::store::AlertStore;
@@ -164,19 +165,23 @@ async fn fan_out<S: AlertStore, N: Notifier>(
     at: i64,
     incident_id: i64,
 ) -> Result<(), PhotonError> {
-    let payload = build_payload(
-        rule,
-        &s.labels_json(),
+    let event = AlertEvent {
+        rule_id: rule.id.clone(),
+        rule_name: rule.name.clone(),
+        severity: rule.severity,
+        signal: rule.condition.signal().to_string(),
+        condition_summary: rule.condition.summary(),
+        labels: s.labels_json(),
         status,
         value,
         threshold,
         started_at,
         at,
         incident_id,
-    );
+    };
     for cid in &rule.channel_ids {
         match store.get_channel(cid).await? {
-            Some(ch) => notifier.deliver(&ch, payload.clone()).await,
+            Some(ch) => notifier.deliver(&ch, event.clone()).await,
             None => eprintln!("alert rule {}: channel {cid} not found, skipping", rule.id),
         }
     }
@@ -310,10 +315,11 @@ mod tests {
         store
             .create_channel(ChannelInput {
                 name: "c1".into(),
-                kind: ChannelKind::Webhook,
-                url: "http://x".into(),
-                secret: None,
-                headers: None,
+                config: ChannelConfig::Webhook {
+                    url: "http://x".into(),
+                    secret: None,
+                    headers: None,
+                },
             })
             .await
             .unwrap();
@@ -361,15 +367,15 @@ mod tests {
     /// state map (not retained as `Ok`) so a churning `group_by` can't leak state forever.
     #[tokio::test]
     async fn vanished_triggered_series_resolves_with_labels_and_is_removed() {
-        // A notifier that captures the full payload so we can assert the resolve's `series` labels.
+        // A notifier that captures the full event so we can assert the resolve's `series` labels.
         #[derive(Default)]
         struct CapturingNotifier {
-            payloads: std::sync::Mutex<Vec<serde_json::Value>>,
+            events: std::sync::Mutex<Vec<crate::format::AlertEvent>>,
         }
         #[async_trait::async_trait]
         impl Notifier for CapturingNotifier {
-            async fn deliver(&self, _channel: &Channel, payload: serde_json::Value) {
-                self.payloads.lock().unwrap().push(payload);
+            async fn deliver(&self, _channel: &Channel, event: crate::format::AlertEvent) {
+                self.events.lock().unwrap().push(event);
             }
         }
 
@@ -377,10 +383,11 @@ mod tests {
         store
             .create_channel(ChannelInput {
                 name: "c1".into(),
-                kind: ChannelKind::Webhook,
-                url: "http://x".into(),
-                secret: None,
-                headers: None,
+                config: ChannelConfig::Webhook {
+                    url: "http://x".into(),
+                    secret: None,
+                    headers: None,
+                },
             })
             .await
             .unwrap();
@@ -413,13 +420,13 @@ mod tests {
         // Incident closed…
         assert_eq!(store.list_open_incidents().await.unwrap().len(), 0);
 
-        // …the resolve payload carries the reconstructed series labels (Fix 2)…
-        let payloads = notifier.payloads.lock().unwrap();
-        let resolve = payloads
+        // …the resolve event carries the reconstructed series labels (Fix 2)…
+        let events = notifier.events.lock().unwrap();
+        let resolve = events
             .iter()
-            .find(|p| p["status"] == "resolved")
-            .expect("a resolved payload was delivered");
-        assert_eq!(resolve["series"]["host.name"].as_str(), Some("web-01"));
+            .find(|e| matches!(e.status, NotifyStatus::Resolved))
+            .expect("a resolved event was delivered");
+        assert_eq!(resolve.labels["host.name"].as_str(), Some("web-01"));
 
         // …and the vanished series is dropped from the state map, not retained as Ok (Fix 3).
         assert!(

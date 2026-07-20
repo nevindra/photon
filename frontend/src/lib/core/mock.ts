@@ -1724,19 +1724,20 @@ let mockAlertChannelsData: AlertChannel[] = [
     id: 'chan-1',
     name: 'Ops webhook bridge',
     kind: 'webhook',
-    url: 'https://hooks.example.com/services/mock/webhook',
-    secret: 'whsec_mock_1a2b3c',
-    headers: null,
+    config: {
+      type: 'webhook',
+      url: 'https://hooks.example.com/services/mock/webhook',
+      secret: 'whsec_mock_1a2b3c',
+      headers: null,
+    },
     created_at: 1_700_000_000_000,
     updated_at: 1_700_000_000_000,
   },
   {
     id: 'chan-2',
-    name: 'PagerDuty inbound',
-    kind: 'webhook',
-    url: 'https://events.pagerduty.example.com/v2/enqueue',
-    secret: null,
-    headers: { Authorization: 'Bearer mock-token' },
+    name: 'Discord · alerts',
+    kind: 'discord',
+    config: { type: 'discord', webhook_url: 'https://discord.com/api/webhooks/123456789012345678/mock-discord-token' },
     created_at: 1_700_000_500_000,
     updated_at: 1_700_000_500_000,
   },
@@ -1977,17 +1978,14 @@ export function mockAlertChannel(id: string): AlertChannel | undefined {
 
 export function mockCreateAlertChannel(input: AlertChannelInput): AlertChannelResult {
   const name = (input.name ?? '').trim()
-  if (!name) return { ok: false, error: 'name must not be empty' }
-  if (!input.url) return { ok: false, error: 'url is required' }
+  if (!name) return { ok: false, error: 'name is required' }
   if (mockAlertChannelsData.some((c) => c.name === name)) return { ok: false, error: 'a channel with that name already exists' }
   const now = Date.now()
   const channel: AlertChannel = {
-    id: `chan-mock${Math.random().toString(16).slice(2, 10)}`,
+    id: `ch-${Math.random().toString(36).slice(2, 8)}`,
     name,
-    kind: input.kind ?? 'webhook',
-    url: input.url,
-    secret: input.secret ?? null,
-    headers: input.headers ?? null,
+    kind: input.config.type,
+    config: input.config,
     created_at: now,
     updated_at: now,
   }
@@ -2001,10 +1999,8 @@ export function mockUpdateAlertChannel(id: string, input: AlertChannelInput): Al
   const updated: AlertChannel = {
     ...existing,
     name: input.name ?? existing.name,
-    kind: input.kind ?? existing.kind,
-    url: input.url ?? existing.url,
-    secret: input.secret !== undefined ? input.secret : existing.secret,
-    headers: input.headers !== undefined ? input.headers : existing.headers,
+    kind: input.config.type,
+    config: input.config,
     updated_at: Date.now(),
   }
   mockAlertChannelsData = mockAlertChannelsData.map((c) => (c.id === id ? updated : c))

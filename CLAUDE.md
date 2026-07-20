@@ -94,8 +94,9 @@ the cross-signal landing dashboard), `/logs`, `/traces` (+ `/traces/:traceId` wa
 sub-routes: `/rum/:appId` vitals, `/pages[/:route]`, `/errors` (search bar + fixed facet panel), and
 `/errors/:fingerprint` issue detail), `/uptime`, `/infra` (+ `/infra/:host` host detail — host/GPU
 resource monitoring), `/data`, `/alerts` (the cross-signal webhook alert engine — rules over
-metrics/logs/traces/RUM, incidents, notification channels, plus a "Browse templates" quick-setup
-on-ramp: target-first Apply/Customize over a frontend-only, 23-template seed catalog), plus `/login`
+metrics/logs/traces/RUM, incidents, notification channels (channels are typed presets: Generic
+Webhook, Discord, Telegram), plus a "Browse templates" quick-setup on-ramp: target-first
+Apply/Customize over a frontend-only, 23-template seed catalog), plus `/login`
 and `/onboarding`, behind a `beforeEach` auth guard
 (`router/index.js`) gated on reactive flags (`lib/core/auth.ts`). The `@photon/rum` browser SDK
 (`sdk/rum/`) behind `/rum` auto-detects SPA client-side navigation (History API —
@@ -161,8 +162,9 @@ photon-ingest   OTLP gRPC (tonic) + HTTP (axum) receivers for logs/traces/metric
 photon-uptime   always-on synthetic HTTP/TCP/ICMP monitors → embedded SQLite. Trait: UptimeStore.
 photon-alerts   system-wide webhook alert engine: per-signal rules (metrics/logs/traces/RUM), a pure
                 Ok→Pending→Triggered state machine per (rule, series), SQLite rules/channels/incidents,
-                webhook delivery (+HMAC). Traits: ConditionSource, AlertStore. Depends only on
-                photon-core (not photon-query) — photon-server implements ConditionSource
+                per-preset delivery — **Generic Webhook** (+HMAC), **Discord** (embed), **Telegram**
+                (Bot API), rendered by a pure `format.rs`. Traits: ConditionSource, AlertStore. Depends
+                only on photon-core (not photon-query) — photon-server implements ConditionSource
                 (EngineConditionSource) over the three query engines. Always on; optional `[alerts]`
                 config tunes `interval_default` (60s) and `worker_concurrency` (16) — no rule/channel
                 config surface, everything is UI/SQLite-managed.

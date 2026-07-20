@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-20
+
+A feature release adding **system-wide alerting & notifications** — a cross-signal
+webhook alert engine with provider-native channel presets — on top of correctness fixes
+to the RUM pages breakdown and the WAL. Fully backward compatible: alerting is always-on
+with sensible defaults and no required config, and every change is additive.
+
+### Added
+
+- **System-wide webhook alert engine (`photon-alerts`).** Rules watch **metrics, logs,
+  traces, and RUM** and fire a webhook when a condition holds, moving each `(rule, series)`
+  through a pure **OK · Pending · Triggered · Resolved** state machine. Incidents,
+  notification channels, and per-rule severity / `for`-duration / evaluation interval are
+  all UI/SQLite-managed (no config surface); the engine is a read-path consumer of the
+  three query engines and is always on (optional `[alerts]` tunes only defaults). Uptime
+  up/down transitions **bridge onto the same incident history + channels**, so there is one
+  notification system, not two. New `/alerts` UI (rules · incidents · channels) and the
+  `/api/alerts/*` surface.
+- **Alert rule templates.** A target-first **"Browse templates"** quick-setup on the Rules
+  tab: pick a target (Service · RUM app · Host · Global) and a concrete instance from live
+  data, then **Apply** or **Customize** from a 23-template catalog — a frontend-only on-ramp
+  that flows straight through the existing rule-create path.
+- **Provider channel presets — Discord & Telegram.** Notification channels are now typed
+  presets: the original **Generic webhook** (+HMAC) plus **Discord** (native embed) and
+  **Telegram** (Bot API, HTML), each rendered by a pure `format.rs`. Pick a preset and fill
+  in only its fields (Discord webhook URL; Telegram bot token + chat id). Channel input is
+  validated (Discord host-locked to Discord's own hosts; Telegram bot-token shape), and a
+  channel **Test** now performs one real, awaited delivery and reports the actual outcome —
+  including for an **unsaved draft**, straight from the create/edit dialog. Discord
+  (host-locked) and Telegram (server-constructed `api.telegram.org` endpoint) are SSRF-free;
+  only the Generic webhook can target an arbitrary host.
+
 ### Fixed
 
 - **Soft-navigated routes missing from the RUM pages list.** Two compounding drops hid

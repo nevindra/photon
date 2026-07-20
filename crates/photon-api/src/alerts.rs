@@ -5,8 +5,9 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use photon_alerts::format::AlertEvent;
 use photon_alerts::model::*;
-use photon_alerts::notify::{Notifier, WebhookNotifier};
+use photon_alerts::notify::{NotifyStatus, WebhookNotifier};
 use photon_alerts::source::ConditionSource;
 use photon_alerts::store::AlertStore;
 use serde::{Deserialize, Serialize};
@@ -220,6 +221,9 @@ pub(crate) async fn create_channel(
     State(s): State<AppState>,
     Json(input): Json<ChannelInput>,
 ) -> Result<Json<Channel>, ApiErr> {
+    input
+        .validate()
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(
         api(&s)?
             .store
@@ -241,19 +245,14 @@ pub(crate) async fn get_channel(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such channel"))
 }
 
-/// Partial update body for `PATCH /alerts/channels/:id` — same rationale as [`RulePatch`].
+/// Partial update body for `PATCH /alerts/channels/:id` — same rationale as [`RulePatch`]. A patch
+/// replaces the whole `config` (per-field patching inside a preset isn't worth the surface).
 #[derive(Debug, Default, Deserialize)]
 pub struct ChannelPatch {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
-    pub kind: Option<ChannelKind>,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub secret: Option<String>,
-    #[serde(default)]
-    pub headers: Option<serde_json::Value>,
+    pub config: Option<ChannelConfig>,
 }
 
 pub(crate) async fn update_channel(
@@ -270,11 +269,11 @@ pub(crate) async fn update_channel(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such channel"))?;
     let input = ChannelInput {
         name: patch.name.unwrap_or(existing.name),
-        kind: patch.kind.unwrap_or(existing.kind),
-        url: patch.url.unwrap_or(existing.url),
-        secret: patch.secret.or(existing.secret),
-        headers: patch.headers.or(existing.headers),
+        config: patch.config.unwrap_or(existing.config),
     };
+    input
+        .validate()
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let ch = a
         .store
         .update_channel(&id, input)
@@ -295,8 +294,28 @@ pub(crate) async fn delete_channel(
     }
 }
 
-/// `POST /alerts/channels/:id/test` — send a sample webhook to this channel via a throwaway
-/// `WebhookNotifier` (fire-and-forget, exactly like a real triggered/resolved delivery).
+/// A representative triggered event for a channel test, so the rendered Discord embed / Telegram
+/// message looks like a real alert.
+fn sample_event() -> AlertEvent {
+    let now = now_ms();
+    AlertEvent {
+        rule_id: "test".into(),
+        rule_name: "Test notification".into(),
+        severity: Severity::Warning,
+        signal: "metrics".into(),
+        condition_summary: "Avg(system.cpu.utilization) > 0.9".into(),
+        labels: json!({ "host.name": "web-01" }),
+        status: NotifyStatus::Triggered,
+        value: 0.94,
+        threshold: 0.9,
+        started_at: now,
+        at: now,
+        incident_id: 0,
+    }
+}
+
+/// `POST /alerts/channels/:id/test` — render + send ONE awaited sample delivery to a saved channel
+/// and report the real outcome.
 pub(crate) async fn test_channel(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -308,17 +327,39 @@ pub(crate) async fn test_channel(
         .await
         .map_err(internal)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such channel"))?;
+    Ok(Json(deliver_test(&channel).await))
+}
+
+/// `POST /alerts/channels/test` — render + send ONE awaited sample delivery to a DRAFT (unsaved)
+/// channel config, so the create/edit dialog can verify a preset before saving.
+pub(crate) async fn test_channel_draft(
+    State(s): State<AppState>,
+    Json(input): Json<ChannelInput>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    api(&s)?; // 404 if the subsystem is disabled
+    input
+        .validate()
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let now = now_ms();
-    let payload = json!({
-        "status": "triggered",
-        "rule": { "id": "test", "name": "Test notification", "severity": "info", "signal": "test" },
-        "series": {},
-        "condition": "This is a test notification from Photon",
-        "value": 1.0, "threshold": 1.0,
-        "started_at": now, "at": now, "incident_id": 0,
-    });
-    WebhookNotifier::new().deliver(&channel, payload).await;
-    Ok(Json(json!({ "delivered": true })))
+    let channel = Channel {
+        id: "draft".into(),
+        name: input.name,
+        kind: input.config.kind(),
+        config: input.config,
+        created_at: now,
+        updated_at: now,
+    };
+    Ok(Json(deliver_test(&channel).await))
+}
+
+async fn deliver_test(channel: &Channel) -> serde_json::Value {
+    match WebhookNotifier::new()
+        .deliver_once(channel, &sample_event())
+        .await
+    {
+        Ok(()) => json!({ "delivered": true }),
+        Err(e) => json!({ "delivered": false, "error": e }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,5 +487,70 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let rules = body_json(resp).await;
         assert_eq!(rules.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_channel_rejects_bad_discord_url() {
+        let store = Arc::new(MemStore::new());
+        let (tx, _rx) = mpsc::channel::<SchedulerCommand>(8);
+        let alerts = super::AlertsApi {
+            store,
+            cmd_tx: tx,
+            source: Arc::new(FakeSource),
+        };
+        let app = crate::test_server().with_alerts(Some(alerts)).into_router();
+        let cookie = crate::session_cookie(&app).await;
+
+        let body = serde_json::json!({
+            "name": "bad",
+            "config": { "type": "discord", "webhook_url": "https://evil.example.com/x" },
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/alerts/channels")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn draft_test_validates_before_sending() {
+        let store = Arc::new(MemStore::new());
+        let (tx, _rx) = mpsc::channel::<SchedulerCommand>(8);
+        let alerts = super::AlertsApi {
+            store,
+            cmd_tx: tx,
+            source: Arc::new(FakeSource),
+        };
+        let app = crate::test_server().with_alerts(Some(alerts)).into_router();
+        let cookie = crate::session_cookie(&app).await;
+
+        // Invalid Telegram token → 400 before any network attempt.
+        let body = serde_json::json!({
+            "name": "t",
+            "config": { "type": "telegram", "bot_token": "nope", "chat_id": "1" },
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/alerts/channels/test")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

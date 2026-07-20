@@ -225,3 +225,11 @@ export function useTestChannel() {
     },
   })
 }
+
+// Sends a sample delivery for an unsaved channel draft — powers the ChannelDialog's in-form Test
+// button so the user can verify a preset before it's ever persisted.
+export function useTestChannelDraft() {
+  return useMutation({
+    mutationFn: (input: AlertChannelInput): Promise<MutationResult> => api.testAlertChannelDraft(input),
+  })
+}
