@@ -2798,6 +2798,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "photon-alerts"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hmac",
+ "photon-core",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "photon-api"
 version = "0.1.0"
 dependencies = [
@@ -2809,6 +2824,7 @@ dependencies = [
  "axum-extra",
  "mime_guess",
  "parquet",
+ "photon-alerts",
  "photon-core",
  "photon-query",
  "photon-uptime",
@@ -2932,6 +2948,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "opentelemetry-proto",
+ "photon-alerts",
  "photon-api",
  "photon-compact",
  "photon-core",

@@ -7,6 +7,7 @@
 //! cookie signing key). JSON endpoints live under `/api`; every other GET is served from the
 //! embedded frontend bundle (with an SPA fallback to `index.html`).
 
+pub mod alerts;
 mod assets;
 mod auth;
 mod data;
@@ -78,6 +79,10 @@ pub struct ApiServer {
     /// The RUM subsystem (the SQLite-backed app registry + the metrics/logs write sink). `None`
     /// keeps `POST /api/rum` returning 404 — set via [`ApiServer::with_rum`].
     rum: Option<rum::RumApi>,
+    /// The alerts vertical (rule/channel store + the scheduler's live-reload command sender +
+    /// the `ConditionSource` seam). `None` keeps `/api/alerts/*` returning 404 — set via
+    /// [`ApiServer::with_alerts`].
+    alerts: Option<alerts::AlertsApi>,
 }
 
 /// Shared, immutable application state: a cheap-to-clone handle over an `Arc`. Handlers pull
@@ -104,6 +109,8 @@ pub(crate) struct AppStateInner {
     pub(crate) replication: Option<Arc<dyn usage::ReplicationStatus>>,
     /// The RUM subsystem; read by the public `beacon` handler (`rum.rs`). `None` disables `/rum`.
     pub(crate) rum: Option<rum::RumApi>,
+    /// The alerts vertical; read by `alerts.rs`. `None` disables `/api/alerts/*`.
+    pub(crate) alerts: Option<alerts::AlertsApi>,
 }
 
 impl std::ops::Deref for AppState {
@@ -142,6 +149,7 @@ impl ApiServer {
             usage: None,
             replication: None,
             rum: None,
+            alerts: None,
         }
     }
 
@@ -187,6 +195,14 @@ impl ApiServer {
         self
     }
 
+    /// Attach the alerts vertical (rule/channel store + the scheduler's live-reload command
+    /// sender + the `ConditionSource` seam), built by `photon-server`. Leaving it unset keeps
+    /// `/api/alerts/*` returning 404 — the subsystem is optional.
+    pub fn with_alerts(mut self, alerts: Option<alerts::AlertsApi>) -> Self {
+        self.alerts = alerts;
+        self
+    }
+
     /// Bind `addr` and serve until the process is terminated.
     pub async fn serve(self, addr: SocketAddr) -> Result<(), PhotonError> {
         let app = self.into_router();
@@ -213,6 +229,7 @@ impl ApiServer {
             usage: self.usage,
             replication: self.replication,
             rum: self.rum,
+            alerts: self.alerts,
         }));
 
         // Everything except `/api/login` requires a valid signed `photon_session` cookie.
@@ -284,6 +301,31 @@ impl ApiServer {
             .route("/monitors/:id/resume", post(uptime::resume_monitor))
             .route("/monitors/:id/heartbeats", get(uptime::get_heartbeats))
             .route("/monitors/:id/incidents", get(uptime::get_incidents))
+            .route(
+                "/alerts/rules",
+                get(alerts::list_rules).post(alerts::create_rule),
+            )
+            .route(
+                "/alerts/rules/:id",
+                get(alerts::get_rule)
+                    .patch(alerts::update_rule)
+                    .delete(alerts::delete_rule),
+            )
+            .route("/alerts/rules/:id/test", post(alerts::test_rule))
+            .route("/alerts/preview", post(alerts::preview))
+            .route(
+                "/alerts/channels",
+                get(alerts::list_channels).post(alerts::create_channel),
+            )
+            .route(
+                "/alerts/channels/:id",
+                get(alerts::get_channel)
+                    .patch(alerts::update_channel)
+                    .delete(alerts::delete_channel),
+            )
+            .route("/alerts/channels/:id/test", post(alerts::test_channel))
+            .route("/alerts/channels/test", post(alerts::test_channel_draft))
+            .route("/alerts/incidents", get(alerts::list_incidents))
             .route("/logout", post(auth::logout))
             .route("/users", get(auth::list_users).post(auth::create_user))
             .route("/users/:username", axum::routing::delete(auth::delete_user))
@@ -407,6 +449,7 @@ pub(crate) fn test_state_with_rum(rum: Option<rum::RumApi>) -> AppState {
         usage: s.usage,
         replication: s.replication,
         rum,
+        alerts: s.alerts,
     }))
 }
 

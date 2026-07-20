@@ -207,6 +207,7 @@ mod tests {
             ignore_tls: false,
             follow_redirects: true,
             webhook_url: None,
+            channel_ids: vec![],
             enabled: true,
             last_state: MonitorState::Pending,
             last_check_at: None,

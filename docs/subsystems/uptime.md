@@ -18,6 +18,14 @@ the Arrow/DataFusion write path used by the other signals.
   `default_interval` (`60s`), `default_timeout` (`10s`), `worker_concurrency` (32), and an optional
   global `webhook_url` (per-monitor overrides supported).
 - The subsystem is **always on**; `photon-server` spawns the scheduler + hourly retention.
+- **Alerts bridge:** a monitor also carries `channel_ids: Vec<String>` (a `Monitor`/`MonitorInput`
+  field, persisted as a JSON `TEXT` column added by an idempotent additive migration in
+  `store/sqlite.rs`; NULL/legacy rows → `[]`). On each up/down **transition** the scheduler's notifier
+  is `photon-server`'s `UptimeAlertBridge` (`crates/photon-server/src/uptime_bridge.rs`), which (1)
+  still fires the legacy per-monitor / global `webhook_url` and (2) opens/closes a shared **alerts**
+  incident (`photon_alerts` `AlertStore`, synthetic `rule_id = "uptime:<monitor.id>"`, empty series
+  key) and delivers an alerts-shaped payload (`status` `triggered`/`resolved`) to each channel in
+  `channel_ids`. `spawn_alerts` runs before `spawn_uptime` in `main.rs` so both share one `AlertStore`.
 
 ## API
 

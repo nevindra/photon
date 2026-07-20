@@ -50,6 +50,10 @@ pub struct Monitor {
     pub ignore_tls: bool,
     pub follow_redirects: bool,
     pub webhook_url: Option<String>,
+    /// Alert channel ids (from the shared alerts store) to notify on up/down transitions, in
+    /// addition to the legacy `webhook_url`. Persisted as a JSON array; absent ⇒ empty.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
     pub enabled: bool,
     pub last_state: MonitorState,
     pub last_check_at: Option<i64>,
@@ -80,6 +84,8 @@ pub struct MonitorInput {
     pub follow_redirects: bool,
     #[serde(default)]
     pub webhook_url: Option<String>,
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }

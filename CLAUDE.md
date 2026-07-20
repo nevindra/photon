@@ -93,7 +93,11 @@ the cross-signal landing dashboard), `/logs`, `/traces` (+ `/traces/:traceId` wa
 (+ `/services/:service` APM detail), `/metrics` (+ `/metrics/catalog`), `/rum` (+ app-scoped
 sub-routes: `/rum/:appId` vitals, `/pages[/:route]`, `/errors` (search bar + fixed facet panel), and
 `/errors/:fingerprint` issue detail), `/uptime`, `/infra` (+ `/infra/:host` host detail — host/GPU
-resource monitoring), `/data`, plus `/login` and `/onboarding`, behind a `beforeEach` auth guard
+resource monitoring), `/data`, `/alerts` (the cross-signal webhook alert engine — rules over
+metrics/logs/traces/RUM, incidents, notification channels (channels are typed presets: Generic
+Webhook, Discord, Telegram), plus a "Browse templates" quick-setup on-ramp: target-first
+Apply/Customize over a frontend-only, 23-template seed catalog), plus `/login`
+and `/onboarding`, behind a `beforeEach` auth guard
 (`router/index.js`) gated on reactive flags (`lib/core/auth.ts`). The `@photon/rum` browser SDK
 (`sdk/rum/`) behind `/rum` auto-detects SPA client-side navigation (History API —
 `pushState`/`replaceState`/`popstate` — on by default; MPAs unaffected) and rotates a
@@ -101,12 +105,12 @@ per-view identity (`view.id`/`seq`/`previous_route`) with its own Web Vitals and
 true`, its own backend trace per route; the exported `trackView(route?)` is a manual escape hatch
 for routers that prefer to drive the boundary themselves. `NavRail` groups these into ownership
 **worlds** (Home; Frontend → `/rum`, Backend → `/services`, Infrastructure → **Hosts** `/infra` +
-**Ops** `/uptime`), an **Explore** section (Logs/Traces/Metrics), and **Manage** (Data), with `AppShell`
-deriving the highlighted group from the route. Cross-view correlation (log→trace, span/trace→logs,
+**Ops** `/uptime`), an **Explore** section (Logs/Traces/Metrics), and **Manage** (Data, Alerts), with
+`AppShell` deriving the highlighted group from the route. Cross-view correlation (log→trace, span/trace→logs,
 and a "Related ▾" menu) flows through `router.push` via `lib/core/useCorrelate.ts`'s `correlate()`, which
 always carries the active time+scope. Components are grouped by signal under `src/components/`
-(`logs/`, `traces/`, `services/`, `metrics/`, `rum/`, `uptime/`, `data/`, `charts/`, `common/`,
-`ui/`). Data flows through one **Ky** client (`lib/core/api.ts` — keeps a mock-fallback: tries `/api`,
+(`logs/`, `traces/`, `services/`, `metrics/`, `rum/`, `uptime/`, `data/`, `alerts/`, `charts/`,
+`common/`, `ui/`). Data flows through one **Ky** client (`lib/core/api.ts` — keeps a mock-fallback: tries `/api`,
 falls back to in-browser mocks on a network failure while surfacing real 400/404s) wrapped by
 **TanStack Query** composables (`lib/*Queries.ts`) keyed off URL/filter state. Tables/waterfalls are
 row-windowed with **TanStack Virtual** on headless **TanStack Table**; charts use **uPlot**
@@ -156,10 +160,19 @@ photon-ingest   OTLP gRPC (tonic) + HTTP (axum) receivers for logs/traces/metric
                 front doors accept gzipped requests (stock OTel Collector gzips by default) and share
                 one `[ingest].max_body_bytes` cap (~16 MiB) enforced on the *decompressed* size.
 photon-uptime   always-on synthetic HTTP/TCP/ICMP monitors → embedded SQLite. Trait: UptimeStore.
+photon-alerts   system-wide webhook alert engine: per-signal rules (metrics/logs/traces/RUM), a pure
+                Ok→Pending→Triggered state machine per (rule, series), SQLite rules/channels/incidents,
+                per-preset delivery — **Generic Webhook** (+HMAC), **Discord** (embed), **Telegram**
+                (Bot API), rendered by a pure `format.rs`. Traits: ConditionSource, AlertStore. Depends
+                only on photon-core (not photon-query) — photon-server implements ConditionSource
+                (EngineConditionSource) over the three query engines. Always on; optional `[alerts]`
+                config tunes `interval_default` (60s) and `worker_concurrency` (16) — no rule/channel
+                config surface, everything is UI/SQLite-managed.
 photon-api      axum REST + session auth (argon2, signed cookies) + embedded Vue UI. Defines trait
                 seams RumSink/RumAppStore/UserStore/UsageStore/ReplicationStatus/DataAdmin (photon-api
                 can't dep photon-wal).
-photon-server   the binary: config load, wiring, background-task supervision (3 compactor loops, etc.).
+photon-server   the binary: config load, wiring, background-task supervision (3 compactor loops, the
+                alert-engine scheduler, etc.).
 photon-loadgen  dev-only OTLP/HTTP logs+traces+metrics load generator (its own binary).
 photon-agent    standalone host/GPU resource-metrics agent (its own binary, like photon-loadgen):
                 samples host (sysinfo) + NVIDIA GPU (nvml-wrapper, default-on `gpu` feature), POSTs
@@ -171,7 +184,12 @@ schema, compactor, and manifest object — a deliberate cost so adding a signal 
 logs path. RUM adds **no** storage engine (Web Vitals → gauge metrics, JS errors → logs); uptime is a
 self-contained SQLite vertical. RUM's own app registry (`rum_apps` — name/key/allowed_origins/
 sample_rate/rate_limit, UI-managed, no config surface) lives in the same shared control-plane SQLite
-DB as UI users and uptime monitors. Full per-signal data flow in
+DB as UI users and uptime monitors. The **alerts** engine (`photon-alerts`) is likewise no new storage
+engine — a strictly read-path consumer of the three query engines plus its own `alert_channels`/
+`alert_rules`/`alert_incidents` tables in that same control-plane SQLite DB; uptime bridges its
+up/down transitions onto the shared alerts incident history + channels via a monitor's optional
+`channel_ids` (see [`docs/subsystems/alerts.md`](docs/subsystems/alerts.md) and
+[`docs/subsystems/uptime.md`](docs/subsystems/uptime.md)). Full per-signal data flow in
 [`docs/architecture.md`](docs/architecture.md).
 
 **Data flow (one signal):** OTLP request → `photon-ingest` checks the bearer token + per-signal
@@ -234,8 +252,12 @@ including RUM's `GET /api/rum/errors` (now with an optional `q` log-grammar filt
 `PATCH/DELETE /api/rum/apps/:name`, `POST /api/rum/apps/:name/rotate-key` (apps are UI-managed —
 there is no `[[rum.apps]]` config anymore) — plus the curated Infrastructure vertical
 `GET /api/infra/hosts`, `GET /api/infra/hosts/:host`, `GET /api/infra/hosts/:host/timeseries` (see
-[`docs/subsystems/infra.md`](docs/subsystems/infra.md)). Handlers live in
-`crates/photon-api/src/*.rs`; the aggregation logic they call lives in
+[`docs/subsystems/infra.md`](docs/subsystems/infra.md)) and the cross-signal alert engine
+`GET/POST /api/alerts/rules`, `GET/PATCH/DELETE /api/alerts/rules/:id`,
+`POST /api/alerts/rules/:id/test`, `POST /api/alerts/preview`, `GET/POST /api/alerts/channels`,
+`GET/PATCH/DELETE /api/alerts/channels/:id`, `POST /api/alerts/channels/:id/test`,
+`GET /api/alerts/incidents` (see [`docs/subsystems/alerts.md`](docs/subsystems/alerts.md)). Handlers
+live in `crates/photon-api/src/*.rs`; the aggregation logic they call lives in
 `crates/photon-query/src/*.rs`. A `tower-http` `CompressionLayer` wraps the whole surface
 (gzip/br, content-negotiated per `Accept-Encoding`; JSON logs compress ~15x) — its default predicate
 skips SSE (`/api/stream/*`), so live-tail is never buffered.

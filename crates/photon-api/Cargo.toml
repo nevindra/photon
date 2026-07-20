@@ -7,6 +7,7 @@ edition = "2021"
 photon-core = { path = "../photon-core" }
 photon-query = { path = "../photon-query" }
 photon-uptime = { path = "../photon-uptime" }
+photon-alerts = { path = "../photon-alerts" }
 async-trait = { workspace = true }
 arrow = { workspace = true }
 axum = { workspace = true }

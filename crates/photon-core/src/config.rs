@@ -20,6 +20,8 @@ pub struct Config {
     pub apm: ApmConfig,
     #[serde(default)]
     pub live: LiveConfig,
+    #[serde(default)]
+    pub alerts: AlertsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +218,35 @@ impl Default for LiveConfig {
             flush_interval_ms: 250,
             max_rows_per_flush: 200,
             max_connections: 32,
+        }
+    }
+}
+
+/// `[alerts]` — optional *tuning* for the system-wide webhook alert engine. The subsystem
+/// always runs; omitting the section just accepts the defaults below.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertsConfig {
+    /// Default per-rule evaluation cadence when a rule doesn't override it.
+    #[serde(default = "AlertsConfig::default_interval")]
+    pub interval_default: String, // e.g. "60s"
+    /// Max concurrent rule evaluations in flight.
+    #[serde(default = "AlertsConfig::default_worker_concurrency")]
+    pub worker_concurrency: usize,
+}
+impl AlertsConfig {
+    fn default_interval() -> String {
+        "60s".into()
+    }
+    fn default_worker_concurrency() -> usize {
+        16
+    }
+}
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            interval_default: Self::default_interval(),
+            worker_concurrency: Self::default_worker_concurrency(),
         }
     }
 }

@@ -64,6 +64,15 @@ const routes = [
   { path: "/infra", name: "infra", component: InfraHostsView },
   { path: "/infra/:host", name: "infra-host", component: InfraHostDetailView },
   { path: "/data", name: "data", component: DataView },
+  // Alerts (webhook-alert engine, Manage group): lazy-loaded since it's not on the critical
+  // first-paint path and its own subtree (rule builder, condition builder, channel dialogs) is
+  // sizeable — mirrors the split-chunk treatment other heavier views get from Vite's default
+  // route-based code splitting once they're behind a dynamic import.
+  {
+    path: "/alerts",
+    name: "alerts",
+    component: () => import("../views/AlertsView.vue"),
+  },
   { path: "/:pathMatch(.*)*", redirect: "/home" },
 ];
 

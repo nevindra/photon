@@ -25,6 +25,8 @@ pub enum PhotonError {
     Query(String),
     #[error("uptime error: {0}")]
     Uptime(String),
+    #[error("alerts: {0}")]
+    Alerts(String),
 }
 
 pub mod config;
