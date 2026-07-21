@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-21
+
+A feature release focused on **infrastructure monitoring UX**: the host detail page becomes
+a two-layer monitoring view, the hosts list gains a fleet executive summary, and release
+tags now ship a prebuilt `photon-agent` binary. Chart rendering fixes (percent axes, axis
+label clipping, legends) ride along. Fully backward compatible.
+
 ### Added
 
 - **Prebuilt `photon-agent` binary on GitHub Releases.** Release tags now also build and
