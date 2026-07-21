@@ -106,6 +106,12 @@ export function formatBytes(bytes: number | null | undefined): string {
   return `${val.toFixed(1)} ${units[i]}`
 }
 
+// Bytes/second → compact rate label, e.g. 2_150_000 → "2.1 MB/s", 512 → "512 B/s".
+export function formatRate(bytesPerSec: number | null | undefined): string {
+  const label = formatBytes(bytesPerSec)
+  return label === '—' ? label : `${label}/s`
+}
+
 // Compact relative label, e.g. "12s ago", "4m ago".
 export function relative(nanos: bigint, nowMs: number = Date.now()): string {
   const secs = Math.max(0, Math.round((nowMs - Number(nanos / 1_000_000n)) / 1000))

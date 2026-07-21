@@ -5,7 +5,7 @@
 // bar/stacked-bar → BarChart (via seriesToBuckets), stat → MetricStat, table → MetricLegendTable.
 import { computed } from 'vue'
 import { seriesColor, seriesLabelKey } from '@/lib/core/seriesColor'
-import { formatNumber } from '@/lib/core/format'
+import { formatNumber, formatRate } from '@/lib/core/format'
 import { seriesToBuckets } from '@/lib/metrics/metricViz'
 import LineChart from '@/components/charts/LineChart.vue'
 import BarChart from '@/components/charts/BarChart.vue'
@@ -14,7 +14,9 @@ import MetricLegendTable from '@/components/metrics/MetricLegendTable.vue'
 
 const props = defineProps({
   series: { type: Array, default: () => [] },
-  unit: { type: String, default: '' },
+  unit: { type: String, default: '' }, //     PURE LABEL only — no transform, no axis pinning
+  percent: { type: Boolean, default: false }, // input series are 0–1 fractions: ×100 + '%' formatting
+  yRange: { type: Array, default: null }, //    forwarded verbatim to LineChart's `yRange` ([min,max])
   startMs: { type: Number, required: true },
   endMs: { type: Number, required: true },
   highlightKey: { type: String, default: null },
@@ -31,7 +33,10 @@ const lineSeries = computed(() =>
       key,
       label: key,
       color: seriesColor(key).stroke,
-      points: s.points.map((p) => ({ t: Number(p.t) / 1e6, v: p.v })),
+      points: s.points.map((p) => ({
+        t: Number(p.t) / 1e6,
+        v: p.v == null ? p.v : props.percent ? p.v * 100 : p.v,
+      })),
     }
   }),
 )
@@ -43,6 +48,11 @@ const stacked = computed(() => props.viz === 'stacked')
 const barStacked = computed(() => props.viz === 'stacked-bar')
 
 function formatValue(v) {
+  if (props.percent) {
+    const n = Number(v)
+    return `${Math.abs(n) < 10 && n !== 0 ? n.toFixed(1) : Math.round(n)}%`
+  }
+  if (props.unit === 'By/s') return formatRate(v)
   return formatNumber(v) + (props.unit && props.unit !== '1' ? ' ' + props.unit : '')
 }
 
@@ -86,6 +96,7 @@ defineExpose({ onPointClick })
     :area="area"
     :stacked="stacked"
     :y-log="yLog"
+    :y-range="yRange"
     :highlight-key="highlightKey"
     :loading="loading"
     @exemplar="(e) => emit('exemplar', e)"

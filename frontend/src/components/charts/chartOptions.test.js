@@ -402,3 +402,31 @@ describe('buildLineOptions yLog', () => {
     expect(hi).toBeGreaterThanOrEqual(50)
   })
 })
+
+describe('buildLineOptions yRange', () => {
+  it('yRange pins the y scale to the given bounds', () => {
+    const { opts } = buildLineOptions({
+      uPlot: fakeUplot,
+      series: [{ key: 'a', points: [{ t: 0, v: 0.4 }, { t: 60_000, v: 0.6 }] }],
+      startMs: 0,
+      endMs: 60_000,
+      yRange: [0, 100],
+    })
+    expect(opts.scales.y.range()).toEqual([0, 100])
+  })
+
+  it('y axis size grows to fit the widest tick label', () => {
+    const { opts } = buildLineOptions({
+      uPlot: fakeUplot,
+      series: [{ key: 'a', points: [{ t: 0, v: 1 }] }],
+      startMs: 0,
+      endMs: 60_000,
+      theme: {},
+    })
+    const yAxis = opts.axes[1]
+    const fakeU = { ctx: { measureText: (s) => ({ width: s.length * 7 }) } }
+    // "12,000 By/s" (11 chars * 7px = 77px) must not be clamped to the 50px default.
+    expect(yAxis.size(fakeU, ['12,000 By/s'], 1)).toBeGreaterThan(77 / (globalThis.devicePixelRatio || 1))
+    expect(yAxis.size(fakeU, null, 1)).toBe(50)
+  })
+})

@@ -73,3 +73,27 @@ export function useInfraHostSeries(
     refetchInterval: 15_000,
   })
 }
+
+// The full per-resource series bundle for one host — the view creates it ONCE and passes it to
+// both the glance tiles and the trend panels, so a tile and its section chart always read the
+// same query cache entry. GPU-dependent resources are gated on `hasGpu` (no polling for hosts
+// without a GPU), mirroring the existing gpu query's `enabled` gate.
+export function useHostResourceSeries(
+  host: MaybeRefOrGetter<string>,
+  startNs: MaybeRefOrGetter<string>,
+  endNs: MaybeRefOrGetter<string>,
+  hasGpu: MaybeRefOrGetter<boolean>,
+) {
+  return {
+    cpu: useInfraHostSeries(host, 'cpu', startNs, endNs),
+    memory: useInfraHostSeries(host, 'memory', startNs, endNs),
+    disk: useInfraHostSeries(host, 'disk', startNs, endNs),
+    network: useInfraHostSeries(host, 'network', startNs, endNs),
+    load: useInfraHostSeries(host, 'load', startNs, endNs),
+    gpu: useInfraHostSeries(host, 'gpu', startNs, endNs, hasGpu),
+    gpuMemory: useInfraHostSeries(host, 'gpu_memory', startNs, endNs, hasGpu),
+    gpuTemp: useInfraHostSeries(host, 'gpu_temp', startNs, endNs, hasGpu),
+    gpuPower: useInfraHostSeries(host, 'gpu_power', startNs, endNs, hasGpu),
+  }
+}
+export type HostResourceSeries = ReturnType<typeof useHostResourceSeries>

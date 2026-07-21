@@ -1,10 +1,18 @@
 # Deploying Photon with Docker
 
-Photon ships as a single ~30 MB non-root container: the Vue SPA, the REST/UI API, and both
+Photon ships as a single ~30 MB non-root container: the web UI, the REST/UI API, and both
 OTLP receivers are all served by one `photon-server` process. Configuration is entirely via
 `PHOTON_*` environment variables — no config file is required.
 
-## Quick start
+**The pieces, in plain terms:**
+
+| Piece | What it is | Where it runs |
+|---|---|---|
+| **Photon server** | The observability platform itself — stores your logs/traces/metrics and serves the dashboard you open in a browser | One machine, in Docker (this guide) |
+| **photon-agent** | A small program that reports a machine's CPU, memory, disk, network, and GPU to the server | On **every machine you want to monitor** ([see below](#monitoring-your-machines-photon-agent)) |
+| **Your applications** | Send their own logs/traces/metrics via OpenTelemetry, and browser data via the `@photon/rum` SDK | Wherever they already run |
+
+## Quick start (the server)
 
 ```bash
 cp .env.example .env
@@ -22,6 +30,122 @@ Ports: **8080** UI+API · **4317** OTLP gRPC · **4318** OTLP HTTP.
 
 Send data (OTLP/HTTP protobuf) to `http://<host>:4318/v1/logs` (and `/v1/traces`, `/v1/metrics`)
 with header `Authorization: Bearer $PHOTON_INGEST_TOKEN`.
+
+## Monitoring your machines (photon-agent)
+
+The server you just started only *receives* data — it doesn't know anything about your
+machines yet. To see a machine's CPU, memory, disk, network, and GPU in the
+**Infrastructure → Hosts** page, run `photon-agent` on that machine.
+
+Two things to know up front:
+
+- The agent runs **directly on the machine** (not inside Docker) — it has to see the real
+  hardware, not a container's view of it.
+- It needs exactly **two settings**: where your Photon server is, and the ingest token from
+  your `.env`. There is no registration step — the moment the agent starts sending, the host
+  appears in the UI (within ~15 seconds).
+
+### 1. Get the agent binary
+
+The Docker image does not include the agent — build it once from this repository (needs the
+[Rust toolchain](https://rustup.rs)):
+
+```bash
+cargo build --release -p photon-agent
+# → binary at target/release/photon-agent
+```
+
+The binary is self-contained. To monitor other machines of the **same OS/architecture**, just
+copy it over — no Rust needed on the target:
+
+```bash
+scp target/release/photon-agent user@machine:/usr/local/bin/photon-agent
+```
+
+(For a different OS/architecture, build on a matching machine or cross-compile.)
+
+### 2. Try it
+
+On the machine you want to monitor:
+
+```bash
+PHOTON_INGEST_TOKEN=<PHOTON_INGEST_TOKEN from your .env> \
+photon-agent --endpoint http://<photon-server-address>:4318/v1/metrics
+```
+
+Replace `<photon-server-address>` with the address of the machine running the Docker server
+(on that same machine, `127.0.0.1` works). Then open the UI → **Infrastructure → Hosts**:
+the machine appears within ~15 seconds, and clicking it opens per-resource charts.
+
+The agent is silent while everything works and prints a line only on errors — no output is
+good news.
+
+### 3. Keep it running (systemd service)
+
+So the agent survives reboots, install it as a service. Create
+`/etc/systemd/system/photon-agent.service`:
+
+```ini
+[Unit]
+Description=Photon host metrics agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/photon-agent
+Environment=PHOTON_AGENT_ENDPOINT=http://<photon-server-address>:4318/v1/metrics
+Environment=PHOTON_INGEST_TOKEN=<PHOTON_INGEST_TOKEN from your .env>
+Restart=always
+RestartSec=5
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now photon-agent
+systemctl status photon-agent     # should show "active (running)"
+```
+
+### Agent options
+
+Every flag has an environment-variable equivalent (flags win):
+
+| Flag | Env var | Default | Purpose |
+|---|---|---|---|
+| `--endpoint` | `PHOTON_AGENT_ENDPOINT` | `http://127.0.0.1:4318/v1/metrics` | Where to send metrics |
+| `--token` | `PHOTON_INGEST_TOKEN` | `dev-ingest-token` | Must match the server's ingest token |
+| `--host-name` | `PHOTON_AGENT_HOST` | the OS hostname | The name shown in the UI |
+| `--interval-secs` | `PHOTON_AGENT_INTERVAL` | `15` | Seconds between samples |
+| `--no-gpu` | `PHOTON_AGENT_NO_GPU` | off | Skip GPU sampling |
+
+**GPU metrics** (NVIDIA) are automatic: if the machine has an NVIDIA driver, utilization,
+GPU memory, temperature, and power appear on the host page; if not, the agent simply runs
+without them. No configuration either way.
+
+### If the host doesn't show up
+
+- **Wrong token** — must be exactly the server's `PHOTON_INGEST_TOKEN`. The agent prints
+  `ingest returned 401` if it isn't.
+- **Server unreachable** — the machine must reach port **4318** on the server (check
+  firewalls). The agent prints `send failed: …` if it can't connect.
+- **Wrong path** — the endpoint ends in `/v1/metrics`, not just the host and port.
+- **Looking too far back** — hosts only appear when they reported inside the selected time
+  range; keep it at "Last 15m" while testing.
+- **GPU missing but expected** — the agent reads NVIDIA's driver via NVML; make sure the
+  user it runs as can read `/dev/nvidia*` (worst case, add it to the `video` group).
+
+## Sending application telemetry
+
+- **Backend services**: point any OpenTelemetry SDK/collector at
+  `http://<host>:4318` (HTTP) or `:4317` (gRPC) with the
+  `Authorization: Bearer $PHOTON_INGEST_TOKEN` header. A stock OTel Collector works as-is.
+- **Browser (RUM)**: RUM apps are managed **in the UI** — create an app under RUM, copy the
+  generated public key (`pk_live_…`) into the `@photon/rum` snippet, and set the allowed
+  origins there. No server configuration is involved, and the beacon endpoint
+  (`POST /api/rum`) is always on; beacons from unregistered apps are rejected with a 403.
 
 ## Configuration (environment variables)
 
@@ -50,12 +174,6 @@ with `PHOTON_CONFIG=/etc/photon/photon.toml`); env vars override individual fiel
 | `PHOTON_DURABLE_SECRET_ACCESS_KEY` | | — | S3 secret key |
 
 An unconfigured server (no token/secret) **refuses to start** — this is intentional.
-
-**RUM apps (`[[rum.apps]]`) have no `PHOTON_*` env var equivalent** — it's a repeatable table
-(name/key/allowed_origins/sample_rate/rate_limit per frontend app), which doesn't map onto flat
-env vars. To enable the `POST /api/rum` beacon, mount a `photon.toml` with one or more
-`[[rum.apps]]` entries (see `photon.example.toml`) instead of using `.env` alone; other
-`PHOTON_*` vars still override individual fields on top of it.
 
 ## Data & persistence
 

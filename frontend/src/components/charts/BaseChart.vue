@@ -346,14 +346,14 @@ defineExpose({ onSetSelect, onSetCursor, recomputeOverlays, uplot })
     <div
       v-if="legendItems.length > 1"
       data-testid="chart-legend"
-      class="absolute inset-x-0 bottom-0 z-10 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 px-2"
+      class="absolute inset-x-0 bottom-0 z-10 flex flex-nowrap items-center gap-x-3 overflow-x-auto px-2 [justify-content:safe_center] [scrollbar-width:none]"
     >
       <button
         v-for="(it, i) in legendItems"
         :key="it.key"
         type="button"
         data-testid="chart-legend-item"
-        class="flex items-center gap-1.5 text-[11px] text-muted-foreground transition-opacity"
+        class="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-muted-foreground transition-opacity"
         :class="isShown(it.key) ? 'opacity-100' : 'opacity-40 line-through'"
         @click="toggleSeries(i, it)"
       >

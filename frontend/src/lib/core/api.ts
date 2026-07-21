@@ -585,6 +585,8 @@ export interface InfraHost {
   host: string
   cpuUtil: number | null
   memUtil: number | null
+  diskUtil: number | null
+  gpuUtil: number | null
   lastSeenNs: string
   hasGpu: boolean
 }

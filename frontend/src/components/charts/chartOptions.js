@@ -136,6 +136,15 @@ function themedAxes(theme, formatValue, xValues, xSplits) {
       grid,
       ticks,
       values: (u, splits) => splits.map((v) => formatValue(v)),
+      // Auto-size to the widest tick label. uPlot's default 50px axis clips long labels
+      // ("12,000 By/s" → "00 By/s"); `values` here are the already-formatted strings and
+      // ctx.measureText is in canvas px, so divide by pxRatio for CSS px.
+      size: (u, values) => {
+        if (!values) return 50
+        const ratio = globalThis.devicePixelRatio || 1
+        const w = Math.max(0, ...values.map((s) => u.ctx.measureText(String(s)).width / ratio))
+        return Math.max(50, Math.ceil(w) + 14)
+      },
     },
   ]
 }
@@ -180,6 +189,7 @@ export function buildLineOptions({
   highlightKey = null,
   compact = false, // mini/sparkline mode: hide axes + gridlines and shrink padding to just the trace
   yLog = false,
+  yRange = null, // fixed [min,max] y bounds (e.g. [0,100] for percent charts); yLog wins if both set
 }) {
   const list = series || []
   const { xs, ys } = alignSeries(list)
@@ -272,6 +282,12 @@ export function buildLineOptions({
         return [Math.max(lo, 1e-9), hi]
       },
     }
+  }
+
+  // Fixed y bounds (e.g. [0,100] for percent charts). A range FUNCTION pins it, same as x.
+  // yLog takes precedence — a log scale supplies its own range.
+  if (yRange && !yLog) {
+    opts.scales.y = { range: () => yRange }
   }
 
   return { data, opts, tooltipData }

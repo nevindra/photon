@@ -122,6 +122,10 @@ already was, without adding a new storage engine:
   | `disk` | `system.filesystem.utilization` | `mountpoint` |
   | `network` | `system.network.io` | `direction` |
   | `gpu` | `system.gpu.utilization` | `gpu` |
+  | `gpu_memory` | `system.gpu.memory.utilization` | `gpu` |
+  | `gpu_temp` | `system.gpu.temperature` | `gpu` |
+  | `gpu_power` | `system.gpu.power` | `gpu` |
+  | `load` | `system.cpu.load_average.1m` | `host.name` |
 
   `system.network.io` is a monotonic cumulative Sum, so `query_series` (no `agg` override) picks its
   default aggregation for a monotonic Sum — reset-aware `rate()` — meaning the network panel's series
@@ -132,9 +136,9 @@ already was, without adding a new storage engine:
 
 | Route | Purpose |
 |---|---|
-| `GET /api/infra/hosts?start=<ns>&end=<ns>` | distinct hosts + latest CPU/memory/GPU-presence vitals |
+| `GET /api/infra/hosts?start=<ns>&end=<ns>` | distinct hosts + latest CPU/memory/disk/GPU utilization vitals (`cpuUtil`/`memUtil`/`diskUtil`/`gpuUtil`, nullable fractions; `diskUtil`/`gpuUtil` are the WORST mountpoint/GPU, not a plain average) + `hasGpu` |
 | `GET /api/infra/hosts/:host?start=<ns>&end=<ns>` | one host's metadata (OS, cores, RAM, GPU names, last-seen) |
-| `GET /api/infra/hosts/:host/timeseries?resource=cpu\|memory\|disk\|network\|gpu&start=<ns>&end=<ns>&buckets=<n>` | curated bucketed series for one resource panel (`buckets` optional, default 48, clamped 1–500) |
+| `GET /api/infra/hosts/:host/timeseries?resource=cpu\|memory\|disk\|network\|gpu\|gpu_memory\|gpu_temp\|gpu_power\|load&start=<ns>&end=<ns>&buckets=<n>` | curated bucketed series for one resource panel (`buckets` optional, default 48, clamped 1–500) |
 
 Handler: `crates/photon-api/src/infra.rs`, registered in `crates/photon-api/src/lib.rs` alongside
 `/api/metrics/*`, behind the same session auth (`require_auth`) as the rest of the authenticated API.
@@ -147,23 +151,55 @@ Timestamps cross the wire as decimal-nanosecond strings (JS-safe), mirroring `me
 in `router/index.js` with the static `/infra` before the dynamic `/infra/:host` (same ordering
 convention as the RUM sub-routes).
 
-- **`InfraHostsView.vue`** — the host list: `useInfraHosts` polled every 15s, rendered via
-  `HostTable.vue` (one row per host — meter + percentage for CPU/memory, a GPU yes/blank flag);
-  row click navigates to `/infra/:host`. Empty state ("Run photon-agent on a host…") when no hosts
-  report.
-- **`InfraHostDetailView.vue`** — host header (OS/cores/RAM/GPU names) + `HostResourcePanels.vue`
-  (one `MetricChart` per resource — CPU/Memory/Disk/Network always render, GPU only when
-  `hasGpu`; each panel is its own `useInfraHostSeries` query so panels load independently). On
-  mount, sets the global scope to `{ type: 'host', id: host, label: host }` via `lib/core/context.ts`'s
+- **`InfraHostsView.vue`** — the host list: `useInfraHosts` polled every 15s, rendered as a fleet
+  KPI band (`HostFleetKpis.vue`) above a card grid (`HostCard.vue`, one per host); card click
+  navigates to `/infra/:host`. Empty state ("Run photon-agent on a host…") when no hosts report.
+  - **`HostFleetKpis.vue`** — one `StatTile` row derived client-side from the host list (no extra
+    query): Hosts (count), Warning/Critical (counts, tinted `warning`/`error` when >0), Avg CPU
+    (mean of non-null `cpuUtil`), GPU hosts (count of `hasGpu`). Per-host status is the worst of
+    `cpuUtil`/`memUtil`/`diskUtil`/`gpuUtil` via the new `hostStatus` helper
+    (`lib/infra/hostStats.ts`) — a critical host counts only toward Critical, never double-counted
+    as Warning.
+  - **`HostCard.vue`** — one card per host: name + a small `⚠ <RESOURCE>` flag naming the single
+    worst-degraded resource, labeled `Meter` rows for CPU/MEM/DSK (a null value skips its row) plus
+    a GPU row when `gpuUtil` is present, and a relative last-seen footer. A warn/error border tint
+    mirrors the flag's severity. No GPU device names (not in this API — see `HostStatTiles.vue`
+    below for those). `HostTable.vue` is removed (dead code); its coverage moved to
+    `HostCard.test.ts` and `hostStats.test.ts`.
+- **`InfraHostDetailView.vue`** — host header (OS/cores/RAM/GPU names) + a glance stat-tile row
+  (`HostStatTiles.vue`) + `HostResourcePanels.vue`'s per-resource trend sections, both driven off one
+  `useHostResourceSeries(host, startNs, endNs, hasGpu)` call hoisted in the view — a bundle of nine
+  `useInfraHostSeries` queries (`cpu`, `memory`, `disk`, `network`, `load`, `gpu`, `gpu_memory`,
+  `gpu_temp`, `gpu_power`; the four GPU ones additionally gated on `hasGpu` so they never fire for a
+  GPU-less host) passed down as one `res` prop to both children, so a tile and its section chart
+  always read the same query-cache entry.
+  - **`HostStatTiles.vue`** — a responsive tile grid (CPU · Memory with a used/total-bytes sub-label ·
+    worst-mountpoint Disk · Network combined rate · GPU util + GPU temp when `hasGpu`), each value
+    derived from the **last point** of the shared series via pure helpers in
+    `lib/infra/hostStats.ts` (`latestValue`/`latestTotal`/`worstSeries`/`sparkValues`, table-tested in
+    `HostStatTiles.test.ts`/`hostStats.test.ts`). Utilization tiles tint `warning`/`error` at the
+    shared **80%/90%** thresholds (`utilAccent`); the CPU and Memory tiles additionally render a
+    `Sparkline` off the same series through `StatTile`'s `#spark` slot.
+  - **`HostResourcePanels.vue`** — now purely presentational (no queries of its own; reads `res`);
+    each chart lives in a titled `charts/ChartPanel` card: a **CPU** card with a `Segmented`
+    total/per-core toggle in its `#summary` slot (`cpuSeriesForMode`, a client-side label filter over
+    the same already-fetched series — defaults to `total`) next to its **load-average (1m)** card; a
+    2-column **Memory** + **Network I/O** row; a **Disk** card listing per-mountpoint `Meter`s
+    worst-first above the trend chart; and, only when `hasGpu`, a 4-card **GPU** section
+    (Utilization/Memory/Temperature/Power), the device name(s) carried in the utilization card's
+    subtitle.
+  On mount, sets the global scope to `{ type: 'host', id: host, label: host }` via `lib/core/context.ts`'s
   `setScope`, so the time range + host scope carry through `AppShell`'s `ContextBar` and the
   "Related ▾" menu (`RelatedMenu`) the same way a service or RUM app scope would.
-- **Components** (`frontend/src/components/infra/`): `HostTable.vue`, `HostResourcePanels.vue` —
-  both reuse existing primitives (`ui/table`, `ui/meter`, `components/metrics/MetricChart.vue`), no
-  bespoke chart code.
+- **Components** (`frontend/src/components/infra/`): `HostFleetKpis.vue`, `HostCard.vue`,
+  `HostStatTiles.vue`, `HostResourcePanels.vue` — together reuse existing primitives (`ui/card`,
+  `ui/meter`, `ui/segmented`, `ui/sparkline`, `ui/stat-tile`, `charts/ChartPanel`,
+  `components/metrics/MetricChart.vue`), no bespoke chart code.
 - **Queries** (`frontend/src/lib/infra/infraQueries.ts`): `useInfraHosts`, `useInfraHost`,
-  `useInfraHostSeries` — same TanStack Query contract as the other per-signal query modules
-  (reactive inputs normalized with `toValue` into a computed `queryKey`, `keepPreviousData`,
-  15s polling for the two live views).
+  `useInfraHostSeries` (one resource at a time) and `useHostResourceSeries` (the nine-query bundle
+  above, hoisted once per host-detail view so its children share one cache read) — same TanStack
+  Query contract as the other per-signal query modules (reactive inputs normalized with `toValue`
+  into a computed `queryKey`, `keepPreviousData`, 15s polling for the two live views).
 - **NavRail:** the "Infrastructure" world now has two items — **Hosts** (`/infra`, `Server` icon) and
   **Ops** (`/uptime`, `Activity` icon) — instead of a single landing item into `/uptime`.
   `AppShell`'s `ROUTE_GROUP`/`LANDING` maps route `infra` → nav-group `infra` → landing `/infra`.

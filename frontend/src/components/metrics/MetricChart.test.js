@@ -77,6 +77,64 @@ describe('MetricChart', () => {
     w.findComponent(LineChart).vm.$emit('exemplar', { traceId: 'abc', t: 123 })
     expect(w.emitted('exemplar')[0]).toEqual([{ traceId: 'abc', t: 123 }])
   })
+
+  it('percent scales 0-1 fractions to 0-100, nulls pass through unscaled', () => {
+    const fractional = [
+      { labels: { service: 'checkout' }, points: [{ t: '0', v: 0.4 }, { t: '1000000', v: null }] },
+    ]
+    const w = mountChart({ series: fractional, percent: true, startMs: 0, endMs: 3 })
+    expect(w.findComponent(LineChart).props('series')[0].points).toEqual([
+      { t: 0, v: 40 },
+      { t: 1, v: null },
+    ])
+  })
+
+  it('forwards yRange verbatim to LineChart; percent alone leaves it null', () => {
+    const frac = [{ labels: {}, points: [{ t: '0', v: 0.4 }] }]
+    // percent does the ×100 transform but does NOT pin the axis on its own
+    const auto = mountChart({ series: frac, percent: true, startMs: 0, endMs: 3 })
+    expect(auto.findComponent(LineChart).props('yRange')).toBeNull()
+    // an explicit yRange is forwarded through untouched
+    const pinned = mountChart({ series: frac, percent: true, yRange: [0, 100], startMs: 0, endMs: 3 })
+    expect(pinned.findComponent(LineChart).props('yRange')).toEqual([0, 100])
+  })
+
+  // Explorer-safety guarantee: MetricsExplorer forwards arbitrary OTLP `unit` (incl. "%") into
+  // MetricChart. `unit` is now a PURE LABEL — a metric already in 0–100 with unit "%" must not be
+  // double-scaled onto a pinned axis. Only the `percent` prop transforms; only `yRange` pins.
+  it('unit="%" alone does NOT transform values and does NOT pin the range', () => {
+    const already0to100 = [
+      { labels: { service: 'checkout' }, points: [{ t: '0', v: 42 }, { t: '1000000', v: null }] },
+    ]
+    const w = mountChart({ series: already0to100, unit: '%', startMs: 0, endMs: 3 })
+    const lineChart = w.findComponent(LineChart)
+    expect(lineChart.props('series')[0].points).toEqual([
+      { t: 0, v: 42 }, // NOT ×100 — no double-scale
+      { t: 1, v: null },
+    ])
+    expect(lineChart.props('yRange')).toBeNull() // NOT pinned to [0,100]
+  })
+
+  it('leaves non-percent units unscaled with a null yRange', () => {
+    const w = mountChart({ series: ONE_SERIES, unit: 'ms', startMs: 0, endMs: 3 })
+    const lineChart = w.findComponent(LineChart)
+    expect(lineChart.props('series')[0].points[0]).toEqual({ t: 0, v: 10 })
+    expect(lineChart.props('yRange')).toBeNull()
+  })
+
+  it('formatValue renders percent with one decimal under 10, rounded otherwise', () => {
+    const w = mountChart({ series: ONE_SERIES, percent: true, startMs: 0, endMs: 3 })
+    const formatValue = w.findComponent(LineChart).props('formatValue')
+    expect(formatValue(4.567)).toBe('4.6%')
+    expect(formatValue(0)).toBe('0%')
+    expect(formatValue(42.9)).toBe('43%')
+  })
+
+  it('formatValue renders "By/s" via formatRate', () => {
+    const w = mountChart({ series: ONE_SERIES, unit: 'By/s', startMs: 0, endMs: 3 })
+    const formatValue = w.findComponent(LineChart).props('formatValue')
+    expect(formatValue(2_150_000)).toBe('2.1 MB/s')
+  })
 })
 
 const series = [{ labels: { svc: 'a' }, points: [{ t: '1000000', v: 5 }] }]

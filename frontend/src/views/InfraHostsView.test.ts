@@ -57,14 +57,14 @@ describe('InfraHostsView', () => {
     setTimeRange('30m')
   })
 
-  it('mounts and renders one row per reporting host', async () => {
+  it('mounts and renders one card per reporting host', async () => {
     const { wrapper } = await mountView()
     await flushPromises()
     expect(wrapper.find('[data-testid="infra-hosts"]').exists()).toBe(true)
-    const rows = wrapper.findAll('[data-testid="infra-host-row"]')
-    expect(rows).toHaveLength(2)
-    expect(rows[0].attributes('data-host')).toBe('web-1')
-    expect(rows[1].attributes('data-host')).toBe('gpu-node-1')
+    const cards = wrapper.findAll('[data-testid="infra-host-card"]')
+    expect(cards).toHaveLength(2)
+    expect(cards[0].attributes('data-host')).toBe('web-1')
+    expect(cards[1].attributes('data-host')).toBe('gpu-node-1')
     wrapper.unmount()
   })
 

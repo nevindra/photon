@@ -11,6 +11,7 @@ const props = defineProps<{
   accent?: 'success' | 'error' | 'warning' | 'info' | 'neutral'
   delta?: number | string
   deltaDirection?: 'up' | 'down' | 'flat'
+  sub?: string
   class?: HTMLAttributes['class']
 }>()
 
@@ -45,17 +46,21 @@ const deltaColorClass = computed(() => {
     "
   >
     <div v-if="props.accent" class="absolute inset-y-0 left-0 w-1" :class="TONE[props.accent].dot" />
-    <div class="space-y-2">
-      <p class="text-xs text-muted-foreground">{{ props.label }}</p>
-      <div class="flex items-baseline gap-2">
-        <p :class="cn('text-2xl font-semibold tabular-nums text-foreground', props.mono && 'font-mono')">
-          {{ props.value }}
-        </p>
-        <div v-if="props.delta !== undefined" class="flex items-center gap-1">
-          <component :is="DeltaIcon" :class="cn('h-3.5 w-3.5', deltaColorClass)" />
-          <span :class="cn('text-xs font-medium', deltaColorClass)">{{ props.delta }}</span>
+    <div class="flex items-end justify-between gap-2">
+      <div class="space-y-2">
+        <p class="text-xs text-muted-foreground">{{ props.label }}</p>
+        <div class="flex items-baseline gap-2">
+          <p :class="cn('text-2xl font-semibold tabular-nums text-foreground', props.mono && 'font-mono')">
+            {{ props.value }}
+          </p>
+          <div v-if="props.delta !== undefined" class="flex items-center gap-1">
+            <component :is="DeltaIcon" :class="cn('h-3.5 w-3.5', deltaColorClass)" />
+            <span :class="cn('text-xs font-medium', deltaColorClass)">{{ props.delta }}</span>
+          </div>
         </div>
+        <p v-if="props.sub" class="text-xs text-muted-foreground">{{ props.sub }}</p>
       </div>
+      <div v-if="$slots.spark" class="pb-0.5 text-primary/70"><slot name="spark" /></div>
     </div>
   </div>
 </template>

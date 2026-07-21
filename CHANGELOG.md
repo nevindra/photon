@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Infra host detail v2 (`/infra/:host`).** The host page is now a two-layer monitoring
+  view: a glance **stat-tile row** (CPU · Memory with absolute GB · worst-mountpoint disk ·
+  network rate · GPU util · GPU temp; warn/error tint at the shared 80%/90% thresholds;
+  CPU + Memory sparklines) above per-resource **trend sections in ChartPanel cards** — CPU
+  with a `total | per-core` toggle and a 1m load-average chart, Memory + Network, Disk
+  per-mountpoint meters + trend, and a 4-chart GPU section (utilization, memory,
+  temperature, power). Tiles derive from the last point of the same series the charts
+  plot — no extra API calls. Backed by four new curated resources on
+  `GET /api/infra/hosts/:host/timeseries`: `gpu_memory`, `gpu_temp`, `gpu_power`, `load`.
+- **Infra fleet executive summary (`/infra`).** The hosts list is now a **fleet KPI band**
+  (hosts · warning · critical · avg CPU · GPU hosts — a degraded host counts in exactly one
+  bucket) above a **host-card grid** (CPU/MEM/DSK/GPU meters, degraded border tint +
+  worst-resource flag, last-seen) replacing the old table, so fleet health reads at a
+  glance without opening each host. `GET /api/infra/hosts` rows gain `diskUtil` (the
+  **worst** mountpoint, not an average) and `gpuUtil`.
+
+### Fixed
+
+- **Chart y-axis labels no longer clip** (the "00 By/s" artifact): axes auto-size to the
+  widest formatted label, and byte-rate axes use compact units (`2.1 MB/s`).
+- **Utilization charts render on a fixed 0–100 % axis** instead of auto-zooming to a
+  sliver of raw fractions (e.g. memory at "0.468–0.478").
+- **Chart legends never wrap** into a multi-row block — one horizontally scrollable row.
+
+### Changed
+
+- **`MetricChart`'s percent handling is an explicit contract**, not a unit-string side
+  effect: `unit` is a pure label; the ×100 fraction transform is an opt-in `percent` prop
+  and axis pinning an explicit `yRange` — so third-party OTLP metrics declaring `unit="%"`
+  in the metrics explorer are never silently rescaled (regression-tested). The services
+  "Error %" chart keeps its auto-ranged axis.
+- `StatTile` gains an optional `sub` line and `#spark` slot (additive).
+
 ## [1.3.0] - 2026-07-20
 
 A feature release adding **system-wide alerting & notifications** — a cross-signal

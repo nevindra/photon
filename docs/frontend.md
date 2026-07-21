@@ -114,8 +114,15 @@ pushes to.
 - **`logs/` · `traces/` · `services/` · `metrics/` · `uptime/` · `data/` · `rum/` · `infra/` ·
   `alerts/`** — the per-signal domain components (see the per-feature docs in
   [`subsystems/`](subsystems/) for the file lists). `infra/` (host/GPU resource monitoring):
-  `HostTable.vue` (host list rows — CPU/memory meters + GPU flag), `HostResourcePanels.vue`
-  (per-resource `MetricChart` panels for one host). `alerts/` (the webhook alert engine, cross-signal):
+  `HostFleetKpis.vue` (the `/infra` fleet KPI band — host/warning/critical counts, avg CPU, GPU
+  hosts, derived client-side from the host list) + `HostCard.vue` (the host card grid replacing the
+  old `HostTable.vue` — CPU/MEM/DSK/GPU meters, a worst-resource degraded flag, last-seen),
+  `HostStatTiles.vue` (the
+  `/infra/:host` glance stat-tile row — last-point derivation off a shared series bundle, 80%/90%
+  warn/error tint), `HostResourcePanels.vue` (presentational per-resource trend cards — each chart in
+  a titled `charts/ChartPanel`: CPU total/per-core toggle + load average, memory/network, disk
+  meters, a 4-card GPU section — reads the same series bundle rather than owning its own queries; see
+  [`subsystems/infra.md`](subsystems/infra.md)). `alerts/` (the webhook alert engine, cross-signal):
   `AlertStatBand`, `AlertRulesTable`/`AlertRuleRow` (its "Browse templates" button + empty-state link
   open the quick-setup picker), `AlertRuleDialog`/`ConditionBuilder` (the plain-English condition
   builder — `AlertRuleDialog` also accepts an optional `:seed` prop, a partial `RuleInput` that
@@ -146,7 +153,7 @@ rule above.
 |---|---|---|
 | `segmented` | segmented control on Reka ToggleGroup (traces/spans, table/cards); active item gets the raised pill | TS |
 | `nav-tabs` | sub-navigation tab bar (route sub-nav) | JS |
-| `stat-tile` | KPI tile: label + value + delta-arrow trend; raised, hover-lifts | TS |
+| `stat-tile` | KPI tile: label + value + delta-arrow trend, optional `sub` caption + a `#spark` slot for an inline sparkline; raised, hover-lifts | TS |
 | `sparkline` | inline-SVG polyline sparkline with last-point dot | JS |
 | `status-dot` / `status-pill` | small tone-colored dot / pill label | TS |
 | `peek-drawer` | Sheet-based side drawer with prev/next stepping through a list | JS |
@@ -200,7 +207,9 @@ follow the same contract) plus its signal-specific helpers:
 - **`services/`** — `servicesQueries.ts`, `serviceHealth.ts`, `serviceColor.ts` (stable hash → palette).
 - **`uptime/`** — `uptimeQueries.ts`.
 - **`data/`** — `dataQueries.ts`.
-- **`infra/`** — `infraQueries.ts` (`useInfraHosts`/`useInfraHost`/`useInfraHostSeries`).
+- **`infra/`** — `infraQueries.ts` (`useInfraHosts`/`useInfraHost`/`useInfraHostSeries`, plus
+  `useHostResourceSeries` — the nine-resource query bundle for one host-detail view) and
+  `hostStats.ts` (pure last-point/worst-series/threshold helpers for the glance tiles).
 
 **Cross-signal:**
 - `alertsQueries.ts` (root `lib/`, not a per-signal folder — the alert engine spans metrics/logs/

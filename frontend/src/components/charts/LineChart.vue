@@ -31,6 +31,7 @@ const props = defineProps({
   compact: { type: Boolean, default: false }, // mini mode: no axes/legend, tight padding, small height
   height: { type: Number, default: 240 }, //     chart pixel height (forwarded to BaseChart)
   yLog: { type: Boolean, default: false }, //    base-10 log y-scale (wide-dynamic-range metrics)
+  yRange: { type: Array, default: null }, //     fixed [min,max] y bounds (e.g. [0,100] for percent charts)
 })
 
 // `exemplar` is declared per the contract but inert until backend exemplars ship (metrics).
@@ -52,6 +53,7 @@ function builderArgs(U, theme) {
     highlightKey: props.highlightKey,
     compact: props.compact,
     yLog: props.yLog,
+    yRange: props.yRange,
   }
 }
 

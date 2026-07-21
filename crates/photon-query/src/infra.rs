@@ -40,6 +40,10 @@ const MEM_LIMIT: &str = "system.memory.limit";
 const FS_UTIL: &str = "system.filesystem.utilization";
 const NET_IO: &str = "system.network.io";
 const GPU_UTIL: &str = "system.gpu.utilization";
+const GPU_MEM_UTIL: &str = "system.gpu.memory.utilization";
+const GPU_TEMP: &str = "system.gpu.temperature";
+const GPU_POWER: &str = "system.gpu.power";
+const LOAD_1M: &str = "system.cpu.load_average.1m";
 
 /// One host with its latest headline vitals over a window — the Infrastructure list row.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +53,14 @@ pub struct HostSummary {
     pub cpu_util: Option<f64>,
     /// Latest (window-avg) `system.memory.utilization` in `[0,1]`, if reported.
     pub mem_util: Option<f64>,
+    /// The WORST mountpoint's window-avg `system.filesystem.utilization` in `[0,1]` — the MAX
+    /// across the host's `(host, mountpoint)` groups, if any filesystem point was reported. A
+    /// plain per-host avg would dilute a real problem on one mountpoint (e.g. a full `/`) with
+    /// an idle one (e.g. `/boot/efi`).
+    pub disk_util: Option<f64>,
+    /// The WORST GPU's window-avg `system.gpu.utilization` in `[0,1]` — the MAX across the
+    /// host's `(host, gpu)` groups, if any GPU point was reported.
+    pub gpu_util: Option<f64>,
     /// Newest sample timestamp seen for the host's CPU metric (epoch nanos); `0` if unknown.
     pub last_seen_ns: i64,
     /// Whether any `system.gpu.utilization` row exists for the host in the window.
@@ -79,7 +91,7 @@ pub struct HostSeries {
     pub series: Vec<crate::SeriesResult>,
 }
 
-/// The five curated resource panels. `from_str` parses the API path segment; `primary` maps each
+/// The curated resource panels. `from_str` parses the API path segment; `primary` maps each
 /// to its headline metric + the data-point attribute the panel breaks down by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfraResource {
@@ -88,6 +100,10 @@ pub enum InfraResource {
     Disk,
     Network,
     Gpu,
+    GpuMemory,
+    GpuTemp,
+    GpuPower,
+    Load,
 }
 
 impl InfraResource {
@@ -99,6 +115,10 @@ impl InfraResource {
             "disk" => Some(InfraResource::Disk),
             "network" => Some(InfraResource::Network),
             "gpu" => Some(InfraResource::Gpu),
+            "gpu_memory" => Some(InfraResource::GpuMemory),
+            "gpu_temp" => Some(InfraResource::GpuTemp),
+            "gpu_power" => Some(InfraResource::GpuPower),
+            "load" => Some(InfraResource::Load),
             _ => None,
         }
     }
@@ -110,6 +130,10 @@ impl InfraResource {
             InfraResource::Disk => "disk",
             InfraResource::Network => "network",
             InfraResource::Gpu => "gpu",
+            InfraResource::GpuMemory => "gpu_memory",
+            InfraResource::GpuTemp => "gpu_temp",
+            InfraResource::GpuPower => "gpu_power",
+            InfraResource::Load => "load",
         }
     }
 
@@ -121,6 +145,10 @@ impl InfraResource {
             InfraResource::Disk => (FS_UTIL, "mountpoint"),
             InfraResource::Network => (NET_IO, "direction"),
             InfraResource::Gpu => (GPU_UTIL, "gpu"),
+            InfraResource::GpuMemory => (GPU_MEM_UTIL, "gpu"),
+            InfraResource::GpuTemp => (GPU_TEMP, "gpu"),
+            InfraResource::GpuPower => (GPU_POWER, "gpu"),
+            InfraResource::Load => (LOAD_1M, HOST_ATTR),
         }
     }
 }
@@ -200,6 +228,8 @@ impl MetricsQueryEngine {
                             host: h,
                             cpu_util: cpu(i),
                             mem_util: None,
+                            disk_util: None,
+                            gpu_util: None,
                             last_seen_ns: last(i).unwrap_or(0),
                             has_gpu: false,
                         });
@@ -215,6 +245,16 @@ impl MetricsQueryEngine {
         .await?;
         // GPU presence: any gpu-utilization row for the host in-window.
         self.mark_gpu_presence(&mut out, start_ns, end_ns).await?;
+        // Worst-mountpoint disk utilization (max of per-mountpoint window-avg).
+        self.fill_worst_gauge(&mut out, FS_UTIL, "mountpoint", start_ns, end_ns, |h, v| {
+            h.disk_util = Some(v)
+        })
+        .await?;
+        // Worst-GPU utilization (max of per-gpu window-avg).
+        self.fill_worst_gauge(&mut out, GPU_UTIL, "gpu", start_ns, end_ns, |h, v| {
+            h.gpu_util = Some(v)
+        })
+        .await?;
 
         Ok(out.into_values().collect())
     }
@@ -259,6 +299,68 @@ impl MetricsQueryEngine {
                         set(hs, val);
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set a headline gauge on the hosts already discovered by `infra_hosts`, aggregating the
+    /// WORST (max) window-avg across a non-promoted data-point breakdown attribute — e.g. the
+    /// worst mountpoint's disk utilization, or the worst GPU's utilization. Unlike
+    /// `fill_latest_gauge` (a plain per-host avg), this groups by `(host.name,
+    /// get_field(attributes, group_attr))` first, then folds the MAX per host into `out` — a
+    /// plain avg would dilute a real problem on one group (a full `/` disk) with an idle one
+    /// (`/boot/efi`). Hosts absent from `out` (no CPU signal) are ignored — same semantics as
+    /// `fill_latest_gauge`.
+    async fn fill_worst_gauge(
+        &self,
+        out: &mut BTreeMap<String, HostSummary>,
+        metric: &str,
+        group_attr: &str,
+        start_ns: i64,
+        end_ns: i64,
+        set: impl Fn(&mut HostSummary, f64),
+    ) -> Result<(), PhotonError> {
+        let req = MetricRequest {
+            metric: metric.to_string(),
+            start_ts_nanos: start_ns,
+            end_ts_nanos: end_ns,
+            filter: None,
+            host: None,
+        };
+        let Some(df) = self.survivors_df(&req).await? else {
+            return Ok(());
+        };
+        let group = get_field(col_ref(metric_schema::ATTRIBUTES), group_attr);
+        let batches = df
+            .filter(metric_base_predicate(&req))
+            .map_err(|e| PhotonError::Query(format!("infra fill_worst_gauge filter: {e}")))?
+            .aggregate(
+                vec![col_ref(HOST_ATTR).alias("host"), group.alias("group")],
+                vec![avg(col_ref(metric_schema::VALUE)).alias("v")],
+            )
+            .map_err(|e| PhotonError::Query(format!("infra fill_worst_gauge aggregate: {e}")))?
+            .collect()
+            .await
+            .map_err(|e| PhotonError::Query(format!("infra fill_worst_gauge collect: {e}")))?;
+        let mut worst: BTreeMap<String, f64> = BTreeMap::new();
+        for b in &batches {
+            let host = str_col(b, 0)?;
+            let v = f64_col(b, 2);
+            for i in 0..b.num_rows() {
+                if host.is_valid(i) {
+                    if let Some(val) = v(i) {
+                        worst
+                            .entry(host.value(i).to_string())
+                            .and_modify(|m| *m = m.max(val))
+                            .or_insert(val);
+                    }
+                }
+            }
+        }
+        for (host, val) in worst {
+            if let Some(hs) = out.get_mut(&host) {
+                set(hs, val);
             }
         }
         Ok(())
@@ -631,7 +733,9 @@ mod tests_fixture {
     }
 
     /// Two hosts (`web-1`, `web-2`) each reporting CPU + memory utilization; `web-1` additionally
-    /// reports a GPU. CPU points carry a `cpu` data-point attribute and `os.type`.
+    /// reports a GPU and TWO filesystem mountpoints (`/` at 0.67, `/boot/efi` at 0.04 — a full
+    /// disk and an idle one, so worst-mountpoint aggregation has something to prove). CPU points
+    /// carry a `cpu` data-point attribute and `os.type`.
     pub(super) async fn two_hosts_cpu() -> (tempfile::TempDir, MetricsQueryEngine) {
         let dir = tempfile::tempdir().unwrap();
         let hot = dir.path().to_path_buf();
@@ -659,6 +763,8 @@ mod tests_fixture {
                             &[("cpu", "total"), ("os.type", "linux")],
                         ),
                         mp(MEM_UTIL, "web-1", 20, 0.55, &[("os.type", "linux")]),
+                        mp(FS_UTIL, "web-1", 20, 0.67, &[("mountpoint", "/")]),
+                        mp(FS_UTIL, "web-1", 22, 0.04, &[("mountpoint", "/boot/efi")]),
                         mp(
                             GPU_UTIL,
                             "web-1",
@@ -666,6 +772,28 @@ mod tests_fixture {
                             0.80,
                             &[("gpu", "0"), ("gpu.name", "NVIDIA A100")],
                         ),
+                        mp(
+                            GPU_MEM_UTIL,
+                            "web-1",
+                            20,
+                            0.55,
+                            &[("gpu", "0"), ("gpu.name", "NVIDIA A100")],
+                        ),
+                        mp(
+                            GPU_TEMP,
+                            "web-1",
+                            20,
+                            61.0,
+                            &[("gpu", "0"), ("gpu.name", "NVIDIA A100")],
+                        ),
+                        mp(
+                            GPU_POWER,
+                            "web-1",
+                            20,
+                            180.0,
+                            &[("gpu", "0"), ("gpu.name", "NVIDIA A100")],
+                        ),
+                        mp(LOAD_1M, "web-1", 20, 1.25, &[("os.type", "linux")]),
                         mp(
                             CPU_UTIL,
                             "web-2",
@@ -742,6 +870,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn infra_hosts_reports_worst_disk_and_gpu_util() {
+        let (_dir, engine) = super::tests_fixture::two_hosts_cpu().await;
+        let mut hosts = engine.infra_hosts(0, i64::MAX).await.unwrap();
+        hosts.sort_by(|a, b| a.host.cmp(&b.host));
+        let web1 = &hosts[0];
+        let web2 = &hosts[1];
+
+        // The WORST mountpoint (max), NOT the ~0.355 avg of 0.67 and 0.04 — this is the point of
+        // the test: a plain per-host avg would hide a nearly-full `/` behind an idle `/boot/efi`.
+        let disk = web1.disk_util.expect("web-1 reported filesystem points");
+        assert!(
+            (disk - 0.67).abs() < 1e-9,
+            "expected the max mountpoint (0.67), got {disk} (a plain avg would be ~0.355)"
+        );
+        let gpu = web1.gpu_util.expect("web-1 reported a GPU point");
+        assert!((gpu - 0.80).abs() < 1e-9, "expected 0.80, got {gpu}");
+
+        assert_eq!(web2.disk_util, None, "web-2 has no filesystem points");
+        assert_eq!(web2.gpu_util, None, "web-2 has no GPU points");
+    }
+
+    #[tokio::test]
     async fn infra_host_detail_reports_cores_and_last_seen() {
         let (_dir, engine) = super::tests_fixture::host_with_core_count().await;
         let d = engine
@@ -786,6 +936,42 @@ mod tests {
                 "buckets must be clamped to MAX_BUCKETS, got {}",
                 s.points.len()
             );
+        }
+    }
+
+    #[test]
+    fn infra_resource_parses_the_new_resources() {
+        assert_eq!(
+            InfraResource::from_str("gpu_memory"),
+            Some(InfraResource::GpuMemory)
+        );
+        assert_eq!(
+            InfraResource::from_str("gpu_temp"),
+            Some(InfraResource::GpuTemp)
+        );
+        assert_eq!(
+            InfraResource::from_str("gpu_power"),
+            Some(InfraResource::GpuPower)
+        );
+        assert_eq!(InfraResource::from_str("load"), Some(InfraResource::Load));
+        assert_eq!(InfraResource::from_str("nope"), None);
+    }
+
+    #[tokio::test]
+    async fn infra_host_series_serves_the_new_gpu_and_load_resources() {
+        let (_dir, engine) = super::tests_fixture::two_hosts_cpu().await;
+        for (resource, name) in [
+            (InfraResource::GpuMemory, "gpu_memory"),
+            (InfraResource::GpuTemp, "gpu_temp"),
+            (InfraResource::GpuPower, "gpu_power"),
+            (InfraResource::Load, "load"),
+        ] {
+            let r = engine
+                .infra_host_series("web-1", resource, 0, i64::MAX, 12)
+                .await
+                .unwrap();
+            assert_eq!(r.resource, name);
+            assert!(!r.series.is_empty(), "{name} series must not be empty");
         }
     }
 }

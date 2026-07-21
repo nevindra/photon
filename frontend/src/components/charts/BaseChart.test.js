@@ -55,6 +55,19 @@ describe('BaseChart', () => {
     expect(chips[0].classes()).not.toContain('line-through')
   })
 
+  it('legend row never wraps (single scrollable row)', () => {
+    const w = mount(BaseChart, {
+      props: {
+        buildOptions: withData,
+        legendItems: [...LEGEND, { key: 'c', label: 'Gamma', color: '#22c55e' }],
+      },
+    })
+    const el = w.get('[data-testid="chart-legend"]')
+    expect(el.classes()).toContain('flex-nowrap')
+    expect(el.classes()).toContain('overflow-x-auto')
+    expect(el.classes()).not.toContain('flex-wrap')
+  })
+
   it('renders marker / band / refline overlays with their labels', () => {
     const w = mount(BaseChart, {
       props: {

@@ -163,7 +163,10 @@ const chartsLoading = computed(() => timeseries.isFetching.value)
 
 const errorRateSeries = computed(() => {
   if (!buckets.value.length) return []
-  return [{ labels: {}, points: buckets.value.map((b) => ({ t: b.ts, v: (b.error_rate ?? 0) * 100 })), exemplars: [] }]
+  // 0-1 fraction, NOT pre-scaled — MetricChart's `percent` prop multiplies by 100 itself;
+  // pre-scaling here would double-scale the chart. No yRange here → axis auto-ranges so a
+  // low error line stays readable (unlike the utilization panels, which pin [0,100]).
+  return [{ labels: {}, points: buckets.value.map((b) => ({ t: b.ts, v: b.error_rate ?? 0 })), exemplars: [] }]
 })
 
 const latencySeries = computed(() => {
@@ -231,7 +234,7 @@ function onOpenDependencyTraces() {
           <ServiceVolumeChart :buckets="buckets" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
         </ChartPanel>
         <ChartPanel title="Error %" subtitle="Share of requests that errored">
-          <MetricChart :series="errorRateSeries" unit="%" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
+          <MetricChart :series="errorRateSeries" percent :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
         </ChartPanel>
         <ChartPanel title="Latency" subtitle="p50 / p90 / p99 · ms">
           <MetricChart :series="latencySeries" unit="ms" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />

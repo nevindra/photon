@@ -27,6 +27,8 @@ fn host_summary_json(h: &HostSummary) -> Value {
         "host": h.host,
         "cpuUtil": h.cpu_util,
         "memUtil": h.mem_util,
+        "diskUtil": h.disk_util,
+        "gpuUtil": h.gpu_util,
         "lastSeenNs": h.last_seen_ns.to_string(),
         "hasGpu": h.has_gpu,
     })
@@ -138,6 +140,8 @@ mod tests {
             host: "web-1".into(),
             cpu_util: Some(0.4),
             mem_util: None,
+            disk_util: Some(0.67),
+            gpu_util: None,
             last_seen_ns: 1_700_000_000_000_000_000,
             has_gpu: true,
         };
@@ -146,6 +150,8 @@ mod tests {
         assert_eq!(v["hasGpu"], true);
         assert_eq!(v["cpuUtil"], 0.4);
         assert_eq!(v["memUtil"], Value::Null);
+        assert_eq!(v["diskUtil"], 0.67);
+        assert_eq!(v["gpuUtil"], Value::Null);
     }
 
     #[test]
@@ -203,6 +209,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn timeseries_accepts_the_new_resources() {
+        use tower::ServiceExt;
+        for resource in ["gpu_memory", "gpu_temp", "gpu_power", "load"] {
+            let router = crate::test_router();
+            let cookie = crate::session_cookie(&router).await;
+            let resp = router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!(
+                            "/api/infra/hosts/web-1/timeseries?resource={resource}&start=0&end=1"
+                        ))
+                        .header(axum::http::header::COOKIE, cookie)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "resource `{resource}`");
+        }
     }
 
     #[tokio::test]

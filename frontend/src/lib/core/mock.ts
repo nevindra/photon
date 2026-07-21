@@ -1611,8 +1611,8 @@ export function mockRumErrorDetail(app: string, fingerprint: string): RumErrorDe
 
 // ---- Infra (host/GPU resource monitoring) fixtures -----------------------------------------
 // A small fixed host corpus mirroring GET /api/infra/hosts, /:host, and /:host/timeseries. Field
-// names match the real API's camelCase JSON exactly (cpuUtil/memUtil/lastSeenNs/hasGpu/
-// totalRamBytes/gpus) so api.ts's mock fallback is shape-identical to the server. The
+// names match the real API's camelCase JSON exactly (cpuUtil/memUtil/diskUtil/gpuUtil/lastSeenNs/
+// hasGpu/totalRamBytes/gpus) so api.ts's mock fallback is shape-identical to the server. The
 // `InfraHost*`/`InfraSeriesResult` shapes themselves are canonically defined in `api.ts` (the
 // source of truth for the wire contract) and imported type-only above — no duplicate declarations.
 
@@ -1625,14 +1625,17 @@ interface InfraHostFixture {
   gpus: string[]
   cpuUtil: number
   memUtil: number
+  diskUtil: number
+  gpuUtil: number | null
 }
 
 // Two ordinary web hosts + one GPU node, so the host table and the GPU-only panel both have
-// something real to show in demo mode.
+// something real to show in demo mode. web-2's disk is deliberately elevated so the fleet KPI band
+// (warning/critical counts) and host card degraded-flag have something real to show.
 const INFRA_HOSTS: InfraHostFixture[] = [
-  { host: 'web-1', os: 'linux', cores: 8, totalRamBytes: 16 * 1024 ** 3, hasGpu: false, gpus: [], cpuUtil: 0.32, memUtil: 0.54 },
-  { host: 'web-2', os: 'linux', cores: 8, totalRamBytes: 16 * 1024 ** 3, hasGpu: false, gpus: [], cpuUtil: 0.41, memUtil: 0.61 },
-  { host: 'gpu-node-1', os: 'linux', cores: 32, totalRamBytes: 128 * 1024 ** 3, hasGpu: true, gpus: ['NVIDIA A100'], cpuUtil: 0.58, memUtil: 0.72 },
+  { host: 'web-1', os: 'linux', cores: 8, totalRamBytes: 16 * 1024 ** 3, hasGpu: false, gpus: [], cpuUtil: 0.32, memUtil: 0.54, diskUtil: 0.45, gpuUtil: null },
+  { host: 'web-2', os: 'linux', cores: 8, totalRamBytes: 16 * 1024 ** 3, hasGpu: false, gpus: [], cpuUtil: 0.41, memUtil: 0.61, diskUtil: 0.84, gpuUtil: null },
+  { host: 'gpu-node-1', os: 'linux', cores: 32, totalRamBytes: 128 * 1024 ** 3, hasGpu: true, gpus: ['NVIDIA A100'], cpuUtil: 0.58, memUtil: 0.72, diskUtil: 0.63, gpuUtil: 0.37 },
 ]
 
 export function mockInfraHosts(): InfraHostsResult {
@@ -1642,6 +1645,8 @@ export function mockInfraHosts(): InfraHostsResult {
       host: h.host,
       cpuUtil: h.cpuUtil,
       memUtil: h.memUtil,
+      diskUtil: h.diskUtil,
+      gpuUtil: h.gpuUtil,
       lastSeenNs: now,
       hasGpu: h.hasGpu,
     })),
@@ -1682,6 +1687,14 @@ function infraSeriesGroups(resource: string, h: InfraHostFixture): { labels: Rec
       ]
     case 'gpu':
       return h.hasGpu ? [{ labels: { gpu: '0' }, base: 0.63 }] : []
+    case 'load':
+      return [{ labels: { 'host.name': h.host }, base: 1.4 }]
+    case 'gpu_memory':
+      return h.hasGpu ? [{ labels: { gpu: '0' }, base: 0.55 }] : []
+    case 'gpu_temp':
+      return h.hasGpu ? [{ labels: { gpu: '0' }, base: 61 }] : []
+    case 'gpu_power':
+      return h.hasGpu ? [{ labels: { gpu: '0' }, base: 180 }] : []
     default:
       return []
   }
