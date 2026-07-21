@@ -1,0 +1,52 @@
+name: Release photon-agent binary
+
+# On the same semver release tag as docker-release.yml (e.g. v1.4.0), build the
+# standalone photon-agent host-metrics binary and attach it to the GitHub Release
+# (created here if the tag doesn't have one yet). Asset names are version-less so
+# the stable `releases/latest/download/...` URL always works; the version lives in
+# the release tag. Tests run separately on push/PR (ci.yml); tag from a green commit.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+concurrency:
+  group: agent-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # create the release / upload assets with the built-in GITHUB_TOKEN
+
+jobs:
+  build-upload:
+    name: Build & attach to GitHub Release
+    # ubuntu-22.04 (not -latest) pins an older glibc baseline so the dynamically
+    # linked binary also runs on older distros. Dynamic glibc is deliberate: GPU
+    # sampling loads NVML at runtime via dlopen, which a static musl build can't do.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache key from ci.yml's test builds (different profile/target set).
+          shared-key: agent-release
+
+      - name: Build photon-agent (release)
+        run: cargo build --release -p photon-agent
+
+      - name: Package tarball + checksum
+        run: |
+          strip target/release/photon-agent
+          tar -C target/release -czf photon-agent-linux-x86_64.tar.gz photon-agent
+          sha256sum photon-agent-linux-x86_64.tar.gz > photon-agent-linux-x86_64.tar.gz.sha256
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            photon-agent-linux-x86_64.tar.gz
+            photon-agent-linux-x86_64.tar.gz.sha256

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Prebuilt `photon-agent` binary on GitHub Releases.** Release tags now also build and
+  attach a stripped Linux x86_64 agent tarball (+ SHA-256 checksum) with a stable
+  `releases/latest/download/photon-agent-linux-x86_64.tar.gz` URL — no more building from
+  source and `scp`-ing to each host. `deploy/README.md` was rewritten as a full step-by-step
+  guide (server, agent, and app telemetry) for technical and non-technical readers.
+
 - **Infra host detail v2 (`/infra/:host`).** The host page is now a two-layer monitoring
   view: a glance **stat-tile row** (CPU · Memory with absolute GB · worst-mountpoint disk ·
   network rate · GPU util · GPU temp; warn/error tint at the shared 80%/90% thresholds;
