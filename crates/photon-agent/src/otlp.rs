@@ -21,10 +21,15 @@ fn kv(key: &str, val: &str) -> KeyValue {
     }
 }
 
-fn to_metric(m: &MetricSample, now: u64) -> Metric {
+fn to_metric(m: &MetricSample, start: u64, now: u64) -> Metric {
     let dp = NumberDataPoint {
         attributes: m.attrs.iter().map(|(k, v)| kv(k, v)).collect(),
-        start_time_unix_nano: 0,
+        // Cumulative monotonic sums carry the process start per the OTLP data model (lets
+        // consumers compute rates and detect counter resets); gauges have no start.
+        start_time_unix_nano: match m.kind {
+            Kind::Gauge => 0,
+            Kind::SumMonotonic => start,
+        },
         time_unix_nano: now,
         exemplars: vec![],
         flags: 0,
@@ -52,12 +57,13 @@ fn to_metric(m: &MetricSample, now: u64) -> Metric {
 pub fn to_otlp(
     host_name: &str,
     sample: &ResourceSample,
+    start_nanos: u64,
     now_nanos: u64,
 ) -> ExportMetricsServiceRequest {
     let metrics = sample
         .metrics
         .iter()
-        .map(|m| to_metric(m, now_nanos))
+        .map(|m| to_metric(m, start_nanos, now_nanos))
         .collect();
     ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
@@ -111,8 +117,23 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_sums_carry_process_start_time_gauges_do_not() {
+        let start = 1_699_999_000_000_000_000_u64;
+        let req = to_otlp("web-1", &sample(), start, 1_700_000_000_000_000_000);
+        let metrics = &req.resource_metrics[0].scope_metrics[0].metrics;
+        let Some(Data::Gauge(gauge)) = &metrics[0].data else {
+            panic!("cpu must be a Gauge")
+        };
+        assert_eq!(gauge.data_points[0].start_time_unix_nano, 0);
+        let Some(Data::Sum(sum)) = &metrics[1].data else {
+            panic!("network.io must be a Sum")
+        };
+        assert_eq!(sum.data_points[0].start_time_unix_nano, start);
+    }
+
+    #[test]
     fn maps_host_resource_attrs_and_kinds() {
-        let req = to_otlp("web-1", &sample(), 1_700_000_000_000_000_000);
+        let req = to_otlp("web-1", &sample(), 0, 1_700_000_000_000_000_000);
         let rm = &req.resource_metrics[0];
         let attrs = &rm.resource.as_ref().unwrap().attributes;
         assert!(attrs.iter().any(|kv| kv.key == "host.name"));
@@ -138,7 +159,7 @@ mod ingest_roundtrip {
 
     #[test]
     fn payload_maps_through_the_real_receiver_with_host_name() {
-        let req = to_otlp("web-1", &sample(), 1_700_000_000_000_000_000);
+        let req = to_otlp("web-1", &sample(), 0, 1_700_000_000_000_000_000);
         let points = photon_ingest::otlp_metrics_to_points(req);
         let cpu = points
             .iter()

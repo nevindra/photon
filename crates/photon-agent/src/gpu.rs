@@ -27,7 +27,12 @@ pub fn init(enabled: bool) -> Box<dyn GpuSampler + Send> {
     #[cfg(feature = "gpu")]
     {
         match nvml_wrapper::Nvml::init() {
-            Ok(nvml) => return Box::new(NvmlGpu { nvml }),
+            Ok(nvml) => {
+                return Box::new(NvmlGpu {
+                    nvml,
+                    names: Default::default(),
+                });
+            }
             Err(e) => eprintln!("photon-agent: NVML init failed, GPU metrics disabled: {e}"),
         }
     }
@@ -37,6 +42,9 @@ pub fn init(enabled: bool) -> Box<dyn GpuSampler + Send> {
 #[cfg(feature = "gpu")]
 pub struct NvmlGpu {
     nvml: nvml_wrapper::Nvml,
+    /// GPU names cached by device index at first sight — `dev.name()` is a driver call that
+    /// allocates a fresh `String`, and GPU names never change across a process's lifetime.
+    names: std::collections::HashMap<u32, String>,
 }
 
 #[cfg(feature = "gpu")]
@@ -51,7 +59,11 @@ impl GpuSampler for NvmlGpu {
             let Ok(dev) = self.nvml.device_by_index(i) else {
                 continue;
             };
-            let name = dev.name().unwrap_or_else(|_| format!("gpu-{i}"));
+            let name = self
+                .names
+                .entry(i)
+                .or_insert_with(|| dev.name().unwrap_or_else(|_| format!("gpu-{i}")))
+                .clone();
             let attrs = || {
                 vec![
                     ("gpu".to_string(), i.to_string()),

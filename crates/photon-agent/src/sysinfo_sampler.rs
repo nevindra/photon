@@ -8,7 +8,15 @@
 //! absent from a refresh, matching `new_with_refreshed_list`'s default behavior). All other
 //! names (`global_cpu_usage`, `refresh_cpu_usage`, `System::host_name`, `System::load_average`)
 //! matched the plan as written.
-use sysinfo::{Disks, Networks, System};
+//!
+//! `System` is constructed with only the CPU-usage and RAM refresh kinds enabled (via
+//! `System::new_with_specifics`) rather than `new_all`/`refresh_all` — we only ever read CPU
+//! usage and total/used memory here, so there's no reason to scan and retain the full process
+//! table (cmdlines, environ, per-process stats) for the life of the agent. Host identity
+//! (`host_id`/`os_type`) is likewise a process-lifetime constant, computed once in `new()` and
+//! cached on the struct instead of being re-resolved (hostname lookup + `/etc/machine-id` read)
+//! on every `sample()` call.
+use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
 
 use crate::sample::{Kind, MetricSample, ResourceSample, Sampler};
 
@@ -16,16 +24,24 @@ pub struct SysinfoSampler {
     sys: System,
     networks: Networks,
     disks: Disks,
+    host_id: String,
+    os_type: String,
 }
 
 impl SysinfoSampler {
     pub fn new() -> SysinfoSampler {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let sys = System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                .with_memory(MemoryRefreshKind::nothing().with_ram()),
+        );
+        let hostname = System::host_name().unwrap_or_default();
         SysinfoSampler {
             sys,
             networks: Networks::new_with_refreshed_list(),
             disks: Disks::new_with_refreshed_list(),
+            host_id: stable_host_id(&hostname),
+            os_type: std::env::consts::OS.to_string(),
         }
     }
 }
@@ -39,7 +55,8 @@ impl Default for SysinfoSampler {
 impl Sampler for SysinfoSampler {
     fn sample(&mut self) -> ResourceSample {
         self.sys.refresh_cpu_usage();
-        self.sys.refresh_memory();
+        self.sys
+            .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
         self.networks.refresh(false);
         self.disks.refresh(false);
 
@@ -150,10 +167,9 @@ impl Sampler for SysinfoSampler {
             ));
         }
 
-        let hostname = System::host_name().unwrap_or_default();
         ResourceSample {
-            host_id: stable_host_id(&hostname),
-            os_type: std::env::consts::OS.to_string(),
+            host_id: self.host_id.clone(),
+            os_type: self.os_type.clone(),
             metrics,
         }
     }
@@ -164,7 +180,9 @@ impl Sampler for SysinfoSampler {
 /// `/var/lib/dbus/machine-id`, the older/alternate location some distros use), trimmed of
 /// surrounding whitespace. On any read failure (file missing, unreadable, empty) or on a
 /// non-Linux OS — where neither path exists — falls back to `hostname`, the previous behavior, so
-/// `host.id` is never empty as long as the hostname itself resolved.
+/// `host.id` is never empty as long as the hostname itself resolved. Called once from
+/// `SysinfoSampler::new()` and cached for the process lifetime (host identity doesn't change
+/// between samples), not re-resolved on every `sample()`.
 fn stable_host_id(hostname: &str) -> String {
     first_machine_id(&["/etc/machine-id", "/var/lib/dbus/machine-id"])
         .unwrap_or_else(|| hostname.to_string())

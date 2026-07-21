@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`photon-agent` sender-loop hardening.** HTTP posts now carry a 10 s timeout — previously
+  a hung/black-holed server could stall sampling forever (and block Ctrl-C, since the signal
+  isn't polled mid-send). The Ctrl-C handler is registered once instead of re-created every
+  loop iteration, and missed ticks are delayed instead of bursting a backlog of catch-up
+  POSTs after host suspend/resume.
+- **Agent cumulative sums (`system.network.io`) now carry `start_time_unix_nano`** (the
+  process start) per the OTLP data model, so consumers can compute rates and detect counter
+  resets; gauges keep no start time.
+
+### Changed
+
+- **`photon-agent` memory footprint cut ~3× — it no longer retains the host's full process
+  table.** `sysinfo` is initialized with only the CPU-usage + RAM refresh kinds instead of
+  `new_all()`/`refresh_all()`; host identity (`host.id`/`os.type`) is resolved once at
+  startup instead of re-reading `/etc/machine-id` + hostname every cycle; NVML GPU names are
+  cached per device instead of queried from the driver each sample. Measured on a dev host:
+  14 → 5 MB RSS (`--no-gpu`) and 35 → 25 MB with GPU metrics (the remaining ~20 MB is the
+  `libnvidia-ml` driver library, outside Photon's control). Busy fleets see a larger drop —
+  the removed process-table snapshot scaled with process count.
+
 ## [1.4.0] - 2026-07-21
 
 A feature release focused on **infrastructure monitoring UX**: the host detail page becomes
