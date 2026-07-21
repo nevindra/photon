@@ -16,7 +16,7 @@ use photon_core::PhotonError;
 use crate::metric_engine::{metric_base_predicate, MetricRequest};
 use crate::metric_query::{
     bucket_of, bucket_start, MetricSeriesRequest, ProbeMeta, QuerySeriesResult, SeriesPoint,
-    SeriesResult, MAX_SERIES, TEMPORALITY_CUMULATIVE,
+    SeriesResult, MAX_COLLECT_ROWS, MAX_SERIES, TEMPORALITY_CUMULATIVE,
 };
 use crate::{col_ref, MetricsQueryEngine};
 
@@ -99,12 +99,40 @@ impl MetricsQueryEngine {
     /// Scan pruned survivors for one metric, projecting `group_by` label columns + timestamp +
     /// start_timestamp + the given JSON payload column, sorted by `(group key, timestamp)`. Groups
     /// rows into per-series (`labels`, time-ordered `rows`). Series identity = the resolved group
-    /// columns (same as `query_series_pointwise`); capped at `MAX_SERIES`.
+    /// columns (same as `query_series_pointwise`); capped at `MAX_SERIES`. Thin wrapper pinning
+    /// the row cap to `MAX_COLLECT_ROWS`; see `collect_dist_series_with_cap` for the
+    /// implementation and its tests for why the cap is a parameter.
     pub(crate) async fn collect_dist_series(
         &self,
         base: &MetricRequest,
         group_by: &[String],
         json_col: &str,
+    ) -> Result<(Vec<(BTreeMap<String, String>, Vec<DistRow>)>, bool), PhotonError> {
+        self.collect_dist_series_with_cap(base, group_by, json_col, MAX_COLLECT_ROWS)
+            .await
+    }
+
+    /// `collect_dist_series`'s implementation. `row_cap` bounds how many sorted rows are ever
+    /// materialized, mirroring `query_series_pointwise_with_cap`: the DataFusion query applies
+    /// `.limit(0, Some(row_cap + 1))` *after* the sort, so a truncation keeps a deterministic
+    /// prefix (the sort order's leading rows) instead of an arbitrary one. Collecting exactly
+    /// `row_cap + 1` rows is the trip wire proving the true result was larger than the cap, so the
+    /// trailing row(s) are dropped and the response is flagged `capped` (the same field the
+    /// `MAX_SERIES` truncation already sets) rather than silently returning a partial answer.
+    /// `row_cap` is a parameter (not always `MAX_COLLECT_ROWS`) purely so tests can exercise
+    /// truncation over a handful of rows instead of 200_000.
+    ///
+    /// Two caveats ride `capped` beyond "fewer series": the series *straddling* the cap boundary
+    /// keeps only its collected time-ascending prefix — so its histogram buckets under-count and
+    /// a summary's "latest snapshot" can be stale, not merely the series count. And the kept
+    /// prefix is deterministic only up to ties in the `(group, timestamp)` sort key — there is
+    /// no per-row tiebreaker.
+    pub(crate) async fn collect_dist_series_with_cap(
+        &self,
+        base: &MetricRequest,
+        group_by: &[String],
+        json_col: &str,
+        row_cap: usize,
     ) -> Result<(Vec<(BTreeMap<String, String>, Vec<DistRow>)>, bool), PhotonError> {
         let Some(df) = self.survivors_df(base).await? else {
             return Ok((Vec::new(), false));
@@ -132,6 +160,12 @@ impl MetricsQueryEngine {
             .map_err(|e| PhotonError::Query(format!("dist select: {e}")))?
             .sort(sorts)
             .map_err(|e| PhotonError::Query(format!("dist sort: {e}")))?
+            // Applied AFTER the sort so a truncation keeps a deterministic prefix (the sort
+            // order's leading rows) rather than whatever DataFusion happened to scan first.
+            // `row_cap + 1`: collecting exactly that many rows is the signal that the true result
+            // was larger than `row_cap` (see the row-walk loop below).
+            .limit(0, Some(row_cap + 1))
+            .map_err(|e| PhotonError::Query(format!("dist limit: {e}")))?
             .collect()
             .await
             .map_err(|e| PhotonError::Query(format!("dist collect: {e}")))?;
@@ -158,7 +192,11 @@ impl MetricsQueryEngine {
             out.push((labels, rows));
         };
 
-        for b in &batches {
+        // `rows_seen` enforces `row_cap` across the whole (possibly multi-batch) collected set:
+        // once it's exhausted, `'rows` breaks out of both loops, dropping the trailing row(s) the
+        // `row_cap + 1` limit fetched as the overflow trip wire and flagging `capped`.
+        let mut rows_seen: usize = 0;
+        'rows: for b in &batches {
             let ts = b
                 .column(n_group)
                 .as_any()
@@ -180,6 +218,11 @@ impl MetricsQueryEngine {
                 .ok_or_else(|| PhotonError::Query("dist: group col not Utf8".into()))?;
 
             for i in 0..b.num_rows() {
+                if rows_seen >= row_cap {
+                    capped = true;
+                    break 'rows;
+                }
+                rows_seen += 1;
                 let key: Vec<Option<String>> = gcols
                     .iter()
                     .map(|a| {
@@ -1016,6 +1059,91 @@ mod hist_tests {
         assert_eq!(run(Agg::Sum).await.series[0].points[0].v, Some(123.5));
         // avg = sum/count = 123.5/20 = 6.175
         assert!((run(Agg::Avg).await.series[0].points[0].v.unwrap() - 6.175).abs() < 1e-9);
+    }
+
+    /// A histogram engine with `n` points for a single series ("a"), timestamps `0, 10, 20, ...`,
+    /// each carrying a distinguishable `count`/`bucket_counts` payload equal to its index — so the
+    /// row at index `i` sorts to position `i`, making truncation-prefix assertions
+    /// straightforward. Mirrors `metric_query`'s `ordered_gauge_engine`.
+    fn ordered_hist_engine(n: i64) -> MetricsQueryEngine {
+        let schema = MetricSchema::new(&["service.name".to_string()]);
+        let mut b = MetricBatchBuilder::new(&schema);
+        for i in 0..n {
+            let json =
+                format!(r#"{{"count":{i},"sum":0,"bucket_counts":[{i}],"explicit_bounds":[]}}"#);
+            b.append(&hpoint("a", i * 10, TEMPORALITY_DELTA, 0, &json));
+        }
+        let batch = b.finish().unwrap();
+        MetricsQueryEngine::from_batch(schema, batch)
+    }
+
+    fn dist_base_req() -> MetricRequest {
+        MetricRequest {
+            metric: "lat".to_string(),
+            start_ts_nanos: 0,
+            end_ts_nanos: 10_000,
+            filter: None,
+            host: None,
+        }
+    }
+
+    /// 15 rows into a row_cap of 10: `collect_dist_series_with_cap` must collect at most 10 rows
+    /// (the sort order's leading prefix, deterministic), drop the rest, and flag `capped`. The
+    /// kept prefix's last row must be index 9 (ts=90), never index 14's — proving the cap
+    /// truncates rather than silently reordering. Mirrors
+    /// `metric_query::pointwise_row_cap_truncates_deterministically_and_flags_capped`.
+    #[tokio::test]
+    async fn dist_row_cap_truncates_deterministically_and_flags_capped() {
+        let engine = ordered_hist_engine(15);
+        let (groups, capped) = engine
+            .collect_dist_series_with_cap(
+                &dist_base_req(),
+                &["service".to_string()],
+                metric_schema::HISTOGRAM,
+                /* row_cap = */ 10,
+            )
+            .await
+            .unwrap();
+
+        assert!(capped, "15 rows over a row_cap of 10 must flag capped");
+        assert_eq!(groups.len(), 1, "one series (all rows share service=a)");
+        let (_, rows) = &groups[0];
+        assert_eq!(
+            rows.len(),
+            10,
+            "only the sort order's leading 10 rows survive the cap"
+        );
+        assert_eq!(
+            rows.last().unwrap().ts,
+            90,
+            "the last kept row is index 9 (ts=90), never index 14's"
+        );
+    }
+
+    /// Companion test: 5 rows under a row_cap of 10 must not be flagged capped, and every row must
+    /// survive (the cap is a no-op below the threshold). Mirrors
+    /// `metric_query::pointwise_row_cap_under_limit_is_uncapped_and_matches_full_result`.
+    #[tokio::test]
+    async fn dist_row_cap_under_limit_is_uncapped_and_matches_full_result() {
+        let engine = ordered_hist_engine(5);
+        let (groups, capped) = engine
+            .collect_dist_series_with_cap(
+                &dist_base_req(),
+                &["service".to_string()],
+                metric_schema::HISTOGRAM,
+                /* row_cap = */ 10,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !capped,
+            "5 rows under a row_cap of 10 must not be flagged capped"
+        );
+        assert_eq!(groups.len(), 1);
+        let (_, rows) = &groups[0];
+        assert_eq!(rows.len(), 5, "all 5 rows, unaffected by the cap");
+        assert_eq!(rows.last().unwrap().ts, 40, "last of the 5 rows, in order");
     }
 }
 

@@ -75,6 +75,9 @@ async fn ingest_traces<W: Wal + Send + Sync + 'static>(
         Ok(req) => req,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // Frees the request buffer before the WAL fsync await; up to `max_body_bytes` (~16 MiB)
+    // per in-flight request would otherwise stay pinned for the duration of the append.
+    drop(body);
 
     let mut builder = SpanBatchBuilder::with_capacity(&state.schema, estimate_rows(&req));
     otlp_traces_into_builder(req, &mut builder);

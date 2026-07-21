@@ -126,13 +126,34 @@ the per-feature docs in [`subsystems/`](subsystems/).
    bloom-pruned then confirmed with a `strpos(body, text) > 0` substring scan — **there is no
    inverted index.**
 
-Every engine's `SessionContext` (the shared `session()` factory in `photon-query/src/lib.rs`) carries
-a **bounded DataFusion memory pool** (`GreedyMemoryPool`, `QUERY_MEMORY_POOL_BYTES` = 512 MiB). Its
-job is to keep the intrinsically-unbounded query paths — a facet `GROUP BY value` on a
-high-cardinality field (holds every distinct value in a hash table before the `LIMIT`) and the
-metrics pointwise/distribution scans (`filter → sort → collect()` every matching row, then cap at
-`MAX_SERIES`) — **fail-loud** (`ResourcesExhausted`) instead of OOM-killing a low-memory single node.
-It is not a config surface yet; a future change could make it per-deployment tunable.
+Every engine's `SessionContext` (the shared `session()` factory in `photon-query/src/lib.rs`) draws on
+**one process-wide, bounded DataFusion memory pool** (`FairSpillPool`, `QUERY_MEMORY_POOL_BYTES` =
+512 MiB) — a single `Arc<RuntimeEnv>` built lazily via `OnceLock` and shared by every session (only
+each session's `SessionConfig` / Parquet tuning is freshly built). So 512 MiB is an **aggregate cap
+across ALL concurrent queries**, not a per-query allowance: opening the UI dashboard fans out ~10
+queries at once, and a fresh pool per session would make that budget additive and effectively
+unbounded (N × 512 MiB). Its job is to keep the remaining intrinsically-unbounded query path — a
+facet `GROUP BY value` on a high-cardinality field (holds every distinct value in a hash table before
+the `LIMIT`) — from OOM-killing a low-memory single node. As a `FairSpillPool` it does this two ways:
+a heavy **spillable** operator (sort, grouped aggregation) that exceeds its fair share **degrades to
+disk-spill** (temp files in the OS temp dir — the runtime keeps DataFusion's default `NewOs`
+`DiskManager`) rather than erroring, while a truly-**unspillable** operator that overflows the
+remaining budget still **fails loud** (`ResourcesExhausted`) — the pool stays the final OOM guard.
+The metrics **pointwise** path (`query_series_pointwise` in `metric_query.rs` —
+cumulative reset-aware rate/increase, gauge `last`) and the metrics **distribution** scans
+(`metric_dist.rs`'s `collect_dist_series`, shared by the histogram/exp-histogram/summary series
+queries) are both narrower: each applies `.limit(0, Some(MAX_COLLECT_ROWS + 1))` after the sort (so a
+truncation keeps a deterministic sort-order-leading prefix, not an arbitrary one), capping the row
+collect itself at 200,000 rows and flagging the existing `capped` response field on overflow — so
+neither depends on this pool as its only backstop. One honesty note on `capped`: the single series
+straddling the row-cap boundary keeps only its time-ascending prefix, so *its own value* (a stale
+`last`, an under-counted `rate`/histogram) can be inaccurate — `capped` covers that too, not just
+"fewer series shown". Sharing one pool bounds the process; making it a **fair-spill** pool keeps that
+bound from turning into cross-query starvation: the budget is divided evenly among concurrent
+spillable consumers (`(pool_size - unspillable) / num_spillers`), so one expensive query can't
+monopolize it and push unrelated ones into `ResourcesExhausted` — it hits its own fair-share ceiling
+and spills to disk instead. It is not a config surface yet; a future change could make it
+per-deployment tunable.
 
 Per-signal engines:
 

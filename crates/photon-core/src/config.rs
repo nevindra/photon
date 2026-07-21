@@ -201,7 +201,11 @@ impl Default for ApmConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct LiveConfig {
-    /// Per-signal broadcast channel depth before a slow subscriber sees `Lagged`.
+    /// Per-signal broadcast channel depth before a slow subscriber sees `Lagged`. Each slot pins
+    /// one ingested batch (`Arc<RecordBatch>`) in memory until it's overwritten by a newer send,
+    /// and only while at least one SSE client is connected — so this is a direct memory/laggy-
+    /// subscriber trade-off, not just a buffering knob. A lagging subscriber that falls behind
+    /// past capacity gets `Lagged` and skips the gap, which live tail tolerates by design.
     pub broadcast_capacity: usize,
     /// Coalescing flush cadence for the SSE stream, milliseconds.
     pub flush_interval_ms: u64,
@@ -214,7 +218,7 @@ pub struct LiveConfig {
 impl Default for LiveConfig {
     fn default() -> Self {
         Self {
-            broadcast_capacity: 1024,
+            broadcast_capacity: 128,
             flush_interval_ms: 250,
             max_rows_per_flush: 200,
             max_connections: 32,
@@ -786,7 +790,7 @@ session_secret = "a-long-random-session-signing-secret"
     fn live_config_defaults_when_absent() {
         // VALID has no [live] section; it still parses, using defaults.
         let cfg: Config = toml::from_str(VALID).expect("parses without [live]");
-        assert_eq!(cfg.live.broadcast_capacity, 1024);
+        assert_eq!(cfg.live.broadcast_capacity, 128);
         assert_eq!(cfg.live.flush_interval_ms, 250);
         assert_eq!(cfg.live.max_rows_per_flush, 200);
         assert_eq!(cfg.live.max_connections, 32);

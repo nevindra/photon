@@ -232,11 +232,20 @@ mod tests {
         assert_eq!(r.values.len(), 2);
     }
 
-    /// Part 1 fail-loud: the facet `GROUP BY value` is the canonical unbounded-RAM path (the
-    /// grouped hash table holds every distinct value before the limit trims it). Run over a
-    /// context whose DataFusion memory pool is 1 byte, it must ERROR with a `ResourcesExhausted`
-    /// (surfaced as `PhotonError::Query`) instead of building an unbounded table / OOMing. Proves
-    /// `session_with_memory_pool_bytes` actually caps the path, globally, at the engine seam.
+    /// Fail-loud OOM backstop under the [`FairSpillPool`] (`crate::session`). The facet
+    /// `GROUP BY value` is the canonical unbounded-RAM path (the grouped hash table holds every
+    /// distinct value before the limit trims it). Run over a context whose DataFusion memory pool
+    /// is 1 byte, it must ERROR with a `ResourcesExhausted` (surfaced as `PhotonError::Query`)
+    /// instead of building an unbounded table / OOMing. Proves `session_with_memory_pool_bytes`
+    /// actually caps the path, globally, at the engine seam.
+    ///
+    /// The swap to `FairSpillPool` does **not** make this path spill-and-succeed at 1 byte: the
+    /// aggregation plan contains an **unspillable** `RepartitionExec` (it buffers batches for
+    /// parallel aggregation and cannot spill), whose first `try_grow` (~6 KiB) already exceeds the
+    /// whole 1-byte budget → `ResourcesExhausted`. That is exactly the unspillable-overflow backstop
+    /// FairSpillPool retains: spillable operators degrade to disk when they exceed their fair share,
+    /// but truly-unspillable ones that overflow the remaining budget still fail loud, so the pool
+    /// stays the final guard against OOM even when nothing can spill.
     #[tokio::test]
     async fn facet_over_tiny_memory_pool_fails_loud_not_oom() {
         // 300 distinct services ⇒ a grouped hash table that cannot fit in a 1-byte pool.

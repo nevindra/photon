@@ -30,6 +30,22 @@ pub(crate) const TEMPORALITY_CUMULATIVE: i32 = 2;
 
 pub(crate) const MAX_SERIES: usize = 1000;
 
+/// Upper bound on how many raw rows two Rust-side roll-up query paths collect into memory before
+/// their per-series walk runs: the metrics **pointwise** path (`query_series_pointwise`:
+/// cumulative reset-aware rate/increase, gauge `last`) and the metrics **distribution** path
+/// (`metric_dist.rs`'s `collect_dist_series`, shared by the histogram/exp-histogram/summary
+/// series queries). Both need every raw sample in time order (pointwise to detect counter resets;
+/// distribution to reset-aware-delta cumulative payloads and pick the latest summary snapshot per
+/// bucket), so — unlike `series_sql_agg`'s SQL-side aggregate — neither can avoid materializing
+/// rows, and nothing upstream bounded how many: a high-cardinality metric over a wide window
+/// pulled every matching row for the whole window into a `Vec<RecordBatch>`, with the per-series
+/// `MAX_SERIES` cap only applied afterwards while walking rows. At roughly a few hundred
+/// bytes/row (group-by labels + timestamp + value/JSON payload + start_timestamp), 200_000 rows
+/// keeps the worst case in the tens of MB rather than unbounded. Reuses the existing `capped`
+/// response field (already surfaced to the UI for the `MAX_SERIES` truncation) so a caller sees
+/// the same "refine your query" signal either way.
+pub(crate) const MAX_COLLECT_ROWS: usize = 200_000;
+
 pub struct MetricSeriesRequest {
     pub metric: String,
     pub agg: Option<Agg>,
@@ -382,9 +398,9 @@ impl MetricsQueryEngine {
             .collect()
     }
 
-    /// Cumulative reset-aware rate/increase and gauge `last`. Fetches per-series time-ordered raw
-    /// points (sorted by group key then timestamp), then walks each series in Rust applying the
-    /// counter-reset rule and rolls contributions into buckets.
+    /// Cumulative reset-aware rate/increase and gauge `last`. Thin wrapper pinning the row cap to
+    /// `MAX_COLLECT_ROWS`; see `query_series_pointwise_with_cap` for the implementation and
+    /// `query_series_pointwise_with_cap`'s tests for why the cap is a parameter.
     async fn query_series_pointwise(
         &self,
         req: MetricSeriesRequest,
@@ -393,6 +409,46 @@ impl MetricsQueryEngine {
         chosen: Agg,
         step_nanos: i64,
         buckets: usize,
+    ) -> Result<QuerySeriesResult, PhotonError> {
+        self.query_series_pointwise_with_cap(
+            req,
+            meta,
+            default,
+            chosen,
+            step_nanos,
+            buckets,
+            MAX_COLLECT_ROWS,
+        )
+        .await
+    }
+
+    /// Fetches per-series time-ordered raw points (sorted by group key then timestamp), then walks
+    /// each series in Rust applying the counter-reset rule and rolls contributions into buckets.
+    ///
+    /// `row_cap` bounds how many sorted rows are ever materialized: the DataFusion query applies
+    /// `.limit(0, Some(row_cap + 1))` *after* the sort, so a truncation keeps a deterministic
+    /// prefix (the sort order's leading rows) instead of an arbitrary one. The `+ 1` is a trip
+    /// wire — collecting exactly `row_cap + 1` rows proves the true result was larger than the
+    /// cap, so the last row is dropped and the response is flagged `capped` (the same field
+    /// `MAX_SERIES` truncation already sets) rather than silently returning a partial answer.
+    /// `row_cap` is a parameter (not always `MAX_COLLECT_ROWS`) purely so tests can exercise
+    /// truncation over a handful of rows instead of 200_000.
+    ///
+    /// Two caveats ride `capped` beyond "fewer series": the series *straddling* the cap boundary
+    /// is flushed from only its collected prefix — rows are time-ascending within a series, so its
+    /// own value can be wrong (`last` stale, `rate`/`increase` under-counted), not merely the
+    /// series count. And the kept prefix is deterministic only up to ties in the
+    /// `(group, timestamp)` sort key — there is no per-row tiebreaker.
+    #[allow(clippy::too_many_arguments)]
+    async fn query_series_pointwise_with_cap(
+        &self,
+        req: MetricSeriesRequest,
+        meta: ProbeMeta,
+        default: Agg,
+        chosen: Agg,
+        step_nanos: i64,
+        buckets: usize,
+        row_cap: usize,
     ) -> Result<QuerySeriesResult, PhotonError> {
         let (start, end) = (req.start_ts_nanos, req.end_ts_nanos);
 
@@ -450,6 +506,12 @@ impl MetricsQueryEngine {
             .map_err(|e| PhotonError::Query(format!("pointwise select: {e}")))?
             .sort(sorts)
             .map_err(|e| PhotonError::Query(format!("pointwise sort: {e}")))?
+            // Applied AFTER the sort so a truncation keeps a deterministic prefix (the sort
+            // order's leading rows) rather than whatever DataFusion happened to scan first.
+            // `row_cap + 1`: collecting exactly that many rows is the signal that the true
+            // result was larger than `row_cap` (see the row-walk loop below).
+            .limit(0, Some(row_cap + 1))
+            .map_err(|e| PhotonError::Query(format!("pointwise limit: {e}")))?
             .collect()
             .await
             .map_err(|e| PhotonError::Query(format!("pointwise collect: {e}")))?;
@@ -461,6 +523,9 @@ impl MetricsQueryEngine {
         let mut cur_key: Option<Vec<Option<String>>> = None;
         let mut cur_rows: Vec<PointRow> = Vec::new();
         let mut capped = false;
+        // Distinguishes the row-cap trip from MAX_SERIES truncation so the operator-facing
+        // warning below names the actual cause (both OR into the response's single `capped`).
+        let mut rows_capped = false;
 
         let build = |key: &[Option<String>], rows: &[PointRow]| -> SeriesResult {
             let points = match chosen {
@@ -478,7 +543,11 @@ impl MetricsQueryEngine {
             SeriesResult { labels, points }
         };
 
-        for b in &batches {
+        // `rows_seen` enforces `row_cap` across the whole (possibly multi-batch) collected set:
+        // once it's exhausted, `'rows` breaks out of both loops, dropping the trailing row(s) the
+        // `row_cap + 1` limit fetched as the overflow trip wire and flagging `capped`.
+        let mut rows_seen: usize = 0;
+        'rows: for b in &batches {
             let ts = b
                 .column(n_group)
                 .as_any()
@@ -500,6 +569,12 @@ impl MetricsQueryEngine {
                 .ok_or_else(|| PhotonError::Query("pointwise: group col not Utf8".into()))?;
 
             for i in 0..b.num_rows() {
+                if rows_seen >= row_cap {
+                    rows_capped = true;
+                    capped = true;
+                    break 'rows;
+                }
+                rows_seen += 1;
                 let key: Vec<Option<String>> = gcols
                     .iter()
                     .map(|a| {
@@ -540,9 +615,15 @@ impl MetricsQueryEngine {
             }
         }
         if capped {
-            eprintln!(
-                "photon-query: warning: metric series truncated to {MAX_SERIES}; refine group-by/filter"
-            );
+            if rows_capped {
+                eprintln!(
+                    "photon-query: warning: metric row collect capped at {row_cap} rows (the cap-straddling series may carry a truncated value); narrow the time range or filter"
+                );
+            } else {
+                eprintln!(
+                    "photon-query: warning: metric series truncated to {MAX_SERIES}; refine group-by/filter"
+                );
+            }
         }
 
         Ok(QuerySeriesResult {
@@ -914,6 +995,99 @@ mod tests {
             pts[buckets - 1].v,
             Some(30.0),
             "row at window end lands in the last bucket"
+        );
+    }
+
+    /// A gauge engine with `n` points for a single series ("a"), timestamps `0, 10, 20, ...`,
+    /// values `0.0, 1.0, 2.0, ...` — so the point at index `i` sorts to position `i` and carries
+    /// value `i as f64`, making truncation-prefix assertions straightforward.
+    fn ordered_gauge_engine(n: i64) -> MetricsQueryEngine {
+        let schema = MetricSchema::new(&["service.name".to_string()]);
+        let mut b = MetricBatchBuilder::new(&schema);
+        for i in 0..n {
+            b.append(&gpoint("g", "a", i * 10, i as f64));
+        }
+        let batch = b.finish().unwrap();
+        MetricsQueryEngine::from_batch(schema, batch)
+    }
+
+    fn pointwise_last_req() -> MetricSeriesRequest {
+        MetricSeriesRequest {
+            metric: "g".into(),
+            agg: Some(Agg::Last),
+            group_by: vec!["service".into()],
+            filter: None,
+            start_ts_nanos: 0,
+            end_ts_nanos: 200,
+            buckets: 1,
+        }
+    }
+
+    fn gauge_probe_meta() -> ProbeMeta {
+        ProbeMeta {
+            metric_type: metric_type::GAUGE,
+            temporality: None,
+            is_monotonic: None,
+            unit: None,
+        }
+    }
+
+    /// 15 rows into a row_cap of 10: the pointwise path must collect at most 10 (the sort order's
+    /// leading prefix, deterministic), drop the rest, and flag `capped`. `last` over the kept
+    /// prefix (indices 0..=9, ts 0..=90) reflects index 9's value (9.0), never the true last row's
+    /// (index 14, value 14.0) — proving the cap truncates rather than silently reordering.
+    #[tokio::test]
+    async fn pointwise_row_cap_truncates_deterministically_and_flags_capped() {
+        let engine = ordered_gauge_engine(15);
+        let res = engine
+            .query_series_pointwise_with_cap(
+                pointwise_last_req(),
+                gauge_probe_meta(),
+                Agg::Last,
+                Agg::Last,
+                200,
+                1,
+                /* row_cap = */ 10,
+            )
+            .await
+            .unwrap();
+
+        assert!(res.capped, "15 rows over a row_cap of 10 must flag capped");
+        assert_eq!(res.series.len(), 1);
+        assert_eq!(
+            res.series[0].points[0].v,
+            Some(9.0),
+            "only the sort order's leading 10 rows (indices 0..=9) survive the cap"
+        );
+    }
+
+    /// Companion test: 5 rows under a row_cap of 10 must not be flagged capped, and must produce
+    /// the same result the uncapped path would (the cap is a no-op below the threshold).
+    #[tokio::test]
+    async fn pointwise_row_cap_under_limit_is_uncapped_and_matches_full_result() {
+        let engine = ordered_gauge_engine(5);
+        let res = engine
+            .query_series_pointwise_with_cap(
+                pointwise_last_req(),
+                gauge_probe_meta(),
+                Agg::Last,
+                Agg::Last,
+                200,
+                1,
+                /* row_cap = */ 10,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !res.capped,
+            "5 rows under a row_cap of 10 must not be flagged capped"
+        );
+        assert_eq!(res.series.len(), 1);
+        assert_eq!(
+            res.series[0].points[0].v,
+            Some(4.0),
+            "last of the 5 rows, unaffected by the cap"
         );
     }
 }

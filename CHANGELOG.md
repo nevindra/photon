@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`photon-server` peak memory during ingest cut sharply** (measured 150–250 MB territory on a
+  moderate single node; the dominant terms below scale it down several-fold):
+  - Default `wal.segment_max_bytes` **128 MiB → 32 MiB**. The compactor's peak working set is
+    ~2× the decoded segment per signal (×3 signals on the same 2 s cadence), so this directly
+    shrinks the largest ingest-time term. Smaller segments mean smaller/more Parquet files;
+    `merge_once` consolidates them as before.
+  - Compacted Parquet **row groups capped at 131,072 rows** (was the parquet-rs default of
+    1,048,576) — bounds the `ArrowWriter`'s in-progress buffer and makes row-group pruning
+    more granular.
+  - Ingest HTTP handlers **release the request body buffer right after protobuf decode**
+    instead of holding it (up to 16 MiB per in-flight request) through the WAL fsync ack.
+  - Default live-tail `[live].broadcast_capacity` **1024 → 128**. While any SSE client is
+    connected, the broadcast ring pins the last N ingested batches (a `tokio::broadcast` slot
+    frees only on overwrite) — at 1024 that alone reached hundreds of MB under load. Lagging
+    subscribers get `Lagged` and skip the gap, which live tail tolerates by design.
+- **DataFusion query memory is now one process-wide budget, fairly shared.** Every query session
+  draws on a single 512 MiB `FairSpillPool` (was: a fresh *per-query* 512 MiB greedy pool, so a
+  dashboard fanning out N queries could claim N × 512 MiB with no aggregate bound). Spillable
+  operators (sorts, aggregations) get an even share of the budget and **spill to the OS temp dir
+  instead of failing** when they hit it; only a truly unspillable operator exceeding the remaining
+  budget still errors with `ResourcesExhausted` — the deliberate final backstop that replaces
+  OOM-killing the process.
+- **Metrics series queries bound their row collection.** The pointwise (`rate`/`increase`/`last`)
+  and distribution (histogram/exp-histogram/summary) paths now cap collected rows at 200,000
+  (`MAX_COLLECT_ROWS`), applied after the sort so truncation keeps a deterministic leading prefix,
+  and surface truncation through the existing `capped` response field. Caveat that rides
+  `capped=true`: the one series straddling the cap keeps only its earliest rows, so its own value
+  can be understated — the server log warning now names which cap actually tripped.
+
 ### Fixed
 
 - **`photon-agent` sender-loop hardening.** HTTP posts now carry a 10 s timeout — previously

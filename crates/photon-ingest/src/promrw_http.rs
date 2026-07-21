@@ -109,6 +109,11 @@ async fn ingest_promrw<W: Wal + Send + Sync + 'static>(
         Ok(req) => req,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // Frees the request buffer before the WAL fsync await; up to `max_body_bytes` (~16 MiB)
+    // per in-flight request would otherwise stay pinned for the duration of the append. The
+    // intermediate snappy-decompressed `Vec<u8>` inside `decode_write_request` is already
+    // dropped when that function returns (it's a local, never part of the returned `WriteRequest`).
+    drop(body);
 
     let points = promrw_to_points(req);
     let mut builder = MetricBatchBuilder::with_capacity(&state.schema, points.len());

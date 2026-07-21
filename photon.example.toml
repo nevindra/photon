@@ -68,8 +68,11 @@ promoted_attributes = ["service.name", "host.name"]
 
 # --- Write-ahead log ---------------------------------------------------------------------
 [wal]
-# Roll to a new segment once the active one exceeds this many bytes (128 MiB here).
-segment_max_bytes = 134217728
+# Roll to a new segment once the active one exceeds this many bytes (32 MiB here). Each closed
+# segment is decoded + sorted + Parquet-encoded in one compaction pass, so this value directly
+# scales the compactor's peak RSS — smaller segments keep peak memory down at the cost of more,
+# smaller Parquet files (merge_once runs on its own cadence to consolidate them back down).
+segment_max_bytes = 33554432
 # ...or once it reaches this age, whichever comes first.
 segment_max_age_secs = 60
 # Group-commit window: concurrent appends arriving within this many ms share one fsync.

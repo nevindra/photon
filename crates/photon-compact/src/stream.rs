@@ -21,6 +21,13 @@ use photon_storage::Storage;
 /// `parquet::basic::ZstdLevel::try_new(1)` equals `ZstdLevel::default()` in parquet 53.
 pub(crate) const DEFAULT_ZSTD_LEVEL: i32 = 1;
 
+/// Cap on rows per Parquet row group, overriding parquet-rs's default of 1,048,576. Without this,
+/// `ArrowWriter` buffers an entire row group's column data in memory before flushing it, so a large
+/// sorted batch (bounded by `wal.segment_max_bytes`) can transiently hold up to a million rows of
+/// decoded columns alongside the batch itself. 128k keeps that buffer small while still leaving
+/// row-group pruning (min/max stats per group) reasonably coarse-grained.
+pub(crate) const MAX_ROW_GROUP_SIZE: usize = 131_072;
+
 /// Resolve an object path to its real on-disk location under the hot store's local root, so a
 /// blocking task can stream a Parquet encode straight to a `File`. The object path maps 1:1 onto
 /// `<hot_dir>/<object_path>`, so the same hot store still serves it via `get`. Errors when the hot
@@ -81,6 +88,7 @@ pub(crate) fn write_parquet_streamed(
     })?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(level))
+        .set_max_row_group_size(MAX_ROW_GROUP_SIZE)
         .build();
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
         .map_err(|e| PhotonError::Arrow(e.to_string()))?;
@@ -182,5 +190,40 @@ mod tests {
         let target = tmp.path().join("out.parquet");
         let err = write_parquet_streamed(&target, &sample_batch(), 0).unwrap_err();
         assert!(err.to_string().contains("zstd_level"));
+    }
+
+    /// A batch bigger than one row group's worth of rows must still be split into multiple row
+    /// groups on write — otherwise the `ArrowWriter` buffers the whole batch's column data in one
+    /// in-progress row group (parquet-rs's default `max_row_group_size` is 1,048,576 rows), which
+    /// is exactly the peak-RSS knob this test locks in. 262,145 rows is just over 2x the intended
+    /// cap (131,072) so a correct writer must emit at least 3 row groups, none larger than the cap.
+    #[test]
+    fn write_parquet_streamed_caps_row_group_size() {
+        let cap = MAX_ROW_GROUP_SIZE as i64;
+        let n: i64 = cap * 2 + 1;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(0..n))])
+                .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("out.parquet");
+        write_parquet_streamed(&target, &batch, DEFAULT_ZSTD_LEVEL).unwrap();
+
+        let file = File::open(&target).unwrap();
+        let reader_builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let row_groups = reader_builder.metadata().row_groups();
+        assert!(
+            !row_groups.is_empty(),
+            "expected at least one row group in the written file"
+        );
+        for rg in row_groups {
+            assert!(
+                rg.num_rows() <= cap,
+                "row group has {} rows, expected <= {cap}",
+                rg.num_rows()
+            );
+        }
     }
 }

@@ -20,13 +20,13 @@
 //! applying predicates. Only surviving files are ever opened.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::SystemTime;
 
 use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
-use datafusion::execution::memory_pool::GreedyMemoryPool;
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::{
     lit, lit_timestamp_nano, strpos, Column, Expr, ParquetReadOptions, SessionConfig,
     SessionContext,
@@ -716,31 +716,77 @@ pub(crate) fn col_ref(name: &str) -> Expr {
 /// - `metadata_size_hint`: speculatively fetch the last 512KiB of each file in one read instead
 ///   of a separate footer-length round trip followed by a second read for the metadata.
 ///
-/// It also installs a **bounded** [`GreedyMemoryPool`] (`QUERY_MEMORY_POOL_BYTES`) on the
-/// `RuntimeEnv`, so the RAM any single query's *tracked* operators may reserve is capped. This is
-/// the fail-loud guard for the unbounded-memory query paths — the facet `GROUP BY value` (holds
-/// every distinct value in a hash table before the `LIMIT` trims it) and the metrics
-/// pointwise/distribution scans (`filter → sort → collect()` every matching row) — which on a
-/// low-memory single node could otherwise OOM-kill the process. With the pool they error with a
-/// DataFusion `ResourcesExhausted` instead. Every engine shares this one factory (logs/spans/
-/// metrics), so the ceiling applies everywhere.
+/// Its `RuntimeEnv` — and therefore its **bounded** [`FairSpillPool`]
+/// (`QUERY_MEMORY_POOL_BYTES`) — is a single *process-wide* instance shared by every `session()`
+/// call (see [`shared_runtime`]). Only the `SessionConfig` above is freshly built per session; the
+/// runtime/pool is not. So the 512 MiB ceiling is an **aggregate cap across ALL concurrent
+/// queries**, not a per-query allowance. This matters because opening the UI dashboard fans out
+/// ~10 queries at once: with a fresh pool per session each would carry its own 512 MiB budget,
+/// making aggregate query memory additive and effectively unbounded (N × 512 MiB); one shared pool
+/// puts a hard lid on the sum regardless of fan-out.
+///
+/// The pool is a [`FairSpillPool`], so that hard lid is divided **fairly** rather than first-come:
+/// each spillable operator (sort, grouped aggregation — the ones that register with
+/// `can_spill(true)`) is capped at an even fraction of the budget net of unspillable reservations
+/// (`(pool_size - unspillable) / num_spillers`), so one expensive query cannot monopolize the pool
+/// and starve concurrent unrelated ones. When a spillable operator hits its fair share, DataFusion
+/// degrades it to **disk-spill** (temp files under the OS temp dir — the runtime's default
+/// `DiskManager` is `NewOs`; see [`runtime_with_memory_pool_bytes`]) instead of erroring. Truly
+/// *unspillable* reservations (allocated first-come against whatever is free) that exceed the
+/// remaining budget still fail loud with a DataFusion `ResourcesExhausted` — so the pool remains the
+/// final OOM backstop for the intrinsically-unbounded query paths (the facet `GROUP BY value` hash
+/// table; the metrics pointwise/distribution `filter → sort → collect()` scans) that could otherwise
+/// OOM-kill a low-memory single node. Every engine shares this one factory (logs/spans/metrics), so
+/// the ceiling — and the fair division — applies everywhere.
 pub(crate) fn session() -> SessionContext {
-    session_with_memory_pool_bytes(QUERY_MEMORY_POOL_BYTES)
+    session_with_runtime(shared_runtime())
 }
 
-/// Per-`SessionContext` DataFusion memory-pool budget, in bytes. 512 MiB: generous enough that
-/// any legitimate single-query working set fits (the whole `photon-query` test suite runs real
-/// queries on KB-scale data, orders of magnitude below this) yet small enough to cap a runaway
-/// high-cardinality query on a low-memory single node. There is no per-deployment config seam yet
-/// — `session()` is a zero-arg factory shared by every engine — so this is a deliberate constant
-/// for this pass; a future change could thread a configurable `[query].memory_pool_bytes` through
-/// the engine constructors.
+/// Process-wide DataFusion memory-pool budget, in bytes, shared (and fairly divided) across every
+/// concurrent query. 512 MiB: generous enough that any legitimate query working set fits (the whole
+/// `photon-query` test suite runs real queries on KB-scale data, orders of magnitude below this) yet
+/// small enough that even the full dashboard fan-out can't OOM a low-memory single node. There is no
+/// per-deployment config seam yet, so this is a deliberate constant for this pass; a future change
+/// could thread a configurable `[query].memory_pool_bytes` through the runtime.
 pub(crate) const QUERY_MEMORY_POOL_BYTES: usize = 512 * 1024 * 1024;
 
-/// [`session()`] with an explicit memory-pool budget — the seam `session()` delegates through, so
-/// tests can build a tiny-pool context and prove the unbounded paths fail loud (rather than having
-/// to actually allocate hundreds of MB). All the Parquet tuning above is applied identically.
-pub(crate) fn session_with_memory_pool_bytes(pool_bytes: usize) -> SessionContext {
+/// The one process-wide [`RuntimeEnv`] (holding the single shared [`FairSpillPool`]) that every
+/// `session()` draws on. Built lazily on first query, then reused for the process lifetime — so the
+/// 512 MiB budget is a cap on the *sum* of all concurrent queries (fairly divided among spillable
+/// consumers), never per-query.
+fn shared_runtime() -> Arc<RuntimeEnv> {
+    static SHARED_RUNTIME: OnceLock<Arc<RuntimeEnv>> = OnceLock::new();
+    SHARED_RUNTIME
+        .get_or_init(|| runtime_with_memory_pool_bytes(QUERY_MEMORY_POOL_BYTES))
+        .clone()
+}
+
+/// Build a *fresh, isolated* `RuntimeEnv` holding a bounded [`FairSpillPool`] of `pool_bytes`.
+/// The process-wide [`shared_runtime`] is built from this; tests use it (via
+/// [`session_with_memory_pool_bytes`]) to get their OWN runtime rather than perturbing — or being
+/// perturbed by — the shared global that concurrent tests run real queries against.
+///
+/// [`FairSpillPool`] divides the budget fairly: each spillable consumer (registered with
+/// `can_spill(true)`) may hold at most `(pool_bytes - unspillable) / num_spillers`, and unspillable
+/// consumers take from whatever is free first-come-first-serve. When a spillable operator exceeds
+/// its share, DataFusion spills that operator to disk. `RuntimeEnvBuilder::new()` leaves the
+/// `DiskManager` at its default (`DiskManagerConfig::NewOs`), so those spill files land in a
+/// temporary directory chosen by the OS (`$TMPDIR` / `/tmp`) — no explicit temp path is configured.
+fn runtime_with_memory_pool_bytes(pool_bytes: usize) -> Arc<RuntimeEnv> {
+    // `build_arc` only fails if the default disk/cache managers can't initialize, which does not
+    // happen with the default config — hence `expect` rather than threading a Result through every
+    // engine's `session()` call site. The default `DiskManager` (NewOs) gives spill a working OS
+    // temp dir, so the FairSpillPool's spillable operators can actually degrade to disk.
+    RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(pool_bytes)))
+        .build_arc()
+        .expect("RuntimeEnv with a memory pool builds under the default disk/cache config")
+}
+
+/// [`session()`] over an explicit `RuntimeEnv` — the seam `session()` delegates through, sharing
+/// the process-wide runtime. Tests pass an isolated runtime to prove two sessions built from the
+/// same one share a single memory budget. The Parquet tuning is applied identically per session.
+pub(crate) fn session_with_runtime(runtime: Arc<RuntimeEnv>) -> SessionContext {
     let config = SessionConfig::new()
         .set_bool(
             "datafusion.execution.parquet.schema_force_view_types",
@@ -752,14 +798,16 @@ pub(crate) fn session_with_memory_pool_bytes(pool_bytes: usize) -> SessionContex
             "datafusion.execution.parquet.metadata_size_hint",
             512 * 1024,
         );
-    // `build_arc` only fails if the default disk/cache managers can't initialize, which does not
-    // happen with the default config — hence `expect` rather than threading a Result through every
-    // engine's `session()` call site.
-    let runtime = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
-        .build_arc()
-        .expect("RuntimeEnv with a memory pool builds under the default disk/cache config");
     SessionContext::new_with_config_rt(config, runtime)
+}
+
+/// [`session()`] with an explicit memory-pool budget on its OWN isolated `RuntimeEnv` (not the
+/// shared global) — so tests can build a tiny-pool context and prove the unbounded paths fail loud
+/// (rather than having to actually allocate hundreds of MB) without cross-test interference.
+/// Test-only: production always goes through the process-wide [`shared_runtime`] via `session()`.
+#[cfg(test)]
+pub(crate) fn session_with_memory_pool_bytes(pool_bytes: usize) -> SessionContext {
+    session_with_runtime(runtime_with_memory_pool_bytes(pool_bytes))
 }
 
 #[cfg(test)]
@@ -767,9 +815,102 @@ mod session_tests {
     use super::*;
     use datafusion::execution::memory_pool::MemoryConsumer;
 
-    /// Part 1 of the memory-bound fix: `session()` must ADD a bounded memory pool while
-    /// PRESERVING every existing Parquet tuning flag. A regression that dropped the flags (or
-    /// left the pool unbounded) is exactly the failure this pins.
+    /// The memory-bound fix's headline invariant: every `session()` must draw on ONE
+    /// process-wide memory pool, so the 512 MiB ceiling is an aggregate cap across all concurrent
+    /// queries — not a per-query allowance that dashboard fan-out (~10 queries) would make
+    /// additive and unbounded (N × 512 MiB). Two `session()` contexts must therefore report the
+    /// *same* pool instance. This fails against a fresh-per-call construction path.
+    #[test]
+    fn session_shares_one_process_wide_memory_pool() {
+        let a = session();
+        let b = session();
+        let ra = a.runtime_env();
+        let rb = b.runtime_env();
+        assert!(
+            Arc::ptr_eq(&ra, &rb),
+            "every session() must share ONE process-wide RuntimeEnv"
+        );
+        assert!(
+            Arc::ptr_eq(&ra.memory_pool, &rb.memory_pool),
+            "every session() must share ONE process-wide memory pool"
+        );
+    }
+
+    /// The shared-runtime seam: two sessions built from the *same* `RuntimeEnv` draw on one
+    /// budget, so a reservation held by one is visible to (counts against) the other. Uses an
+    /// isolated 1 KiB runtime — never the global pool — so it can't interfere with, or be
+    /// perturbed by, other tests running real queries concurrently in the same process. Both
+    /// consumers are *unspillable* (`MemoryConsumer::new` defaults to `can_spill = false`), so on
+    /// the `FairSpillPool` they allocate first-come against `pool_size - (unspillable + spillable)`
+    /// — the whole budget is one shared unspillable ledger, exactly the property under test.
+    #[test]
+    fn sessions_from_one_runtime_share_their_memory_budget() {
+        let runtime = runtime_with_memory_pool_bytes(1024);
+        let a = session_with_runtime(runtime.clone());
+        let b = session_with_runtime(runtime.clone());
+
+        // Hold the whole budget via a's pool …
+        let a_pool = a.runtime_env().memory_pool.clone();
+        let mut res_a = MemoryConsumer::new("a").register(&a_pool);
+        res_a
+            .try_grow(1024)
+            .expect("first grow fits the 1 KiB budget");
+
+        // … and b's pool must now be full: it's the SAME pool, not a second 1 KiB allowance.
+        let b_pool = b.runtime_env().memory_pool.clone();
+        let mut res_b = MemoryConsumer::new("b").register(&b_pool);
+        assert!(
+            res_b.try_grow(1).is_err(),
+            "a reservation on one session must count against the other — a single shared budget"
+        );
+    }
+
+    /// The FairSpillPool anti-starvation property — the whole reason we swapped off the greedy
+    /// pool. Two concurrent *spillable* operators (e.g. two dashboard queries each running a sort
+    /// or grouped aggregation) share ONE pool. Fair division caps each spiller at an even fraction
+    /// of the budget net of unspillable reservations (`(pool_size - unspillable) / num_spillers`),
+    /// so the first cannot monopolize the pool and starve the second — the exact failure mode the
+    /// old `GreedyMemoryPool` (first-come, no fair-share) allowed. Isolated 1 KiB runtime.
+    #[test]
+    fn fair_spill_pool_caps_each_spiller_at_its_share_no_starvation() {
+        let runtime = runtime_with_memory_pool_bytes(1024);
+        let pool = runtime.memory_pool.clone();
+
+        // Two spillable consumers registered → num_spillers = 2 → fair share = 1024/2 = 512 each.
+        let mut res_a = MemoryConsumer::new("a")
+            .with_can_spill(true)
+            .register(&pool);
+        let mut res_b = MemoryConsumer::new("b")
+            .with_can_spill(true)
+            .register(&pool);
+
+        // A cannot grab the whole pool: a spiller is capped at its 512-byte fair share, so it
+        // cannot go first-come-first-served over the entire budget the way a greedy pool allows.
+        assert!(
+            res_a.try_grow(1024).is_err(),
+            "a spiller must be capped at its fair share, unable to monopolize the pool"
+        );
+
+        // A takes exactly its fair share …
+        res_a
+            .try_grow(512)
+            .expect("a spiller can reserve its full fair share");
+
+        // … and B can STILL reserve its own fair share afterwards — no starvation. Under the old
+        // greedy pool, A taking half (or, unchecked, all) of one shared budget could leave B unable
+        // to reserve anything; fair division guarantees B its 512 regardless of what A holds.
+        res_b
+            .try_grow(512)
+            .expect("the second spiller keeps its fair share even after the first has reserved");
+    }
+
+    /// `session()` must PRESERVE every Parquet tuning flag, and the budget it draws on must be
+    /// *bounded* (a `FairSpillPool`, not the unbounded default). The bound is probed on an
+    /// isolated runtime of the same `QUERY_MEMORY_POOL_BYTES` budget — not the shared global — so
+    /// the probe can't interact with concurrently-running queries. The probe uses an unspillable
+    /// (default) consumer, whose `try_grow` on the `FairSpillPool` checks the request against the
+    /// whole free budget — so a request one byte over the ceiling is rejected. `try_grow` is pure
+    /// arithmetic (nothing is allocated), so probing the boundary is cheap even at 512 MiB.
     #[test]
     fn session_carries_parquet_tuning_and_a_bounded_memory_pool() {
         let ctx = session();
@@ -789,9 +930,9 @@ mod session_tests {
             "metadata_size_hint must be preserved"
         );
 
-        // New: a *bounded* pool. An `UnboundedMemoryPool` accepts any reservation; ours must
-        // reject one larger than its budget. `try_grow` is pure arithmetic — nothing is actually
-        // allocated — so probing the boundary is cheap even at the 512 MiB default.
+        // A *bounded* pool of the default budget. An `UnboundedMemoryPool` accepts any
+        // reservation; ours must reject one larger than its budget.
+        let ctx = session_with_memory_pool_bytes(QUERY_MEMORY_POOL_BYTES);
         let pool = ctx.runtime_env().memory_pool.clone();
         let mut res = MemoryConsumer::new("session_bound_probe").register(&pool);
         assert!(

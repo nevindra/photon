@@ -20,7 +20,7 @@ days = 30
 promoted_attributes = ["service.name", "host.name"]
 
 [wal]
-segment_max_bytes = 134217728
+segment_max_bytes = 33554432
 segment_max_age_secs = 60
 group_commit_max_delay_ms = 5
 
