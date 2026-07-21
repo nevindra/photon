@@ -627,10 +627,28 @@ mod tests {
         let engine = engine_with_points(vec![
             // hard landing on /home: LCP + a view_duration
             vp_route("web_vitals.lcp", "web", "/home", "desktop", 2000.0),
-            vp_route("web_vitals.view_duration", "web", "/home", "desktop", 12000.0),
+            vp_route(
+                "web_vitals.view_duration",
+                "web",
+                "/home",
+                "desktop",
+                12000.0,
+            ),
             // two clean soft views of /settings: view_duration only
-            vp_route("web_vitals.view_duration", "web", "/settings", "desktop", 3000.0),
-            vp_route("web_vitals.view_duration", "web", "/settings", "desktop", 4500.0),
+            vp_route(
+                "web_vitals.view_duration",
+                "web",
+                "/settings",
+                "desktop",
+                3000.0,
+            ),
+            vp_route(
+                "web_vitals.view_duration",
+                "web",
+                "/settings",
+                "desktop",
+                4500.0,
+            ),
         ]);
         let rows = engine
             .rum_breakdown("web", "browser.route", 0, i64::MAX, None)
@@ -638,9 +656,10 @@ mod tests {
             .unwrap();
 
         // /settings shows up purely from view_duration, with no vital p75s.
-        let settings = rows.iter().find(|r| r.key == "/settings").expect(
-            "route with only view_duration samples must appear in the pages breakdown",
-        );
+        let settings = rows
+            .iter()
+            .find(|r| r.key == "/settings")
+            .expect("route with only view_duration samples must appear in the pages breakdown");
         assert_eq!(settings.pageviews, 2);
         assert_eq!(settings.lcp_p75, None);
         assert_eq!(settings.inp_p75, None);
