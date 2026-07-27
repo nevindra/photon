@@ -135,6 +135,28 @@ describe('TraceDetailView', () => {
     wrapper.unmount()
   })
 
+  // Filters live in the explorer's query string, and only the explorer's own history entry has
+  // them — a fresh push('/traces') would drop them. Coming from the explorer must POP back.
+  it('pops back to the explorer entry (keeping its filters) when that is where we came from', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(History.prototype, 'state')
+    Object.defineProperty(History.prototype, 'state', {
+      configurable: true,
+      get: () => ({ back: '/traces?q=status%3Aerror&sort=slowest&mode=spans' }),
+    })
+    try {
+      const { wrapper, router } = await mountAt('/traces/abc')
+      await settle()
+      const push = vi.spyOn(router, 'push')
+      const back = vi.spyOn(router, 'back').mockImplementation(() => {})
+      await wrapper.find('[data-testid="back-to-traces"]').trigger('click')
+      expect(back).toHaveBeenCalled()
+      expect(push).not.toHaveBeenCalled()
+      wrapper.unmount()
+    } finally {
+      if (descriptor) Object.defineProperty(History.prototype, 'state', descriptor)
+    }
+  })
+
   it('pivots to /logs with the whole-trace query on "view all logs"', async () => {
     const { wrapper, router } = await mountAt('/traces/abc')
     await settle()

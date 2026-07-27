@@ -334,6 +334,27 @@ describe('TracesExplorer (integration)', () => {
     wrapper.unmount()
   })
 
+  // A drill-in to /traces/:id returns to THIS history entry, so the entry has to describe the
+  // whole view from the moment it's mounted — not only once the user changes something.
+  it('stamps sort + mode onto the URL at mount, so a drill-in can return to them', async () => {
+    window.history.replaceState(null, '', '/traces?q=' + encodeURIComponent('status:error'))
+    const { wrapper } = await mountExplorer()
+    const params = new URLSearchParams(window.location.search)
+    expect(params.get('sort')).toBe('recent')
+    expect(params.get('mode')).toBe('traces')
+    expect(params.get('q')).toBe('status:error') // ...without clobbering the filters already there
+    wrapper.unmount()
+  })
+
+  it('ignores an unknown sort/mode in the URL instead of querying with it', async () => {
+    window.history.replaceState(null, '', '/traces?sort=bogus&mode=nonsense')
+    const { wrapper } = await mountExplorer()
+    expect(api.searchTraces).toHaveBeenCalled()
+    expect(api.searchTraces.mock.calls[0][0].sort).toBe('recent')
+    expect(wrapper.findComponent(TraceTable).exists()).toBe(true)
+    wrapper.unmount()
+  })
+
   it('errors-only switch adds and removes status:error in the query', async () => {
     const { wrapper } = await mountExplorer()
 

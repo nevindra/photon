@@ -2,7 +2,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { useVirtualizer } from '@tanstack/vue-virtual'
 import { ChevronRight, ChevronDown, ChevronUp } from 'lucide-vue-next'
-import { useElementSize } from '@vueuse/core'
+import { useElementSize, useStorage } from '@vueuse/core'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { Label } from '@/components/ui/label'
@@ -37,7 +37,60 @@ const ROW_HEIGHT = 28 // matches the h-7 rows below
 // Shared column split (label column | bar-track column) so the axis ticks, the gridlines, and
 // every row all measure their 0-100% span identically — the "bar-track origin" the ticks and
 // gridlines are aligned to.
-const GRID_TEMPLATE_COLUMNS = 'minmax(200px, 320px) 1fr'
+//
+// The label column used to be a hard `minmax(200px, 320px)`, which capped it at 320px no matter
+// how wide the window was: deep traces (each level indents 14px) truncated both the service and
+// the operation name to a few characters with no way to see them. It's now user-resizable via the
+// drag handle between the two columns, clamped to [LABEL_MIN, LABEL_MAX] and persisted across
+// traces/sessions. Every consumer of the split reads the same computed, so the axis, the
+// gridlines, and the rows stay locked together while dragging.
+const LABEL_MIN = 160
+const LABEL_MAX = 720
+const LABEL_DEFAULT = 320
+const storedLabelWidth = useStorage('photon:waterfall-label-width', LABEL_DEFAULT)
+const clampLabelWidth = (px) =>
+  Math.round(Math.min(LABEL_MAX, Math.max(LABEL_MIN, Number(px) || LABEL_DEFAULT)))
+const labelWidth = computed(() => clampLabelWidth(storedLabelWidth.value))
+const GRID_TEMPLATE_COLUMNS = computed(() => `${labelWidth.value}px 1fr`)
+
+// --- label-column resize (pointer drag + keyboard) ---
+const resizing = ref(false)
+let dragStartX = 0
+let dragStartWidth = LABEL_DEFAULT
+function onResizeStart(event) {
+  resizing.value = true
+  dragStartX = event.clientX
+  dragStartWidth = labelWidth.value
+  event.currentTarget.setPointerCapture?.(event.pointerId)
+  event.preventDefault()
+}
+function onResizeMove(event) {
+  if (!resizing.value) return
+  storedLabelWidth.value = clampLabelWidth(dragStartWidth + (event.clientX - dragStartX))
+}
+function onResizeEnd(event) {
+  if (!resizing.value) return
+  resizing.value = false
+  event.currentTarget.releasePointerCapture?.(event.pointerId)
+}
+// Keyboard equivalent for the drag (the handle is a focusable `separator`), plus double-click /
+// Home to snap back to the default width.
+function onResizeKeydown(event) {
+  const step = event.shiftKey ? 48 : 16
+  if (event.key === 'ArrowLeft') {
+    event.preventDefault()
+    storedLabelWidth.value = clampLabelWidth(labelWidth.value - step)
+  } else if (event.key === 'ArrowRight') {
+    event.preventDefault()
+    storedLabelWidth.value = clampLabelWidth(labelWidth.value + step)
+  } else if (event.key === 'Home') {
+    event.preventDefault()
+    storedLabelWidth.value = LABEL_DEFAULT
+  }
+}
+function resetLabelWidth() {
+  storedLabelWidth.value = LABEL_DEFAULT
+}
 
 // Filter: case-insensitive substring match on service OR operation name. Non-matches are DIMMED,
 // not removed, so the tree shape stays legible — but matches are also navigable (see below).
@@ -184,6 +237,7 @@ const openRows = computed(() => {
       ...n,
       barLeftPct: leftPct,
       barWidthPct: widthPct,
+      ...computeBarLabel(leftPct, widthPct),
       selfInsets: computeSelfInsets(n),
       eventMarkers: computeEventMarkers(n),
       descendantCount: isCollapsedParent ? descendantCount(n) : 0,
@@ -297,10 +351,36 @@ function barClass(node) {
 // Bar left/width as % of the full trace width. A floor keeps sub-pixel spans visible.
 // Pure — takes the node + trace tree, returns numeric percentages; folded into `openRows` once
 // (per recompute) so the template reads static fields instead of recomputing this per frame.
+//
+// The floor is applied LAST, by sliding `left` back, not by trimming `width` against `100 - left`
+// as this used to: a short span sitting at the very end of the trace has left ≈ 100, so
+// `min(width, 100 - left)` clamped it back below the floor and the bar rendered as a hairline (or
+// nothing at all). Clamping the offset instead keeps every span at least MIN_BAR_PCT wide while
+// still never overflowing the track.
+const MIN_BAR_PCT = 0.5
+// Past this end-position the duration caption would be pushed off the right edge of the track (and
+// clipped by the rows' scroll container), so it flips to the other side of the bar — see
+// `computeBarLabel`.
+const LABEL_FLIP_PCT = 88
+// ...unless the bar STARTS that near the left edge too (a bar spanning nearly the whole track), in
+// which case there's no room before it either and the caption sits inside the bar's right end.
+const LABEL_INSIDE_PCT = 12
+
 function computeBar(node, t) {
-  const left = pct(node.offsetNs, t.durationNs)
-  const width = Math.max(pct(node.durationNs, t.durationNs), 0.5)
-  return { leftPct: left, widthPct: Math.min(width, 100 - left) }
+  const width = Math.min(100, Math.max(pct(node.durationNs, t.durationNs), MIN_BAR_PCT))
+  const left = Math.max(0, Math.min(pct(node.offsetNs, t.durationNs), 100 - width))
+  return { leftPct: left, widthPct: width }
+}
+
+// Where the duration caption anchors, given the bar geometry. `flipped` captions are translated a
+// full width to the LEFT of their anchor (see the template), so they read right-to-left from it.
+function computeBarLabel(leftPct, widthPct) {
+  const end = leftPct + widthPct
+  if (end <= LABEL_FLIP_PCT) return { labelAnchorPct: end, labelFlipped: false }
+  return {
+    labelAnchorPct: leftPct >= LABEL_INSIDE_PCT ? leftPct : end,
+    labelFlipped: true,
+  }
 }
 
 // Self-time insets: the union of child-covered intervals (already clamped + merged by
@@ -456,7 +536,10 @@ function onRowsKeydown(event) {
       <!-- Time axis + ticks, split on the same grid as the rows so ticks sit above the bar track.
            When the minimap is shown it narrows the rows' bar-track, so the axis carries a matching
            spacer on its right to keep the tick track the same width as the gridlines/bars below. -->
-      <div class="mx-3 mt-2 flex h-4 shrink-0 border-b border-border">
+      <!-- Horizontal insets must match the rows' exactly (`pr-3`, no left inset) or the ticks and
+           gridlines drift from the bars they annotate — the axis used to be `mx-3` while the rows
+           were flush-left with `pr-3`, offsetting the whole tick track by 12px. -->
+      <div class="mt-2 flex h-4 shrink-0 border-b border-border pr-3">
         <div class="grid min-w-0 flex-1" :style="{ gridTemplateColumns: GRID_TEMPLATE_COLUMNS }">
           <div></div>
           <div class="relative h-full">
@@ -473,7 +556,35 @@ function onRowsKeydown(event) {
       </div>
 
       <!-- Span rows (virtualized) + right-edge minimap for deep traces. -->
-      <div class="flex min-h-0 flex-1">
+      <div class="relative flex min-h-0 flex-1">
+      <!-- Label/bar-track splitter. Sits on the column boundary, spans the rows viewport, and is a
+           focusable `separator` so the column is resizable by keyboard too (←/→, Home to reset;
+           double-click resets as well). -->
+      <div
+        data-testid="waterfall-label-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize span label column"
+        :aria-valuenow="labelWidth"
+        :aria-valuemin="LABEL_MIN"
+        :aria-valuemax="LABEL_MAX"
+        tabindex="0"
+        :class="
+          cn(
+            'absolute inset-y-0 z-10 w-2 -translate-x-1/2 cursor-col-resize touch-none select-none',
+            'after:absolute after:inset-y-0 after:left-1/2 after:w-px after:-translate-x-1/2 after:bg-border after:transition-colors',
+            'hover:after:bg-brand focus-visible:outline-none focus-visible:after:bg-brand',
+            resizing && 'after:bg-brand',
+          )
+        "
+        :style="{ left: labelWidth + 'px' }"
+        @pointerdown="onResizeStart"
+        @pointermove="onResizeMove"
+        @pointerup="onResizeEnd"
+        @pointercancel="onResizeEnd"
+        @keydown="onResizeKeydown"
+        @dblclick="resetLabelWidth"
+      />
       <div
         ref="scrollEl"
         data-testid="waterfall-rows"
@@ -485,7 +596,7 @@ function onRowsKeydown(event) {
         <div :style="{ height: totalSize + 'px', width: '100%', position: 'relative' }">
           <!-- Gridlines: faint vertical lines at each axis tick, behind the rows. -->
           <div
-            class="pointer-events-none absolute inset-0 grid"
+            class="pointer-events-none absolute inset-0 grid pr-3"
             :style="{ gridTemplateColumns: GRID_TEMPLATE_COLUMNS }"
           >
             <div></div>
@@ -591,9 +702,19 @@ function onRowsKeydown(event) {
                   >◆</span
                 >
               </div>
+              <!-- Duration caption. Normally trails the bar; for bars that end at (or near) the
+                   right edge it flips to the other side of its anchor so it can't be pushed out of
+                   the track and clipped by the rows' scroll container. -->
               <span
-                class="absolute top-1/2 -translate-y-1/2 pl-1 font-mono text-[10px] text-muted-foreground"
-                :style="{ left: row.node.barLeftPct + row.node.barWidthPct + '%' }"
+                data-testid="span-duration-label"
+                :data-flipped="row.node.labelFlipped ? 'true' : 'false'"
+                :class="
+                  cn(
+                    'pointer-events-none absolute top-1/2 -translate-y-1/2 whitespace-nowrap font-mono text-[10px] text-muted-foreground',
+                    row.node.labelFlipped ? '-translate-x-full pr-1' : 'pl-1',
+                  )
+                "
+                :style="{ left: row.node.labelAnchorPct + '%' }"
                 >{{ formatDuration(row.node.durationNs) }}</span
               >
             </div>

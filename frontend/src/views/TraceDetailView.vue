@@ -17,6 +17,7 @@ import { formatDuration, formatFull, formatNumber } from '@/lib/core/format'
 import { serviceColorClass } from '@/lib/services/serviceColor'
 import { useCopy } from '@/lib/core/useCopy'
 import { correlate } from '@/lib/core/useCorrelate'
+import { backTo } from '@/lib/core/useBackTo'
 
 const route = useRoute()
 const router = useRouter()
@@ -96,8 +97,11 @@ function onWindowKeydown(event) {
 onMounted(() => window.addEventListener('keydown', onWindowKeydown))
 onUnmounted(() => window.removeEventListener('keydown', onWindowKeydown))
 
+// Return to the explorer's own history entry when that's where we came from, so its filters
+// (`q`/`sort`/`mode` + the context keys) survive the round trip — a bare push('/traces') would
+// mint a filterless entry instead. See lib/core/useBackTo.ts.
 function backToTraces() {
-  router.push('/traces')
+  backTo(router, '/traces')
 }
 
 function openLogs(query) {

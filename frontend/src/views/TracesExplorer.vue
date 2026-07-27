@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, watch, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useQuery, keepPreviousData } from '@tanstack/vue-query'
 import { refDebounced, useIntersectionObserver } from '@vueuse/core'
 import AppShell from '@/components/common/AppShell.vue'
@@ -45,6 +45,7 @@ import {
 } from '@/lib/core/context'
 import { correlate } from '@/lib/core/useCorrelate'
 
+const route = useRoute()
 const router = useRouter()
 
 // --- state ---
@@ -84,14 +85,23 @@ const aggEndMs = computed(() => Math.ceil(endMs.value / AGG_BUCKET_MS) * AGG_BUC
 // `range`/`from`/`to` URL sync (seeded + started once in main.js).
 useUrlState({ text })
 
+// Correlation/deep-link entry: a pivot into the explorer lands here as `/traces?q=<query>` via
+// router.push, so seed `text` from `route.query.q` too — the router-native counterpart to
+// useUrlState's window.location seed above (equal in a browser, but authoritative under
+// memory-history and on a back-navigation into a fresh instance). Mirrors LogsView.
+if (typeof route.query.q === 'string' && route.query.q) text.value = route.query.q
+
 // `sort` and `resultMode` aren't among useUrlState's fixed keys, so they're layered on top with
-// their own tiny sync: seed each once from the raw query string (before anything rewrites it)...
-if (typeof window !== 'undefined') {
-  const params = new URLSearchParams(window.location.search)
-  const initialSort = params.get('sort')
-  if (initialSort) sort.value = initialSort
-  const initialMode = params.get('mode')
-  if (initialMode) resultMode.value = initialMode
+// their own tiny sync: seed each once from the route (falling back to the raw query string, before
+// anything rewrites it)...
+{
+  const q = route.query
+  const params =
+    typeof window === 'undefined' ? null : new URLSearchParams(window.location.search)
+  const initialSort = (typeof q.sort === 'string' && q.sort) || params?.get('sort')
+  if (initialSort && SORTS.some((s) => s.key === initialSort)) sort.value = initialSort
+  const initialMode = (typeof q.mode === 'string' && q.mode) || params?.get('mode')
+  if (initialMode && RESULT_MODES.some((m) => m.key === initialMode)) resultMode.value = initialMode
 }
 
 // --- services (for the search-bar autocomplete) ---
@@ -406,6 +416,11 @@ function onViewLogs({ traceId }) {
 // watcher (the default 'pre' flush timing) rewrites the WHOLE query string via buildQuery whenever
 // timeRange/text change, and buildQuery has no notion of `sort`/`mode` — a `flush: 'post'` watcher
 // here always runs after that rewrite, so neither gets silently dropped from the URL.
+//
+// `immediate: true` matters for round-tripping: a drill-in to `/traces/:id` and back returns to
+// THIS entry's URL, so the entry has to already carry the full view state at mount — not only
+// after the user happens to change something. Same reason the whole filter set lives in the query
+// string at all (see lib/core/useBackTo.ts).
 if (typeof window !== 'undefined') {
   watch(
     [timeRange, text, sort, resultMode],
@@ -415,7 +430,7 @@ if (typeof window !== 'undefined') {
       params.set('mode', resultMode.value)
       window.history.replaceState(null, '', '?' + params.toString())
     },
-    { flush: 'post' },
+    { flush: 'post', immediate: true },
   )
 }
 </script>

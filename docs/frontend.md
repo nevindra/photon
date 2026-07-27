@@ -184,7 +184,9 @@ cross-cutting. Imports use the extensionless alias form `@/lib/<folder>/<name>`.
   `range`/`from`/`to`/`scope` URL keys), `useUrlState.ts` (per-view `svc`/`sev`/`q`; merge-preserves
   every other key, including the context ones), `useCorrelate.ts` (`correlate()` builds a same-app
   link that always carries the current time+scope; `relatedFor()` is the per-entity-kind
-  related-destination graph behind `RelatedMenu`).
+  related-destination graph behind `RelatedMenu`), `useBackTo.ts` (`backTo(router, listPath)` —
+  a detail view's back button POPS to the list's own history entry when that's where it came from,
+  so the list's filters survive the round trip, and only `push`es as the deep-link fallback).
 - *Search DSL & generic composables:* `queryLang.ts` (display-only lexer mirroring the Rust parser —
   never validates), `useTableColumns.ts` (persisted column visibility), `useLiveTail.ts` (refresh-mode
   → stream-or-poll + ring buffer with pause-on-scroll), `listNav.ts` (pure j/k stepping), `useCopy.ts`.

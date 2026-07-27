@@ -55,6 +55,25 @@ Handlers: `crates/photon-api/src/{traces,traces_search,traces_agg}.rs`.
 - `/traces/:traceId` → `TraceDetailView.vue`: the waterfall + a span detail panel. The route param is
   the source of truth.
 
+**Filter persistence.** The explorer's whole view state lives in the query string: `q` (the grammar
+query every facet/quick-filter writes into — see `useUrlState`) plus `sort` and `mode`, layered on
+by TracesExplorer's own `flush: 'post'` watcher. That watcher is `immediate`, so the entry carries
+the full state from mount, not only after the first change; unknown `sort`/`mode` values are
+rejected at seed time rather than forwarded to the API. The detail view's back button therefore
+**pops** back to the explorer's own history entry (`lib/core/useBackTo.ts` — `router.back()` when
+the previous entry is `/traces`, `router.push` only for deep links), which is what makes the
+filters survive a drill-in → back round trip. `ServiceDetailView` uses the same helper.
+
+**Waterfall layout.** The label column (service · operation, indented 14px per depth) is
+**user-resizable** via the splitter between it and the bar track — drag, or focus it and use ←/→
+(Shift for a bigger step), Home/double-click to reset. The width is clamped to 160–720px and
+persisted in `localStorage` under `photon:waterfall-label-width`. The axis, the gridline overlay and
+the rows all read one `GRID_TEMPLATE_COLUMNS` computed and share identical horizontal insets, so
+ticks/gridlines stay locked to the bars. Bar geometry floors every span at 0.5% width and slides
+`left` back to fit (never trims width against `100 - left`, which used to erase spans sitting at the
+very end of a skewed trace); the duration caption flips to the other side of its anchor when the bar
+ends near the right edge, so it can't be clipped by the rows' scroll container.
+
 **Components** (`frontend/src/components/traces/`): `TraceTable`, `SpanTable`, `TraceWaterfall`,
 `TraceMinimap`, `SpanDetailPanel`, `TracePeekDrawer`, `TracesFilters`, `LatencyHistogram`,
 `SpanVolumeHistogram`. **Queries**: `frontend/src/lib/tracesQueries.js`. **Waterfall geometry**:

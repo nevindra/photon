@@ -340,4 +340,114 @@ describe('TraceWaterfall', () => {
     expect(w.emitted('select-span')).toBeUndefined()
     w.unmount()
   })
+
+  // --- bar geometry: end-of-trace spans (the "invisible bars" report) ---
+  // A trace whose root is short but whose sibling work lands at the very END of the window (real
+  // traces get this from cross-service clock skew). Those spans sit at left ≈ 100%, which is where
+  // the old `min(width, 100 - left)` clamp trimmed them to a hairline.
+  const TAIL_SPANS = [
+    span('root', null, 0, 1_000_000_000),
+    span('tail', 'root', 999_000_000, 999_500_000, { service: 'db' }),
+    span('wide', 'root', 0, 990_000_000, { service: 'cache' }),
+  ]
+
+  it('keeps a visible bar for a span at the very end of the trace', async () => {
+    const w = mount(TraceWaterfall, { props: { spans: TAIL_SPANS }, attachTo: document.body })
+    await settle()
+    const tail = w.vm.openRows.find((r) => r.id === 'tail')
+    expect(tail.barWidthPct).toBeGreaterThanOrEqual(0.5)
+    // ...and still inside the track.
+    expect(tail.barLeftPct + tail.barWidthPct).toBeLessThanOrEqual(100)
+    w.unmount()
+  })
+
+  it('flips the duration caption for bars that end at the right edge', async () => {
+    const w = mount(TraceWaterfall, { props: { spans: TAIL_SPANS }, attachTo: document.body })
+    await settle()
+    const label = (id) =>
+      w.find(`[data-span-row][data-span-id="${id}"] [data-testid="span-duration-label"]`)
+
+    // Root spans the whole track: no room on either side, so the caption sits inside its right end.
+    expect(label('root').attributes('data-flipped')).toBe('true')
+    // The tail span starts near the right edge: the caption goes BEFORE it.
+    expect(label('tail').attributes('data-flipped')).toBe('true')
+    expect(w.vm.openRows.find((r) => r.id === 'tail').labelAnchorPct).toBeLessThan(100)
+    // A bar ending well inside the track keeps the caption trailing it.
+    const child = mount(TraceWaterfall, { props: { spans: SPANS }, attachTo: document.body })
+    await settle()
+    expect(
+      child.find('[data-span-row][data-span-id="child"] [data-testid="span-duration-label"]')
+        .attributes('data-flipped'),
+    ).toBe('false')
+    child.unmount()
+    w.unmount()
+  })
+
+  // --- resizable label column ---
+  // jsdom has no PointerEvent, and VTU's synthesized MouseEvent has a read-only `clientX` — so
+  // dispatch a real MouseEvent (whose constructor DOES take clientX) under the pointer* type the
+  // handler listens for.
+  function pointer(el, type, clientX) {
+    el.dispatchEvent(new MouseEvent(type, { clientX, bubbles: true, cancelable: true }))
+  }
+
+  it('resizes the label column by dragging the splitter, and keeps every track in step', async () => {
+    localStorage.removeItem('photon:waterfall-label-width')
+    const w = mount(TraceWaterfall, { props: { spans: SPANS }, attachTo: document.body })
+    await settle()
+    const handle = w.find('[data-testid="waterfall-label-resizer"]')
+    expect(handle.exists()).toBe(true)
+    expect(handle.attributes('aria-valuenow')).toBe('320')
+
+    pointer(handle.element, 'pointerdown', 320)
+    pointer(handle.element, 'pointermove', 460)
+    pointer(handle.element, 'pointerup', 460)
+    await settle()
+
+    expect(w.vm.labelWidth).toBe(460)
+    // The rows, the gridline overlay and the axis all read the same computed split.
+    const row = w.find('[data-span-row]')
+    expect(row.attributes('style')).toContain('460px 1fr')
+    w.unmount()
+  })
+
+  it('clamps the label column to its bounds and persists the width', async () => {
+    localStorage.removeItem('photon:waterfall-label-width')
+    const w = mount(TraceWaterfall, { props: { spans: SPANS }, attachTo: document.body })
+    await settle()
+    const handle = w.find('[data-testid="waterfall-label-resizer"]')
+
+    pointer(handle.element, 'pointerdown', 320)
+    pointer(handle.element, 'pointermove', -5000)
+    await settle()
+    expect(w.vm.labelWidth).toBe(160) // LABEL_MIN
+    pointer(handle.element, 'pointermove', 5000)
+    await settle()
+    expect(w.vm.labelWidth).toBe(720) // LABEL_MAX
+    pointer(handle.element, 'pointerup', 5000)
+    w.unmount()
+
+    // A fresh instance picks the stored width back up.
+    const again = mount(TraceWaterfall, { props: { spans: SPANS }, attachTo: document.body })
+    await settle()
+    expect(again.vm.labelWidth).toBe(720)
+    again.unmount()
+    localStorage.removeItem('photon:waterfall-label-width')
+  })
+
+  it('resizes by keyboard and resets to the default', async () => {
+    localStorage.removeItem('photon:waterfall-label-width')
+    const w = mount(TraceWaterfall, { props: { spans: SPANS }, attachTo: document.body })
+    await settle()
+    const handle = w.find('[data-testid="waterfall-label-resizer"]')
+
+    await handle.trigger('keydown', { key: 'ArrowRight' })
+    expect(w.vm.labelWidth).toBe(336)
+    await handle.trigger('keydown', { key: 'ArrowLeft', shiftKey: true })
+    expect(w.vm.labelWidth).toBe(288)
+    await handle.trigger('dblclick')
+    expect(w.vm.labelWidth).toBe(320)
+    w.unmount()
+    localStorage.removeItem('photon:waterfall-label-width')
+  })
 })

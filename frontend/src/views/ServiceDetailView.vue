@@ -26,6 +26,7 @@ import { ArrowLeft } from 'lucide-vue-next'
 import { api } from '@/lib/core/api'
 import { formatDuration, formatNumber } from '@/lib/core/format'
 import { useRed } from '@/lib/traces/tracesQueries'
+import { backTo } from '@/lib/core/useBackTo'
 import { useServiceTimeseries, useServiceDependencies } from '@/lib/services/servicesQueries'
 import {
   timeRange,
@@ -59,8 +60,10 @@ watch(
   { immediate: true },
 )
 
+// Same round-trip preservation as the trace detail's back button (see lib/core/useBackTo.ts):
+// return to the list's own history entry so its sort/search state survives.
 function backToServices() {
-  router.push('/services')
+  backTo(router, '/services')
 }
 
 // --- data ---

@@ -1,7 +1,12 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   darkMode: 'class',
-  content: ['./index.html', './src/**/*.{vue,js}'],
+  // `.ts` is NOT optional here: class-name literals live in plain TypeScript modules too
+  // (lib/services/serviceColor.ts's SERVICE_PALETTE, lib/core/seriesColor.ts's swatches,
+  // lib/services/serviceHealth.ts, lib/core/format.ts's severity tones). Dropping `ts` from
+  // this glob purges those utilities from the bundle, and every span bar / breakdown segment /
+  // series swatch renders with no background at all. See tailwind.config.test.js.
+  content: ['./index.html', './src/**/*.{vue,js,ts}'],
   theme: {
     extend: {
       colors: {
