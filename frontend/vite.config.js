@@ -15,7 +15,8 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/api': 'http://127.0.0.1:8080',
+      // Backend target; override with PHOTON_API_PROXY when :8080 is taken (default matches process-compose).
+      '/api': process.env.PHOTON_API_PROXY || 'http://127.0.0.1:8080',
     },
   },
   build: {
