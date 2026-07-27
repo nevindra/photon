@@ -219,6 +219,16 @@ const matchedCount = computed(() => search.value.data.value?.pages?.[0]?.matched
 const elapsedMs = computed(() => search.value.data.value?.pages?.[0]?.elapsed_ms ?? 0)
 const loading = computed(() => search.value.isFetching.value)
 const resultNoun = computed(() => (resultMode.value === 'spans' ? 'spans' : 'traces'))
+// The two grains answer DIFFERENT questions, and only the spans grain answers the obvious one.
+// A query always matches SPANS; the traces grain then returns the whole trace around each match
+// (photon-query's trace_list), so a trace row is "a trace containing a matching span" — its Root
+// service / Root operation columns describe its root span, which may not be what matched at all.
+// Left implicit, that reads as a broken filter. Stated once, next to the count, it reads as the
+// feature it is. Only shown when a query is actually narrowing something.
+const hasQuery = computed(() => debouncedText.value.trim().length > 0)
+const matchNote = computed(() =>
+  resultMode.value === 'traces' && hasQuery.value ? 'containing a matching span' : '',
+)
 
 // The table shows the streamed spans while Live is active AND the Spans grain is showing — merged on
 // top of the current span search page as a frozen baseline, so entering Live keeps the already-
@@ -508,6 +518,13 @@ if (typeof window !== 'undefined') {
           <span class="font-mono tabular-nums text-foreground/80">
             {{ formatNumber(matchedCount) }} {{ resultNoun }}
           </span>
+          <span
+            v-if="matchNote"
+            data-testid="trace-match-note"
+            class="font-mono text-muted-foreground/70"
+            title="A query matches spans. The traces grain returns the whole trace around each matching span, so the Root service / Root operation columns describe the trace's root — not necessarily the span that matched. Switch to Spans to list the matching spans themselves."
+            >{{ matchNote }}</span
+          >
           <span class="text-border">·</span>
           <span class="font-mono tabular-nums">{{ elapsedMs }} ms</span>
           <span class="text-border">·</span>

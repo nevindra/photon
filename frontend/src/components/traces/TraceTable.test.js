@@ -144,6 +144,21 @@ describe('TraceTable', () => {
     w.unmount()
   })
 
+  // A query matches SPANS; the traces grain returns the whole trace around each match, so this
+  // column can name a service that has nothing matching in it. Headed "Service" that reads as a
+  // broken filter — it must say which span it describes, like its "Root operation" neighbour.
+  it('heads the root-service column "Root service", not "Service"', async () => {
+    const w = mount(TraceTable, { props: { traces: TRACES }, attachTo: document.body })
+    await settle()
+    // The header row is the one uppercase block; its spans are the column labels.
+    const labels = w.get('.uppercase').findAll('span').map((s) => s.text())
+    expect(labels).toContain('Root service')
+    expect(labels).not.toContain('Service')
+    // Its neighbour already named the span it describes; the two now agree.
+    expect(labels).toContain('Root operation')
+    w.unmount()
+  })
+
   it('adding an attribute column via the ColumnPicker emits columns-changed and renders root_attributes', async () => {
     const traces = [trace('t1', { root_attributes: { 'http.route': '/orders/:id' } })]
     const w = mount(TraceTable, {

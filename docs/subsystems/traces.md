@@ -55,6 +55,20 @@ Handlers: `crates/photon-api/src/{traces,traces_search,traces_agg}.rs`.
 - `/traces/:traceId` → `TraceDetailView.vue`: the waterfall + a span detail panel. The route param is
   the source of truth.
 
+**The two grains answer different questions — say so in the UI.** A query always matches **spans**.
+The Spans grain lists those matching spans. The Traces grain runs the same span predicate and then
+returns the **whole trace** around each match (`trace_list`: find trace ids with ≥1 matching span,
+then refetch every span of those traces *unfiltered* so the rollups describe the whole trace), and
+each row's `root_service`/`root_name` describe the trace's **root span** — which need not be what
+matched. So `kind:server` legitimately lists a trace rooted at a service that has no server span in
+it. Because that reads as a broken filter when left implicit, three labels carry it: the column is
+headed **"Root service"** (matching its "Root operation" neighbour, and never bare "Service"), the
+result count adds **"containing a matching span"** whenever a query narrows the traces grain, and the
+filter rail is captioned **"counts are spans"** — its facets run on the spans engine
+(`span_facet.rs`) in *both* grains, which is why a rail total (47) won't match a trace total (44).
+Keep these in sync with the engine: if the matching semantics ever change, these three strings are
+the contract users read.
+
 **Filter persistence.** The explorer's whole view state lives in the query string: `q` (the grammar
 query every facet/quick-filter writes into — see `useUrlState`) plus `sort` and `mode`, layered on
 by TracesExplorer's own `flush: 'post'` watcher. That watcher is `immediate`, so the entry carries

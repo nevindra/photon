@@ -355,6 +355,41 @@ describe('TracesExplorer (integration)', () => {
     wrapper.unmount()
   })
 
+  // The reported confusion: `kind:server` listed traces rooted at a service with no server span.
+  // That's correct — a query matches SPANS and the traces grain returns the whole trace around each
+  // match — but nothing said so, so it read as a broken filter.
+  describe('grain note', () => {
+    it('says what a trace row is once a query is narrowing the list', async () => {
+      window.history.replaceState(null, '', '/traces?q=' + encodeURIComponent('kind:server'))
+      const { wrapper } = await mountExplorer()
+      await flushPromises()
+      const note = wrapper.get('[data-testid="trace-match-note"]')
+      expect(note.text()).toBe('containing a matching span')
+      expect(note.attributes('title')).toContain('Switch to Spans')
+      wrapper.unmount()
+    })
+
+    it('stays quiet with no query — nothing is being narrowed', async () => {
+      const { wrapper } = await mountExplorer()
+      await flushPromises()
+      expect(wrapper.find('[data-testid="trace-match-note"]').exists()).toBe(false)
+      wrapper.unmount()
+    })
+
+    it('stays quiet in the spans grain — there the rows ARE the matches', async () => {
+      window.history.replaceState(
+        null,
+        '',
+        '/traces?mode=spans&q=' + encodeURIComponent('kind:server'),
+      )
+      const { wrapper } = await mountExplorer()
+      await flushPromises()
+      expect(wrapper.findComponent(SpanTable).exists()).toBe(true)
+      expect(wrapper.find('[data-testid="trace-match-note"]').exists()).toBe(false)
+      wrapper.unmount()
+    })
+  })
+
   it('errors-only switch adds and removes status:error in the query', async () => {
     const { wrapper } = await mountExplorer()
 

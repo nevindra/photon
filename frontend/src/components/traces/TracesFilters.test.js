@@ -37,6 +37,20 @@ beforeEach(() => {
 })
 
 describe('TracesFilters — pinned Service/Status/Kind', () => {
+  // Every count in this panel comes off the SPANS engine, while the list beside it may be showing
+  // traces — which is how "raisa-gateway 47" ends up next to "44 traces" whose rows are rooted at
+  // some other service. Unlabelled, the rail reads as a broken filter.
+  it('states that its counts are span counts', async () => {
+    stubApi({ service: [{ value: 'checkout-api', count: 120 }] })
+    const wrapper = mountFilters()
+    await flushPromises()
+    const note = wrapper.get('[data-testid="facet-grain-note"]')
+    expect(note.text()).toBe('counts are spans')
+    // ...with the full "a trace is listed when any one of its spans matches" explanation on hover.
+    expect(note.attributes('title')).toContain('span counts')
+    wrapper.unmount()
+  })
+
   it('renders service/status/kind sections with facet values and counts', async () => {
     stubApi({
       service: [{ value: 'checkout-api', count: 120 }],

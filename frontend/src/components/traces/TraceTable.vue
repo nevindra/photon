@@ -30,7 +30,14 @@ const emit = defineEmits(['open-trace', 'toggle-value', 'columns-changed'])
 // it's a rendering concern `useTableColumns` doesn't need to know about.
 const BUILTINS = [
   { key: 'start_ts', label: 'Start', width: '104px' },
-  { key: 'root_service', label: 'Service', width: '140px' },
+  // "Root service", not "Service" — it renders `root_service`, the trace's parent-less root span,
+  // which is NOT necessarily the service that matched the query. Trace-grain search matches at the
+  // SPAN level and returns whole traces (photon-query's trace_list: find trace ids with ≥1 matching
+  // span, then refetch every span of those traces unfiltered for the rollups), so `kind:server` can
+  // legitimately list a trace rooted at a service with no server span in it at all. Labelling this
+  // "Service" invited exactly one misreading: "why is this row here, it isn't that service?".
+  // The neighbouring column was already "Root operation"; these two describe the same span.
+  { key: 'root_service', label: 'Root service', width: '140px' },
   { key: 'root_name', label: 'Root operation', width: '1fr' },
   { key: 'duration_ns', label: 'Duration', width: '170px' },
   { key: 'span_count', label: 'Spans', width: '64px' },
