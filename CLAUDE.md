@@ -106,7 +106,8 @@ and `/onboarding`, behind a `beforeEach` auth guard
 per-view identity (`view.id`/`seq`/`previous_route`) with its own Web Vitals and, with `tracing:
 true`, its own backend trace per route; the exported `trackView(route?)` is a manual escape hatch
 for routers that prefer to drive the boundary themselves. `NavRail` groups these into ownership
-**worlds** (Home; Frontend → `/rum`, Backend → `/services`, Infrastructure → **Hosts** `/infra` +
+**worlds** (Home; Frontend → `/rum`, Backend → `/services`, Infrastructure — headed "Infra", since
+rail headings have ~10 characters of room — → **Hosts** `/infra` +
 **Ops** `/uptime`), an **Explore** section (Logs/Traces/Metrics), and **Manage** (Data, Alerts), with
 `AppShell` deriving the highlighted group from the route. Cross-view correlation (log→trace, span/trace→logs,
 and a "Related ▾" menu) flows through `router.push` via `lib/core/useCorrelate.ts`'s `correlate()`, which

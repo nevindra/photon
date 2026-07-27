@@ -91,7 +91,12 @@ per-signal list: an ungrouped **Home** entry, then three worlds — **Frontend**
 (→ `/services`), **Infrastructure** (two items: **Hosts** → `/infra`, **Ops** → `/uptime`) — Frontend
 and Backend are each today a single landing item into an existing route (room to grow their own
 sub-nav later), then **Explore** (Logs · Traces · Metrics, the raw per-signal browsers) and **Manage**
-(Data, then Alerts — the cross-signal webhook alert engine). `AppShell.vue` derives which group to
+(Data, then Alerts — the cross-signal webhook alert engine). The rail is 74px wide, so a group
+**heading** has room for ~10 characters at its 9px uppercase/`tracking-wider` size — the
+Infrastructure world is headed **"Infra"** for that reason (the full word overflowed both edges and
+was clipped by the rail border, reading as a mis-centred label; it stays full-length in breadcrumbs).
+Headings also `truncate`, so an over-long one clips cleanly instead of bleeding. `AppShell.vue`
+derives which group to
 highlight from the route via a `ROUTE_GROUP` map (e.g.
 `/rum` → `frontend`, `/infra` → `infra`) and the inverse `LANDING` map picks the route a NavRail click
 pushes to.
