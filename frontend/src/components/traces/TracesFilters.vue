@@ -156,6 +156,19 @@ function activeCount(field) {
 
 <template>
   <div class="flex flex-col">
+    <!-- Grain caption. Every count in this panel is a SPAN count (the facet runs on the spans
+         engine — see photon-query's span_facet), while the list next to it may be showing TRACES.
+         That's how "Service · raisa-gateway 47" sits beside "44 traces" whose rows are rooted at a
+         different service. Stating the noun once, quietly, is the difference between a rail that
+         looks broken and one that reads correctly. -->
+    <p
+      data-testid="facet-grain-note"
+      class="border-b border-border/60 px-3.5 py-2 font-mono text-[10px] text-muted-foreground/60"
+      title="Facet counts are span counts over the current window and query. The results list can be grouped into traces, so its total counts something else — a trace is listed when any one of its spans matches."
+    >
+      counts are spans
+    </p>
+
     <FacetSection
       label="Service"
       :loading="serviceLoading"

@@ -114,6 +114,24 @@ describe('NavRail — grouped worlds', () => {
     }
   })
 
+  // The rail is 74px wide (~66px of content). At 9px semibold uppercase + tracking-wider that's
+  // room for roughly 10 characters — "Infrastructure" (14) overflowed BOTH edges, got clipped by
+  // the rail border, and read as a mis-centred label. Group headings must stay short, and must
+  // clip cleanly rather than bleed if one ever doesn't.
+  it('keeps group headings short enough for the rail, and truncates rather than bleeding', () => {
+    const w = wrap('home')
+    const headings = w.findAll('[data-nav-group]')
+    expect(headings.length).toBeGreaterThan(0)
+    for (const h of headings) {
+      expect(h.text().length).toBeLessThanOrEqual(10)
+      expect(h.classes()).toContain('truncate')
+    }
+    // The Infrastructure world specifically — the one that overflowed.
+    expect(w.text()).toContain('Infra')
+    expect(w.text()).not.toContain('Infrastructure')
+    w.unmount()
+  })
+
   it('marks the active group', () => {
     const w = wrap('backend')
     expect(w.get('[data-nav="backend"]').classes().join(' ')).toContain('text-brand')

@@ -67,9 +67,17 @@ function candidates(kind: string, f: Fields): Candidate[] {
       return [
         { id: 'traces', label: 'Traces', dest: { path: '/traces', query: { q: term('service.name', f.service), sort: 'slowest' } } },
         { id: 'logs', label: 'Logs', dest: { path: '/logs', query: { q: term('service.name', f.service) } } },
-        { id: 'metrics', label: 'Metrics', dest: { path: '/metrics', query: { svc: f.service } } },
-        { id: 'rum-app', label: 'RUM app', dest: { path: '/rum', query: { svc: f.service } } },
-        { id: 'uptime', label: 'Uptime', dest: { path: '/uptime', query: { svc: f.service } } },
+        // These three used to carry a `svc` param that NO destination read, so the pivots landed
+        // unfiltered. Each now speaks the key its destination actually consumes:
+        // `/metrics` takes the same `q` grammar filter its builder persists (`service:` resolves to
+        // the promoted `service.name` column server-side, see photon-core's resolver);
+        // `/rum` takes `app` — RUM apps and backend services are separate namespaces linked only by
+        // naming convention, so RumAppsView jumps to the app only when one actually matches;
+        // `/uptime` takes `q` — a monitor has no service field at all (just name + target), so this
+        // is an honest name/target text match, not a modeled relationship.
+        { id: 'metrics', label: 'Metrics', dest: { path: '/metrics', query: { q: term('service', f.service) } } },
+        { id: 'rum-app', label: 'RUM app', dest: { path: '/rum', query: { app: f.service } } },
+        { id: 'uptime', label: 'Uptime', dest: { path: '/uptime', query: { q: f.service } } },
       ]
     case 'rumError':
       return [

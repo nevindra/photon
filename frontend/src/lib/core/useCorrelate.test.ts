@@ -42,4 +42,32 @@ describe('relatedFor() builds the correct destination graph', () => {
     const ids = relatedFor({ kind: 'service', fields: { service: 'checkout' } }).map((x) => x.id)
     expect(ids).toEqual(expect.arrayContaining(['traces', 'logs', 'metrics', 'rum-app', 'uptime']))
   })
+
+  // These three used to carry a `svc` param no destination read, so each pivot landed unfiltered.
+  // Every one must now speak the key its own view actually consumes.
+  it('the service pivots carry a key their destination consumes, not a dead `svc`', () => {
+    const d = relatedFor({ kind: 'service', fields: { service: 'checkout' } })
+    const dest = (id: string) => d.find((x) => x.dest.path.length && x.id === id)!.dest
+
+    // /metrics: the grammar filter MetricsExplorer persists as `q` (`service` resolves to the
+    // promoted service.name column server-side).
+    expect(dest('metrics').query).toEqual({ q: 'service:checkout' })
+    // /rum: RumAppsView matches this against its registered apps by name.
+    expect(dest('rum-app').query).toEqual({ app: 'checkout' })
+    // /uptime: UptimeDashboard's name/target text filter.
+    expect(dest('uptime').query).toEqual({ q: 'checkout' })
+
+    for (const id of ['metrics', 'rum-app', 'uptime']) {
+      expect(Object.keys(dest(id).query ?? {})).not.toContain('svc')
+      expect(correlate(dest(id))).not.toContain('svc=')
+    }
+  })
+
+  it('a service name the grammar cannot express drops the metrics term rather than emitting junk', () => {
+    // `term()` refuses whitespace/commas (the grammar splits on them).
+    const d = relatedFor({ kind: 'service', fields: { service: 'my service' } })
+    expect(d.find((x) => x.id === 'metrics')!.dest.query).toEqual({ q: '' })
+    // ...and correlate() drops the empty value entirely instead of writing `q=`.
+    expect(correlate(d.find((x) => x.id === 'metrics')!.dest)).not.toContain('q=')
+  })
 })

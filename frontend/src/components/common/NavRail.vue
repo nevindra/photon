@@ -56,7 +56,11 @@ const NAV_GROUPS = [
     items: [{ key: 'backend', label: 'Backend', icon: Gauge, route: '/services' }],
   },
   {
-    label: 'Infrastructure',
+    // Rail group labels must fit the 74px rail (~66px of content at 9px + tracking-wider, i.e.
+    // ~10 characters). "Infrastructure" needed ~84px: it bled past both edges and was clipped by
+    // the rail border, reading as a mis-centred label. Short form only here — the world is still
+    // "Infrastructure" everywhere it has room (breadcrumbs, docs), and `/infra` is the route.
+    label: 'Infra',
     items: [
       { key: 'infra', label: 'Hosts', icon: Server, route: '/infra' },
       { key: 'infrastructure', label: 'Ops', icon: Activity, route: '/uptime' },
@@ -100,7 +104,8 @@ function onSelect(item) {
       <template v-for="group in NAV_GROUPS" :key="group.label ?? 'root'">
         <div
           v-if="group.label"
-          class="mb-1 mt-3 w-full px-1 text-center text-[9px] font-semibold uppercase tracking-wider text-muted-foreground/50"
+          data-nav-group
+          class="mb-1 mt-3 w-full truncate px-1 text-center text-[9px] font-semibold uppercase tracking-wider text-muted-foreground/50"
         >
           {{ group.label }}
         </div>

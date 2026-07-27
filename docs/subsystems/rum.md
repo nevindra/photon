@@ -328,6 +328,13 @@ services underneath so correlation works, but the Services list stays backend-fo
 | `/rum/:appId/errors` | `RumErrorsView` | JS errors grouped into issues (Sentry-style), with a search bar + fixed facet panel |
 | `/rum/:appId/errors/:fingerprint` | `RumErrorDetailView` | one issue: hero summary, occurrence-series chart, tag breakdowns, sample stack, recent sample events (each with its own trace/logs jump) |
 
+**Service → RUM app pivot.** A backend service's "Related ▾ → RUM app" lands on `/rum?app=<service>`.
+RUM apps and backend services are **separate namespaces with no modeled link** — they line up only by
+naming convention (the same convention `RumErrorDetailView` leans on when it pivots an app name to
+`/services/:service`). So `RumAppsView` hands off (`router.replace`, so Back still leaves) to
+`/rum/:appId` only when a registered app matches the name case-insensitively, and otherwise just
+stays on the fleet overview — whose apps table is right there. It never invents a match.
+
 The visual **LCP attribution panel** (`LcpAttributionBar` — the segmented "why is LCP slow here?"
 sub-part bar) is live in `RumPageDetailView`: `GET /api/rum/pages/detail` returns an
 `attribution.lcp` object (avg of the LCP sub-part gauge metrics + the top LCP element), and the

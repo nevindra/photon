@@ -40,8 +40,16 @@ Attached via `ApiServer::with_uptime`; routes 404 unless attached. Handler: `cra
 
 ## UI
 
-`/uptime` → `UptimeDashboard.vue`: a table/cards toggle (persisted via `useStorage`), a stat band, and
-create/detail dialogs.
+`/uptime` → `UptimeDashboard.vue`: a table/cards toggle (persisted via `useStorage`), a monitor
+filter, a stat band, and create/detail dialogs.
+
+The filter is a case-insensitive substring match over a monitor's **`name` and `target`**, mirrored
+to `?q=` so a filtered view is shareable. It's also where a service's "Related ▾ → Uptime" pivot
+lands (`/uptime?q=<service>`, see `lib/core/useCorrelate.ts`). Note what that is and isn't: a
+`Monitor` has **no service field** — only `name` and `target` (`crates/photon-uptime/src/model.rs`) —
+so the pivot is an honest best-effort text match, not a modeled relationship. Associating monitors
+with services properly would mean a schema change; until then the empty state distinguishes "no
+matching monitors" from "no monitors yet" so a miss reads as a miss.
 
 **Components** (`frontend/src/components/uptime/`): `MonitorTable`, `MonitorRow`, `MonitorCard`,
 `MonitorForm`, `MonitorDetailDialog`, `HeartbeatBar`, `ResponseTimeChart`, `StatePill`,

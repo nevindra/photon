@@ -87,8 +87,10 @@ shadcn-vue equivalent) and Lucide icons; package manager is **bun** (never npm �
 lockfile). It is deliberately lean — **Vue Router for top-level routes, but no Pinia** (server state
 lives in **TanStack Query**, a request cache). Time range + entity scope are **global**,
 module-singleton state in `lib/core/context.ts`, surfaced by one `ContextBar` mounted once in `AppShell`
-(not per-view, and no longer on `TopBar`); within-view filters (`svc`/`sev`/`q`) live in URL params
-via `lib/core/useUrlState.ts`, which merge-preserves the context keys. Routes: `/` → `/home` (`HomeView`,
+(not per-view, and no longer on `TopBar`); within-view filters (`svc`/`sev`/`q`, plus per-view extras like traces'
+`sort`/`mode`) live in URL params via `lib/core/useUrlState.ts`, which merge-preserves the context
+keys — and a detail view's back button pops to the list's own history entry
+(`lib/core/useBackTo.ts`) so those filters survive a drill-in → back round trip. Routes: `/` → `/home` (`HomeView`,
 the cross-signal landing dashboard), `/logs`, `/traces` (+ `/traces/:traceId` waterfall), `/services`
 (+ `/services/:service` APM detail), `/metrics` (+ `/metrics/catalog`), `/rum` (+ app-scoped
 sub-routes: `/rum/:appId` vitals, `/pages[/:route]`, `/errors` (search bar + fixed facet panel), and
@@ -104,7 +106,8 @@ and `/onboarding`, behind a `beforeEach` auth guard
 per-view identity (`view.id`/`seq`/`previous_route`) with its own Web Vitals and, with `tracing:
 true`, its own backend trace per route; the exported `trackView(route?)` is a manual escape hatch
 for routers that prefer to drive the boundary themselves. `NavRail` groups these into ownership
-**worlds** (Home; Frontend → `/rum`, Backend → `/services`, Infrastructure → **Hosts** `/infra` +
+**worlds** (Home; Frontend → `/rum`, Backend → `/services`, Infrastructure — headed "Infra", since
+rail headings have ~10 characters of room — → **Hosts** `/infra` +
 **Ops** `/uptime`), an **Explore** section (Logs/Traces/Metrics), and **Manage** (Data, Alerts), with
 `AppShell` deriving the highlighted group from the route. Cross-view correlation (log→trace, span/trace→logs,
 and a "Related ▾" menu) flows through `router.push` via `lib/core/useCorrelate.ts`'s `correlate()`, which

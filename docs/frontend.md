@@ -91,7 +91,12 @@ per-signal list: an ungrouped **Home** entry, then three worlds — **Frontend**
 (→ `/services`), **Infrastructure** (two items: **Hosts** → `/infra`, **Ops** → `/uptime`) — Frontend
 and Backend are each today a single landing item into an existing route (room to grow their own
 sub-nav later), then **Explore** (Logs · Traces · Metrics, the raw per-signal browsers) and **Manage**
-(Data, then Alerts — the cross-signal webhook alert engine). `AppShell.vue` derives which group to
+(Data, then Alerts — the cross-signal webhook alert engine). The rail is 74px wide, so a group
+**heading** has room for ~10 characters at its 9px uppercase/`tracking-wider` size — the
+Infrastructure world is headed **"Infra"** for that reason (the full word overflowed both edges and
+was clipped by the rail border, reading as a mis-centred label; it stays full-length in breadcrumbs).
+Headings also `truncate`, so an over-long one clips cleanly instead of bleeding. `AppShell.vue`
+derives which group to
 highlight from the route via a `ROUTE_GROUP` map (e.g.
 `/rum` → `frontend`, `/infra` → `infra`) and the inverse `LANDING` map picks the route a NavRail click
 pushes to.
@@ -182,9 +187,15 @@ cross-cutting. Imports use the extensionless alias form `@/lib/<folder>/<name>`.
 - *App-wide reactive state & navigation:* `auth.ts`, `context.ts` (app-wide time range + entity scope
   — the same module-singleton pattern as `auth.ts`/`theme.ts`; sole owner of the
   `range`/`from`/`to`/`scope` URL keys), `useUrlState.ts` (per-view `svc`/`sev`/`q`; merge-preserves
-  every other key, including the context ones), `useCorrelate.ts` (`correlate()` builds a same-app
+  every other key, including the context ones), `historyUrl.ts` (`replaceSearch()` — the **only**
+  sanctioned way to rewrite the query string without navigating; preserves vue-router's entry state
+  and keeps its `current` in step, see [conventions](conventions.md)), `useCorrelate.ts` (`correlate()` builds a same-app
   link that always carries the current time+scope; `relatedFor()` is the per-entity-kind
-  related-destination graph behind `RelatedMenu`).
+  related-destination graph behind `RelatedMenu`; **every destination must send a key its target
+  view actually reads** — `q` for logs/traces/metrics/uptime, `app` for `/rum` — a param nothing
+  consumes silently lands the pivot unfiltered), `useBackTo.ts` (`backTo(router, listPath)` —
+  a detail view's back button POPS to the list's own history entry when that's where it came from,
+  so the list's filters survive the round trip, and only `push`es as the deep-link fallback).
 - *Search DSL & generic composables:* `queryLang.ts` (display-only lexer mirroring the Rust parser —
   never validates), `useTableColumns.ts` (persisted column visibility), `useLiveTail.ts` (refresh-mode
   → stream-or-poll + ring buffer with pause-on-scroll), `listNav.ts` (pure j/k stepping), `useCopy.ts`.

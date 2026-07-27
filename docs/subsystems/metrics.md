@@ -61,8 +61,11 @@ Catalog tab. The view owns **all** server state; the `components/metrics/` child
 `MetricPicker` now groups by namespace with favorites/recent and type badges; `MetricChart` routes viz
 types (line/area/stacked/bar/stacked-bar/stat/table, reusing `MetricLegendTable` for the table viz);
 the explorer supports brush-to-zoom, click-a-point-to-correlate-to-traces, and a y-axis log toggle.
-**Client state:** favorites/recent in `localStorage` (`photon.metrics.favorites`/`.recent`); selected
-viz in the `viz` URL param. **Queries** (`frontend/src/lib/metricsQueries.js`): `useMetricCatalog`,
+**Client state:** favorites/recent in `localStorage` (`photon.metrics.favorites`/`.recent`); the
+builder (`metric`/`agg`/`group`/`q`/`viz`) round-trips through URL params. The builder is seeded from
+the URL **before** anything derived from those refs is created — in particular before
+`refDebounced(filter, 180)`, or a `/metrics?q=…` deep-link (the service → Metrics pivot lands here as
+`?q=service:<svc>`) would fire one unfiltered series query and self-correct 180ms later. **Queries** (`frontend/src/lib/metricsQueries.js`): `useMetricCatalog`,
 `useMetricMetadata`, `useMetricSeries`. **Autocomplete fields**: `frontend/src/lib/metricFields.js`.
 **Series colors**: `frontend/src/lib/seriesColor.js` (stable hash → palette, consistent across legend
 and tooltip).

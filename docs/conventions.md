@@ -95,6 +95,26 @@ public API, adding a dependency, or touching the query/chart data path.
   surfacing real 400/404s. `api.mock` is the reactive degraded-mode flag the shell shows.
 - **`cn()`** (`lib/utils.js`, clsx + tailwind-merge) is used by every `ui/` primitive for class
   composition.
+- **Never call `history.replaceState` directly — use `replaceSearch()` (`lib/core/historyUrl.ts`).**
+  Several layers merge their own keys into `location.search` outside vue-router (context's
+  `range`/`from`/`to`/`scope`, `useUrlState`'s `svc`/`sev`/`q`, per-view `sort`/`mode`/`viz`/…), and
+  a raw call breaks vue-router two ways: (1) `replaceState(null, …)` **wipes** the
+  `{ back, current, forward, position, scroll }` object vue-router keeps on the entry — and since
+  `router.afterEach` re-syncs context on every navigation, that state was destroyed the moment you
+  landed anywhere, which is what stopped `useBackTo` from ever finding the entry to go back to
+  (vue-router warns about this in dev); (2) even preserving the state isn't enough — vue-router's
+  `push()` re-asserts `state.current` onto the outgoing entry
+  (`changeLocation(currentState.current, …, true)`), so a **stale `current` reverts the URL you just
+  merged**, silently dropping the filters from the entry you'd later go back to. `replaceSearch()`
+  preserves the state and moves `current` with the URL.
+- **Tailwind's `content` globs must cover `.ts`, not just `.vue`/`.js`.** Class-name literals live in
+  plain TypeScript modules too — `services/serviceColor.ts` (`SERVICE_PALETTE`),
+  `core/seriesColor.ts` (chart swatches), `services/serviceHealth.ts` (status dots),
+  `core/format.ts` (severity tones). Drop `ts` from the glob and Tailwind purges exactly those
+  utilities: the classes still land in the DOM, so nothing throws and no component test fails — the
+  trace waterfall's span bars, the "time by service" band and every series swatch just render with
+  **no background at all**. `tailwind.config.test.js` guards the glob. Corollary: keep those class
+  strings **literal** (never built by concatenation), or the scanner can't see them either.
 - **Design tokens (`styles/tokens.css` + `tailwind.config.js`) are the single source of truth for
   the look:** a near-neutral base + one reserved Photon Cyan brand accent (`--brand`), layered
   `surface-1`/`surface-2` chrome, `shadow-1`/`shadow-2`/`shadow-sink` elevation, Tight radius, and

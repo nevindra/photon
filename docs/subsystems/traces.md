@@ -55,6 +55,42 @@ Handlers: `crates/photon-api/src/{traces,traces_search,traces_agg}.rs`.
 - `/traces/:traceId` → `TraceDetailView.vue`: the waterfall + a span detail panel. The route param is
   the source of truth.
 
+**The two grains answer different questions — say so in the UI.** A query always matches **spans**.
+The Spans grain lists those matching spans. The Traces grain runs the same span predicate and then
+returns the **whole trace** around each match (`trace_list`: find trace ids with ≥1 matching span,
+then refetch every span of those traces *unfiltered* so the rollups describe the whole trace), and
+each row's `root_service`/`root_name` describe the trace's **root span** — which need not be what
+matched. So `kind:server` legitimately lists a trace rooted at a service that has no server span in
+it. Because that reads as a broken filter when left implicit, three labels carry it: the column is
+headed **"Root service"** (matching its "Root operation" neighbour, and never bare "Service"), the
+result count adds **"containing a matching span"** whenever a query narrows the traces grain, and the
+filter rail is captioned **"counts are spans"** — its facets run on the spans engine
+(`span_facet.rs`) in *both* grains, which is why a rail total (47) won't match a trace total (44).
+Keep these in sync with the engine: if the matching semantics ever change, these three strings are
+the contract users read.
+
+**Filter persistence.** The explorer's whole view state lives in the query string: `q` (the grammar
+query every facet/quick-filter writes into — see `useUrlState`) plus `sort` and `mode`, layered on
+by TracesExplorer's own `flush: 'post'` watcher. That watcher is `immediate`, so the entry carries
+the full state from mount, not only after the first change; unknown `sort`/`mode` values are
+rejected at seed time rather than forwarded to the API. Those merge-writes go through
+`replaceSearch()` (`lib/core/historyUrl.ts`) — a raw `history.replaceState` both wipes the state
+`useBackTo` reads *and* gets reverted by vue-router's next `push()`, which is what made the filters
+vanish on the way back even once the back button was history-aware. The detail view's back button
+**pops** back to the explorer's own history entry (`lib/core/useBackTo.ts` — `router.back()` when
+the previous entry is `/traces`, `router.push` only for deep links), which is what makes the
+filters survive a drill-in → back round trip. `ServiceDetailView` uses the same helper.
+
+**Waterfall layout.** The label column (service · operation, indented 14px per depth) is
+**user-resizable** via the splitter between it and the bar track — drag, or focus it and use ←/→
+(Shift for a bigger step), Home/double-click to reset. The width is clamped to 160–720px and
+persisted in `localStorage` under `photon:waterfall-label-width`. The axis, the gridline overlay and
+the rows all read one `GRID_TEMPLATE_COLUMNS` computed and share identical horizontal insets, so
+ticks/gridlines stay locked to the bars. Bar geometry floors every span at 0.5% width and slides
+`left` back to fit (never trims width against `100 - left`, which used to erase spans sitting at the
+very end of a skewed trace); the duration caption flips to the other side of its anchor when the bar
+ends near the right edge, so it can't be clipped by the rows' scroll container.
+
 **Components** (`frontend/src/components/traces/`): `TraceTable`, `SpanTable`, `TraceWaterfall`,
 `TraceMinimap`, `SpanDetailPanel`, `TracePeekDrawer`, `TracesFilters`, `LatencyHistogram`,
 `SpanVolumeHistogram`. **Queries**: `frontend/src/lib/tracesQueries.js`. **Waterfall geometry**:
