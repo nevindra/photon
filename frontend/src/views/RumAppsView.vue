@@ -5,8 +5,8 @@
 // a KPI strip, a fleet-wide Core Web Vitals band (reusing WebVitalScorecard), a ranked apps table,
 // a cross-app "live issues" feed, and the slowest routes. Time comes from the global context
 // (ContextBar in AppShell); every drill-through rides `correlate()` so the window + scope tag along.
-import { computed, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import AppShell from '@/components/common/AppShell.vue'
 import WebVitalScorecard from '@/components/rum/WebVitalScorecard.vue'
 import RumFleetKpis from '@/components/rum/RumFleetKpis.vue'
@@ -23,6 +23,7 @@ import { correlate } from '@/lib/core/useCorrelate'
 import { useRumApps, useRumAppsVitals, useRumAppsErrors, useRumAppsPages } from '@/lib/rum/rumQueries'
 import { fleetKpis, fleetVitals, rankApps, topIssues, slowestRoutes, formatVital, VITAL_FULL } from '@/lib/rum/rumSummary'
 
+const route = useRoute()
 const router = useRouter()
 
 const appsQuery = useRumApps()
@@ -127,6 +128,24 @@ function go(path) {
 function openApp(app) {
   go(`/rum/${encodeURIComponent(app)}`)
 }
+
+// Service → "RUM app" pivot landing (`/rum?app=<service>`, see lib/core/useCorrelate.ts). RUM apps
+// and backend services are separate namespaces with NO modeled link — they only line up by naming
+// convention (the same convention RumErrorDetailView leans on when it pivots an app name to
+// `/services/:service`). So: hand off to that app's own view when one actually matches (case-
+// insensitively), and otherwise just stay on the fleet overview, whose apps table is right there.
+// `replace`, not `push`, so Back returns to wherever the pivot came from rather than bouncing.
+const appRedirectDone = ref(false)
+watch(
+  [() => route.query.app, appRecords],
+  ([wanted, records]) => {
+    if (appRedirectDone.value || typeof wanted !== 'string' || !wanted || !records.length) return
+    const match = records.find((a) => a.name?.toLowerCase() === wanted.toLowerCase())
+    appRedirectDone.value = true
+    if (match) router.replace(correlate({ path: `/rum/${encodeURIComponent(match.name)}` }))
+  },
+  { immediate: true },
+)
 function openErrors(app) {
   go(`/rum/${encodeURIComponent(app)}/errors`)
 }

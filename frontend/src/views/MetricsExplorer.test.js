@@ -124,6 +124,29 @@ describe('MetricsExplorer', () => {
     expect(wrapper.find('[data-testid="legend-row"]').exists()).toBe(true)
   })
 
+  // Landing spot for the service → Metrics pivot (`/metrics?q=service:<svc>`, see
+  // lib/core/useCorrelate.ts — that pivot used to send a dead `svc` param nothing read).
+  it('seeds the grammar filter from ?q= and sends it with the series query', async () => {
+    const { queryClient, router } = makeHarness()
+    await router.isReady()
+    // The harness uses a real web history, so makeHarness()'s own push('/metrics') rewrites
+    // window.location — seed the query string AFTER it settles, since the builder reads
+    // window.location.search at setup.
+    window.history.replaceState(null, '', '/metrics?q=' + encodeURIComponent('service:checkout'))
+    const wrapper = mountWrapped(queryClient, router)
+    await flushPromises()
+    expect(wrapper.findComponent(MetricsExplorer).vm.filter).toBe('service:checkout')
+
+    api.metricQuery.mockClear()
+    wrapper.findComponent(MetricsExplorer).vm.metric = 'http.server.requests'
+    await flushPromises()
+    await flushPromises()
+    // The very FIRST query already carries the filter — the debounced ref is built after the URL
+    // seed, so a deep-link never fires an unfiltered query first.
+    expect(api.metricQuery.mock.calls[0][0].queries[0].filter).toBe('service:checkout')
+    window.history.replaceState(null, '', '/')
+  })
+
   it('queries the series with the global context window', async () => {
     setTimeRange('15m')
     const { queryClient, router } = makeHarness()

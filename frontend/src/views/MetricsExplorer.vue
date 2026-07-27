@@ -58,12 +58,29 @@ const metric = ref("");
 const agg = ref(null); // null = "auto" (server smart-default)
 const groupBy = ref([]);
 const filter = ref("");
+const viz = ref("line");
+const yLog = ref(false);
+
+// --- URL persistence (part 1): the global context owns the `range`/`from`/`to` keys; metric/agg/
+// group/q are layered back on further down (context's URL sync preserves those non-context keys).
+// Seed the builder from the URL on reload (before the layering watcher rewrites it) — and, load-
+// bearingly, before ANYTHING derived from these refs is created. `debouncedFilter` right below is
+// why: built before this seed, its initial value would be the empty pre-seed filter, so a
+// `/metrics?q=…` deep-link (e.g. the service → Metrics pivot) would fire one UNFILTERED series
+// query and only correct itself 180ms later. Same ordering rule LogsView documents for `text`.
+if (typeof window !== "undefined") {
+    const p = new URLSearchParams(window.location.search);
+    if (p.get("metric")) metric.value = p.get("metric");
+    if (p.get("agg")) agg.value = p.get("agg");
+    if (p.get("group")) groupBy.value = [p.get("group")];
+    if (p.get("q")) filter.value = p.get("q");
+    if (p.get("viz")) viz.value = parseViz(p.get("viz"));
+}
 // Debounced so typing in the filter box doesn't re-key the series query on every keystroke —
 // MetricQueryRow still gets the RAW `filter` (typing stays responsive); only the seriesKey/
 // buildRequest read the settled value. Mirrors TracesExplorer.vue's `debouncedText`.
 const debouncedFilter = refDebounced(filter, 180);
-const viz = ref("line");
-const yLog = ref(false);
+
 // The y-log toggle only applies to the line family (bar/stat/table ignore it).
 const showYLogToggle = computed(() =>
     ["line", "area", "stacked"].includes(viz.value),
@@ -100,17 +117,8 @@ const filterError = ref(null);
 // the global context (imported above); the chart's x-axis clock advances when the context's window
 // re-anchors. `seriesKey` below stays RELATIVE (timeRange/customRange only, never ns).
 
-// --- URL persistence: the global context owns the `range`/`from`/`to` keys; metric/agg/group/q
-// are layered on below (context's URL sync preserves those non-context keys). ---
-// Seed the builder from the URL on reload (before the layering watcher rewrites it).
-if (typeof window !== "undefined") {
-    const p = new URLSearchParams(window.location.search);
-    if (p.get("metric")) metric.value = p.get("metric");
-    if (p.get("agg")) agg.value = p.get("agg");
-    if (p.get("group")) groupBy.value = [p.get("group")];
-    if (p.get("q")) filter.value = p.get("q");
-    if (p.get("viz")) viz.value = parseViz(p.get("viz"));
-}
+// --- URL persistence (part 2): the builder is SEEDED from the URL up with the builder refs above,
+// before anything derived from them exists. Here we only layer the keys back onto the URL. ---
 // Layer metric/agg/group/q onto the URL. The global context's URL sync (flush 'pre') merge-writes
 // only its own range/from/to/scope keys and preserves these builder keys, so a flush:'post' watcher
 // runs after it and (re)stamps metric/agg/group/q. `timeRange` is in the dep list so a range change

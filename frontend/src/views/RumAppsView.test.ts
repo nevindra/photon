@@ -69,9 +69,9 @@ function queryPlugin(): [typeof VueQueryPlugin, { queryClient: QueryClient }] {
   return [VueQueryPlugin, { queryClient }]
 }
 
-async function mountSummary() {
+async function mountSummary(initial = '/rum') {
   const router = createRouter({ history: createMemoryHistory(), routes })
-  router.push('/rum')
+  router.push(initial)
   await router.isReady()
   const wrapper = mount(
     {
@@ -128,5 +128,43 @@ describe('RumAppsView (executive summary)', () => {
     expect(push).toHaveBeenCalledWith(expect.stringContaining('/rum/web-storefront'))
     expect(push).toHaveBeenCalledWith(expect.stringContaining('range=30m'))
     wrapper.unmount()
+  })
+
+  // The service → "RUM app" pivot (`/rum?app=<service>`). RUM apps and backend services share no
+  // modeled link — only a naming convention — so this hands off only on a real match.
+  describe('service → RUM app pivot', () => {
+    it('replaces to the matching app’s own view, carrying the window', async () => {
+      const { wrapper, router } = await mountSummary('/rum?app=web-storefront')
+      const replace = vi.spyOn(router, 'replace')
+      await flushPromises()
+      expect(replace).toHaveBeenCalledWith(expect.stringContaining('/rum/web-storefront'))
+      expect(replace).toHaveBeenCalledWith(expect.stringContaining('range=30m'))
+      wrapper.unmount()
+    })
+
+    it('matches case-insensitively', async () => {
+      const { wrapper, router } = await mountSummary('/rum?app=WEB-Storefront')
+      const replace = vi.spyOn(router, 'replace')
+      await flushPromises()
+      expect(replace).toHaveBeenCalledWith(expect.stringContaining('/rum/web-storefront'))
+      wrapper.unmount()
+    })
+
+    it('stays on the fleet overview when no app matches the service', async () => {
+      const { wrapper, router } = await mountSummary('/rum?app=checkout-api')
+      const replace = vi.spyOn(router, 'replace')
+      await flushPromises()
+      expect(replace).not.toHaveBeenCalled()
+      expect(wrapper.findAll('[data-testid="rum-app-row"]')).toHaveLength(2)
+      wrapper.unmount()
+    })
+
+    it('does nothing without the param', async () => {
+      const { wrapper, router } = await mountSummary()
+      const replace = vi.spyOn(router, 'replace')
+      await flushPromises()
+      expect(replace).not.toHaveBeenCalled()
+      wrapper.unmount()
+    })
   })
 })
