@@ -59,7 +59,10 @@ Handlers: `crates/photon-api/src/{traces,traces_search,traces_agg}.rs`.
 query every facet/quick-filter writes into — see `useUrlState`) plus `sort` and `mode`, layered on
 by TracesExplorer's own `flush: 'post'` watcher. That watcher is `immediate`, so the entry carries
 the full state from mount, not only after the first change; unknown `sort`/`mode` values are
-rejected at seed time rather than forwarded to the API. The detail view's back button therefore
+rejected at seed time rather than forwarded to the API. Those merge-writes go through
+`replaceSearch()` (`lib/core/historyUrl.ts`) — a raw `history.replaceState` both wipes the state
+`useBackTo` reads *and* gets reverted by vue-router's next `push()`, which is what made the filters
+vanish on the way back even once the back button was history-aware. The detail view's back button
 **pops** back to the explorer's own history entry (`lib/core/useBackTo.ts` — `router.back()` when
 the previous entry is `/traces`, `router.push` only for deep links), which is what makes the
 filters survive a drill-in → back round trip. `ServiceDetailView` uses the same helper.

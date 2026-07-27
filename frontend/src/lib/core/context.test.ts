@@ -92,4 +92,35 @@ describe('context URL', () => {
     expect(params.get('range')).toBe('1h')
     expect(params.get('scope')).toBe('service:checkout')
   })
+
+  // Regression: syncContextToUrl runs from router.afterEach on EVERY navigation, i.e. immediately
+  // after landing on a detail route. It used to pass `null` as the state, which wipes the
+  // `{ back, current, forward, position, scroll }` object vue-router keeps on the entry — so
+  // `history.state.back` was gone and lib/core/useBackTo.ts could never recognise the entry it
+  // came from (it fell back to a filterless push). Same reason vue-router's own scroll
+  // restoration depends on that object surviving. A merge-write of the URL must never touch state.
+  it('preserves the history state vue-router keeps on the entry', () => {
+    const routerState = {
+      back: '/traces?range=30m&q=kind%3Aserver&sort=recent&mode=traces',
+      current: '/traces/abc?t=123',
+      forward: null,
+      position: 4,
+      replaced: false,
+      scroll: { left: 0, top: 0 },
+    }
+    window.history.replaceState(routerState, '', '/traces/abc?t=123')
+    setTimeRange('1h')
+
+    syncContextToUrl()
+
+    // `back` (what useBackTo reads) and the rest of vue-router's bookkeeping survive; only
+    // `current` follows the URL — see lib/core/historyUrl.ts for why it must.
+    expect(window.history.state).toMatchObject({
+      back: routerState.back,
+      forward: null,
+      position: 4,
+      scroll: { left: 0, top: 0 },
+    })
+    expect(new URLSearchParams(window.location.search).get('range')).toBe('1h')
+  })
 })

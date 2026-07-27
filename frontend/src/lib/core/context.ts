@@ -2,6 +2,7 @@
 // The auth.js / theme.js module-singleton pattern (NOT Pinia). One source of truth for the
 // time math that every view used to duplicate. URL sync lives in this file too (Task 2).
 import { ref, computed, watch, type Ref, type ComputedRef } from 'vue'
+import { replaceSearch } from '@/lib/core/historyUrl'
 
 // Same preset table every view used (LogsView/ServiceDetailView/...). Milliseconds.
 export const RANGE_MS: Record<string, number> = {
@@ -117,8 +118,7 @@ export function syncContextToUrl(): void {
     p.set('range', timeRange.value)
   }
   if (scope.value) p.set('scope', `${scope.value.type}:${scope.value.id}`)
-  const qs = p.toString()
-  window.history.replaceState(null, '', qs ? `?${qs}` : window.location.pathname)
+  replaceSearch(p)
 }
 
 let syncStarted = false

@@ -6,6 +6,7 @@
 // `parseQuery` / `buildQuery` are pure and round-trip stable — the same object comes back
 // out of `parseQuery(buildQuery(state))` (modulo array order/dedupe, which callers control).
 import { ref, watch, type Ref } from 'vue'
+import { replaceSearch } from '@/lib/core/historyUrl'
 
 // The per-view filter state this module owns (svc/sev/q). `timeRange` here is the
 // legacy/local `range` key — distinct from context.ts's global time range.
@@ -89,8 +90,7 @@ export function useUrlState(refs: UrlStateRefs): void {
       }).replace(/^\?/, ''),
     )
     built.forEach((v, k) => p.set(k, v))
-    const qs = p.toString()
-    window.history.replaceState(null, '', qs ? `?${qs}` : window.location.pathname)
+    replaceSearch(p)
   }
 
   watch(

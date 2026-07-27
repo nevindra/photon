@@ -41,6 +41,7 @@ import {
     setCustomRange,
 } from "@/lib/core/context";
 import { correlate } from "@/lib/core/useCorrelate";
+import { replaceSearch } from "@/lib/core/historyUrl";
 
 const router = useRouter();
 const route = useRoute();
@@ -134,7 +135,7 @@ if (typeof window !== "undefined") {
             set("group", groupBy.value[0] ?? "");
             set("q", filter.value);
             set("viz", serializeViz(viz.value));
-            window.history.replaceState(null, "", "?" + params.toString());
+            replaceSearch(params);
         },
         { flush: "post" },
     );

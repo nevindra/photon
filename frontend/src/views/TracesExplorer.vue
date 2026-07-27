@@ -21,6 +21,7 @@ import { Spinner } from '@/components/ui/spinner'
 import { api } from '@/lib/core/api'
 import { formatNumber, relative } from '@/lib/core/format'
 import { useUrlState } from '@/lib/core/useUrlState'
+import { replaceSearch } from '@/lib/core/historyUrl'
 import { useSearchTraces, useSearchSpans, useTracesFields } from '@/lib/traces/tracesQueries'
 import { useLiveTail, mergeLiveRows } from '@/lib/core/useLiveTail'
 import { nextIndex } from '@/lib/core/listNav'
@@ -428,7 +429,7 @@ if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search)
       params.set('sort', sort.value)
       params.set('mode', resultMode.value)
-      window.history.replaceState(null, '', '?' + params.toString())
+      replaceSearch(params)
     },
     { flush: 'post', immediate: true },
   )

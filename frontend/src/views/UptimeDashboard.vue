@@ -10,6 +10,7 @@ import { Segmented, SegmentedItem } from '@/components/ui/segmented'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Spinner } from '@/components/ui/spinner'
 import { api } from '@/lib/core/api'
+import { replaceSearch } from '@/lib/core/historyUrl'
 import { useMonitors, useCreateMonitor } from '@/lib/uptime/uptimeQueries'
 import UptimeStatBand from '@/components/uptime/UptimeStatBand.vue'
 import MonitorTable from '@/components/uptime/MonitorTable.vue'
@@ -41,8 +42,7 @@ watch(filterText, (q) => {
   const params = new URLSearchParams(window.location.search)
   if (q) params.set('q', q)
   else params.delete('q')
-  const qs = params.toString()
-  window.history.replaceState(null, '', qs ? `?${qs}` : window.location.pathname)
+  replaceSearch(params)
 })
 
 const monitors = computed(() => {
