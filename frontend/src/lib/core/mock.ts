@@ -2,7 +2,7 @@
 // backend is wired. Timestamps are epoch nanoseconds (BigInt), matching the API.
 
 import { fieldValues, removeField } from '@/lib/core/queryLang'
-import type { InfraHost, InfraHostsResult, InfraHostDetail, InfraSeriesResult } from '@/lib/core/api'
+import type { InfraHost, InfraHostsResult, InfraHostDetail, InfraSeriesResult, InfraProcessesResult } from '@/lib/core/api'
 import type {
   AlertRule,
   AlertRuleInput,
@@ -1662,6 +1662,33 @@ export function mockInfraHost(host: string): InfraHostDetail {
     totalRamBytes: h.totalRamBytes,
     gpus: h.gpus,
     lastSeenNs: (BigInt(Date.now()) * MS).toString(),
+  }
+}
+
+// Per-host process (mandor worker) rosters for the Processes table. `api` is deliberately the
+// heaviest CPU worker so the default CPU-desc sort has something to prove. Field names match the
+// real API's camelCase JSON exactly (cpuPct/rssBytes/fds/threads/restarts/lastSeenNs).
+const INFRA_PROCESSES: Record<string, { process: string; cpuPct: number; rssBytes: number; fds: number; threads: number; restarts: number }[]> = {
+  'web-1': [
+    { process: 'api', cpuPct: 42.5, rssBytes: 512 * 1024 ** 2, fds: 128, threads: 12, restarts: 0 },
+    { process: 'worker', cpuPct: 18.3, rssBytes: 256 * 1024 ** 2, fds: 64, threads: 8, restarts: 2 },
+    { process: 'cron-loop', cpuPct: 3.1, rssBytes: 48 * 1024 ** 2, fds: 16, threads: 3, restarts: 0 },
+  ],
+  'web-2': [
+    { process: 'api', cpuPct: 51.2, rssBytes: 640 * 1024 ** 2, fds: 160, threads: 14, restarts: 1 },
+    { process: 'worker', cpuPct: 22.7, rssBytes: 288 * 1024 ** 2, fds: 72, threads: 9, restarts: 0 },
+  ],
+  'gpu-node-1': [
+    { process: 'trainer', cpuPct: 88.4, rssBytes: 24 * 1024 ** 3, fds: 512, threads: 48, restarts: 0 },
+    { process: 'api', cpuPct: 12.0, rssBytes: 384 * 1024 ** 2, fds: 96, threads: 10, restarts: 3 },
+  ],
+}
+
+export function mockInfraHostProcesses(host: string): InfraProcessesResult {
+  const now = (BigInt(Date.now()) * MS).toString()
+  const procs = INFRA_PROCESSES[host] ?? INFRA_PROCESSES['web-1']
+  return {
+    processes: procs.map((p) => ({ ...p, lastSeenNs: now })),
   }
 }
 

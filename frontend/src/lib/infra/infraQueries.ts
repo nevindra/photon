@@ -7,7 +7,7 @@
 import { computed, toValue } from 'vue'
 import type { MaybeRefOrGetter } from 'vue'
 import { useQuery, keepPreviousData } from '@tanstack/vue-query'
-import { api, type InfraHostsResult, type InfraHostDetail, type InfraSeriesResult } from '@/lib/core/api'
+import { api, type InfraHostsResult, type InfraHostDetail, type InfraSeriesResult, type InfraProcessesResult } from '@/lib/core/api'
 
 export const infraHostsKey = (
   startNs: MaybeRefOrGetter<string>,
@@ -44,6 +44,30 @@ export function useInfraHost(
       api.infraHost(toValue(host), toValue(startNs), toValue(endNs), { signal }),
     enabled: computed(() => !!toValue(host)),
     placeholderData: keepPreviousData,
+  })
+}
+
+// Per-host process (mandor worker) roster + resource usage for the Processes table. Polls every
+// 15s like the other host queries and keeps the previous host/window's rows on screen across a
+// change (`keepPreviousData`), gated on a non-empty host like `useInfraHost`.
+export function useInfraHostProcesses(
+  host: MaybeRefOrGetter<string>,
+  startNs: MaybeRefOrGetter<string>,
+  endNs: MaybeRefOrGetter<string>,
+) {
+  return useQuery({
+    queryKey: computed(() => [
+      'infra',
+      'processes',
+      toValue(host),
+      String(toValue(startNs)),
+      String(toValue(endNs)),
+    ]),
+    queryFn: ({ signal }: { signal: AbortSignal }): Promise<InfraProcessesResult> =>
+      api.infraHostProcesses(toValue(host), toValue(startNs), toValue(endNs), { signal }),
+    enabled: computed(() => !!toValue(host)),
+    placeholderData: keepPreviousData,
+    refetchInterval: 15_000,
   })
 }
 

@@ -138,6 +138,7 @@ already was, without adding a new storage engine:
 |---|---|
 | `GET /api/infra/hosts?start=<ns>&end=<ns>` | distinct hosts + latest CPU/memory/disk/GPU utilization vitals (`cpuUtil`/`memUtil`/`diskUtil`/`gpuUtil`, nullable fractions; `diskUtil`/`gpuUtil` are the WORST mountpoint/GPU, not a plain average) + `hasGpu` |
 | `GET /api/infra/hosts/:host?start=<ns>&end=<ns>` | one host's metadata (OS, cores, RAM, GPU names, last-seen) |
+| `GET /api/infra/hosts/:host/processes?start=<ns>&end=<ns>` | the mandor workers running on one host + their latest resource usage (`process`, `cpuPct` (a percent, not a fraction), `rssBytes`, `fds`, `threads`, `restarts` — all nullable; `lastSeenNs`). Processes are the distinct `service.name` values among `process.*` metrics scoped to the host, enumerated from `process.cpu.percent`. Powers the per-host Processes table |
 | `GET /api/infra/hosts/:host/timeseries?resource=cpu\|memory\|disk\|network\|gpu\|gpu_memory\|gpu_temp\|gpu_power\|load&start=<ns>&end=<ns>&buckets=<n>` | curated bucketed series for one resource panel (`buckets` optional, default 48, clamped 1–500) |
 
 Handler: `crates/photon-api/src/infra.rs`, registered in `crates/photon-api/src/lib.rs` alongside
@@ -188,6 +189,12 @@ convention as the RUM sub-routes).
     worst-first above the trend chart; and, only when `hasGpu`, a 4-card **GPU** section
     (Utilization/Memory/Temperature/Power), the device name(s) carried in the utilization card's
     subtitle.
+  Below the trend panels it renders a **Processes** table — every mandor worker on the host, one row
+  per `service.name`, driven by `useInfraHostProcesses(host, startNs, endNs)` (`GET
+  /api/infra/hosts/:host/processes`, 15s poll). Columns: Process, CPU %, RSS (human-readable via
+  `formatBytes`), FDs, Threads, Restarts; all header cells are click-to-sort, defaulting to CPU
+  descending so the heaviest process is on top (nulls sort last). Covered by
+  `InfraHostDetailView.test.ts`.
   On mount, sets the global scope to `{ type: 'host', id: host, label: host }` via `lib/core/context.ts`'s
   `setScope`, so the time range + host scope carry through `AppShell`'s `ContextBar` and the
   "Related ▾" menu (`RelatedMenu`) the same way a service or RUM app scope would.

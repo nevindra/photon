@@ -91,7 +91,7 @@ mod rum_vitals;
 pub use rum_vitals::{BreakdownRow, LcpAttribution, VitalSummary};
 
 mod infra;
-pub use infra::{HostDetail, HostSeries, HostSummary, InfraResource};
+pub use infra::{HostDetail, HostSeries, HostSummary, InfraResource, ProcessSummary};
 
 mod rum_errors;
 pub use rum_errors::ErrorIssue;

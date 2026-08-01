@@ -225,7 +225,7 @@ Handlers live in `crates/photon-api/src/*.rs`; the aggregation logic they call l
 - **Services (APM):** `GET /api/red`, `GET /api/services/:service/timeseries|dependencies|settings`.
 - **Metrics:** `POST /api/metrics/query`, `GET /api/metrics/catalog|metadata/:name|labels`.
 - **Infrastructure (host/GPU resource monitoring):** `GET /api/infra/hosts`,
-  `GET /api/infra/hosts/:host`,
+  `GET /api/infra/hosts/:host`, `GET /api/infra/hosts/:host/processes`,
   `GET /api/infra/hosts/:host/timeseries?resource=cpu\|memory\|disk\|network\|gpu\|gpu_memory\|gpu_temp\|gpu_power\|load`
   — see [`subsystems/infra.md`](subsystems/infra.md).
 - **RUM (read):** `GET /api/rum/apps|vitals|vitals/breakdown|pages|pages/detail|errors|errors/facets|errors/:fingerprint`

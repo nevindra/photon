@@ -41,6 +41,7 @@ import {
   mockInfraHosts,
   mockInfraHost,
   mockInfraHostSeries,
+  mockInfraHostProcesses,
   mockAlertRules,
   mockAlertRule,
   mockCreateAlertRule,
@@ -604,6 +605,21 @@ export interface InfraHostDetail {
 export interface InfraSeriesResult {
   resource: string
   series: MetricSeries[]
+}
+// One process (a mandor worker) running on a host, with its latest resource usage over the window.
+// `cpuPct` is a percent (not a 0..1 ratio). Every numeric field is nullable — a process may report
+// CPU without every other metric present in the window.
+export interface InfraProcess {
+  process: string
+  cpuPct: number | null
+  rssBytes: number | null
+  fds: number | null
+  threads: number | null
+  restarts: number | null
+  lastSeenNs: string
+}
+export interface InfraProcessesResult {
+  processes: InfraProcess[]
 }
 
 // --- Alerts (webhook alert & notification engine) ---
@@ -1503,6 +1519,18 @@ export const api = {
       if (e.status === 400) throw e
       api.mock = true
       return mockInfraHost(host) as InfraHostDetail
+    }
+  },
+
+  async infraHostProcesses(host: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<InfraProcessesResult> {
+    try {
+      return await http
+        .get(`infra/hosts/${encodeURIComponent(host)}/processes`, { searchParams: { start: startNs, end: endNs }, signal: opts.signal })
+        .json<InfraProcessesResult>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      api.mock = true
+      return mockInfraHostProcesses(host) as InfraProcessesResult
     }
   },
 

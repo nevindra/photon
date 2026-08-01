@@ -30,6 +30,7 @@ use crate::MetricsQueryEngine;
 
 // --- The exact OTel system-metric names / attributes this vertical curates (Global Constants). ---
 const HOST_ATTR: &str = "host.name";
+const SERVICE_ATTR: &str = "service.name";
 const OS_TYPE_ATTR: &str = "os.type";
 const GPU_NAME_ATTR: &str = "gpu.name";
 
@@ -44,6 +45,16 @@ const GPU_MEM_UTIL: &str = "system.gpu.memory.utilization";
 const GPU_TEMP: &str = "system.gpu.temperature";
 const GPU_POWER: &str = "system.gpu.power";
 const LOAD_1M: &str = "system.cpu.load_average.1m";
+
+// Per-process (mandor worker) resource metrics: each point carries `service.name` (= the worker
+// name) AND `host.name` (= the node). "Processes on host H" = distinct `service.name` among these
+// scoped to `host.name = H`. `process.cpu.percent` is the enumerating metric — every worker reports
+// it — and its value is a percent (0..100+), not a 0..1 ratio, so it is surfaced as-is.
+const PROC_CPU: &str = "process.cpu.percent";
+const PROC_RSS: &str = "process.memory.rss";
+const PROC_FDS: &str = "process.open_fds";
+const PROC_THREADS: &str = "process.threads";
+const PROC_RESTARTS: &str = "process.restarts";
 
 /// One host with its latest headline vitals over a window — the Infrastructure list row.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +100,27 @@ pub struct HostDetail {
 pub struct HostSeries {
     pub resource: String,
     pub series: Vec<crate::SeriesResult>,
+}
+
+/// One process (a mandor worker, keyed by `service.name`) running on a host, with its latest
+/// resource usage over a window — the per-host Processes table row. Every gauge is `Option`
+/// because a process may report `process.cpu.percent` (which enumerates it) without every other
+/// metric being present in the window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessSummary {
+    pub process: String,
+    /// Window-avg `process.cpu.percent` — a percent (not a 0..1 ratio), surfaced as-is.
+    pub cpu_pct: Option<f64>,
+    /// Window-avg `process.memory.rss` in bytes.
+    pub rss_bytes: Option<f64>,
+    /// Window-avg `process.open_fds`.
+    pub fds: Option<f64>,
+    /// Window-avg `process.threads`.
+    pub threads: Option<f64>,
+    /// Window-avg `process.restarts`.
+    pub restarts: Option<f64>,
+    /// Newest sample timestamp seen for the process's CPU metric (epoch nanos); `0` if unknown.
+    pub last_seen_ns: i64,
 }
 
 /// The curated resource panels. `from_str` parses the API path segment; `primary` maps each
@@ -439,6 +471,144 @@ impl MetricsQueryEngine {
             gpus,
             last_seen_ns,
         })
+    }
+
+    /// Distinct processes (mandor workers) running on one host + their latest resource usage over
+    /// `[start_ns, end_ns]`, ranked-ready for the per-host Processes table. Processes are enumerated
+    /// from `process.cpu.percent` (every worker reports it), grouped by the promoted `service.name`
+    /// column and scoped to the host both by `MetricRequest.host` (skip-index host-range pruning)
+    /// and a `host.name = <host>` row predicate — the same host scoping `infra_host_detail`'s
+    /// per-host reads use. RSS/fds/threads/restarts are then folded in per process with the same
+    /// window-avg fill pattern `infra_hosts` uses for memory/gpu. A process with no CPU points in
+    /// the window does not appear.
+    pub async fn infra_host_processes(
+        &self,
+        host: &str,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Vec<ProcessSummary>, PhotonError> {
+        let mut out: BTreeMap<String, ProcessSummary> = BTreeMap::new();
+
+        // Distinct processes + window-avg CPU percent + last_seen, scoped to the host.
+        let req = MetricRequest {
+            metric: PROC_CPU.to_string(),
+            start_ts_nanos: start_ns,
+            end_ts_nanos: end_ns,
+            filter: None,
+            host: Some(host.to_string()),
+        };
+        if let Some(df) = self.survivors_df(&req).await? {
+            let service_col = col_ref(SERVICE_ATTR);
+            let value = col_ref(metric_schema::VALUE);
+            let ts = col_ref(metric_schema::TIMESTAMP);
+            let batches = df
+                .filter(
+                    metric_base_predicate(&req)
+                        .and(col_ref(HOST_ATTR).eq(lit(host.to_string()))),
+                )
+                .map_err(|e| PhotonError::Query(format!("infra_host_processes filter: {e}")))?
+                .aggregate(
+                    vec![service_col.alias("process")],
+                    vec![avg(value).alias("cpu"), max(ts).alias("last_seen")],
+                )
+                .map_err(|e| PhotonError::Query(format!("infra_host_processes aggregate: {e}")))?
+                .collect()
+                .await
+                .map_err(|e| PhotonError::Query(format!("infra_host_processes collect: {e}")))?;
+            for b in &batches {
+                let process = str_col(b, 0)?;
+                let cpu = f64_col(b, 1);
+                let last = ts_col(b, 2);
+                for i in 0..b.num_rows() {
+                    if process.is_valid(i) {
+                        let p = process.value(i).to_string();
+                        out.entry(p.clone()).or_insert(ProcessSummary {
+                            process: p,
+                            cpu_pct: cpu(i),
+                            rss_bytes: None,
+                            fds: None,
+                            threads: None,
+                            restarts: None,
+                            last_seen_ns: last(i).unwrap_or(0),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Fold in the remaining per-process gauges (window-avg), same host scope.
+        self.fill_latest_process_gauge(&mut out, PROC_RSS, host, start_ns, end_ns, |p, v| {
+            p.rss_bytes = Some(v)
+        })
+        .await?;
+        self.fill_latest_process_gauge(&mut out, PROC_FDS, host, start_ns, end_ns, |p, v| {
+            p.fds = Some(v)
+        })
+        .await?;
+        self.fill_latest_process_gauge(&mut out, PROC_THREADS, host, start_ns, end_ns, |p, v| {
+            p.threads = Some(v)
+        })
+        .await?;
+        self.fill_latest_process_gauge(&mut out, PROC_RESTARTS, host, start_ns, end_ns, |p, v| {
+            p.restarts = Some(v)
+        })
+        .await?;
+
+        Ok(out.into_values().collect())
+    }
+
+    /// Set a window-avg gauge (grouped by `service.name`) on the processes already discovered by
+    /// `infra_host_processes`. Host-scoped like `host_latest_scalar` (skip-index prune +
+    /// `host.name = <host>` predicate). Processes absent from `out` (no CPU signal) are ignored —
+    /// this only enriches known processes, mirroring `fill_latest_gauge`.
+    async fn fill_latest_process_gauge(
+        &self,
+        out: &mut BTreeMap<String, ProcessSummary>,
+        metric: &str,
+        host: &str,
+        start_ns: i64,
+        end_ns: i64,
+        set: impl Fn(&mut ProcessSummary, f64),
+    ) -> Result<(), PhotonError> {
+        let req = MetricRequest {
+            metric: metric.to_string(),
+            start_ts_nanos: start_ns,
+            end_ts_nanos: end_ns,
+            filter: None,
+            host: Some(host.to_string()),
+        };
+        let Some(df) = self.survivors_df(&req).await? else {
+            return Ok(());
+        };
+        let batches = df
+            .filter(metric_base_predicate(&req).and(col_ref(HOST_ATTR).eq(lit(host.to_string()))))
+            .map_err(|e| {
+                PhotonError::Query(format!("infra fill_latest_process_gauge filter: {e}"))
+            })?
+            .aggregate(
+                vec![col_ref(SERVICE_ATTR).alias("process")],
+                vec![avg(col_ref(metric_schema::VALUE)).alias("v")],
+            )
+            .map_err(|e| {
+                PhotonError::Query(format!("infra fill_latest_process_gauge aggregate: {e}"))
+            })?
+            .collect()
+            .await
+            .map_err(|e| {
+                PhotonError::Query(format!("infra fill_latest_process_gauge collect: {e}"))
+            })?;
+        for b in &batches {
+            let process = str_col(b, 0)?;
+            let v = f64_col(b, 1);
+            for i in 0..b.num_rows() {
+                if process.is_valid(i) {
+                    if let (Some(ps), Some(val)) = (out.get_mut(process.value(i)), v(i)) {
+                        set(ps, val);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Window-avg value + newest timestamp of a numeric metric for one host. `(None, 0)` when the
@@ -849,6 +1019,61 @@ mod tests_fixture {
         let engine = MetricsQueryEngine::new(hot, schema).unwrap();
         (dir, engine)
     }
+
+    /// A `mp`-style point that also sets a specific `service.name` (the process/worker name), so a
+    /// segment can carry several distinct processes on one host. Used by the processes fixture.
+    fn proc_mp(metric: &str, host: &str, process: &str, ts: i64, value: f64) -> MetricPoint {
+        let mut attributes = std::collections::BTreeMap::new();
+        attributes.insert("service.name".to_string(), process.to_string());
+        attributes.insert("host.name".to_string(), host.to_string());
+        MetricPoint {
+            metric_name: metric.to_string(),
+            metric_type: metric_type::GAUGE,
+            timestamp_nanos: ts,
+            value: Some(value),
+            attributes,
+            ..Default::default()
+        }
+    }
+
+    /// One host (`web-1`) running two mandor workers (`api`, `worker`) each reporting the full
+    /// per-process metric set, plus a second host (`web-2`) running `api` — so a host-scoped process
+    /// query must return exactly `web-1`'s two workers, never `web-2`'s.
+    pub(super) async fn host_with_processes() -> (tempfile::TempDir, MetricsQueryEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().to_path_buf();
+        let schema = schema();
+        compact(
+            &hot,
+            &schema,
+            vec![(
+                SegmentId(0),
+                vec![batch(
+                    &schema,
+                    &[
+                        // web-1 / api — the heaviest CPU worker.
+                        proc_mp(PROC_CPU, "web-1", "api", 10, 40.0),
+                        proc_mp(PROC_CPU, "web-1", "api", 20, 60.0),
+                        proc_mp(PROC_RSS, "web-1", "api", 20, 536_870_912.0),
+                        proc_mp(PROC_FDS, "web-1", "api", 20, 128.0),
+                        proc_mp(PROC_THREADS, "web-1", "api", 20, 12.0),
+                        proc_mp(PROC_RESTARTS, "web-1", "api", 20, 1.0),
+                        // web-1 / worker — lighter.
+                        proc_mp(PROC_CPU, "web-1", "worker", 20, 10.0),
+                        proc_mp(PROC_RSS, "web-1", "worker", 20, 268_435_456.0),
+                        proc_mp(PROC_FDS, "web-1", "worker", 20, 64.0),
+                        proc_mp(PROC_THREADS, "web-1", "worker", 20, 8.0),
+                        proc_mp(PROC_RESTARTS, "web-1", "worker", 20, 3.0),
+                        // web-2 / api — a different host; must be excluded from web-1's result.
+                        proc_mp(PROC_CPU, "web-2", "api", 20, 99.0),
+                    ],
+                )],
+            )],
+        )
+        .await;
+        let engine = MetricsQueryEngine::new(hot, schema).unwrap();
+        (dir, engine)
+    }
 }
 
 #[cfg(test)]
@@ -937,6 +1162,30 @@ mod tests {
                 s.points.len()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn infra_host_processes_lists_host_workers_with_usage() {
+        let (_dir, engine) = super::tests_fixture::host_with_processes().await;
+        let procs = engine
+            .infra_host_processes("web-1", 0, i64::MAX)
+            .await
+            .unwrap();
+        // Only web-1's two workers — web-2's `api` must NOT leak in.
+        let names: Vec<String> = procs.iter().map(|p| p.process.clone()).collect();
+        assert_eq!(names, vec!["api".to_string(), "worker".to_string()]);
+
+        let api = procs.iter().find(|p| p.process == "api").unwrap();
+        // window-avg CPU of 40 and 60 = 50 (a percent, surfaced as-is).
+        assert!((api.cpu_pct.unwrap() - 50.0).abs() < 1e-9, "got {:?}", api.cpu_pct);
+        assert_eq!(api.rss_bytes, Some(536_870_912.0));
+        assert_eq!(api.fds, Some(128.0));
+        assert_eq!(api.threads, Some(12.0));
+        assert_eq!(api.restarts, Some(1.0));
+        assert!(api.last_seen_ns > 0);
+
+        let worker = procs.iter().find(|p| p.process == "worker").unwrap();
+        assert_eq!(worker.restarts, Some(3.0));
     }
 
     #[test]
