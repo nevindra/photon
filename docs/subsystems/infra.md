@@ -99,8 +99,17 @@ already was, without adding a new storage engine:
 - **`infra_hosts(start_ns, end_ns) -> Vec<HostSummary>`** — distinct hosts + latest headline vitals.
   Hosts are enumerated from `system.cpu.utilization` (every agent reports it); a host with no CPU
   points in the window doesn't appear. `system.memory.utilization` fills `mem_util`; presence of any
-  `system.gpu.utilization` row sets `has_gpu`. `HostSummary { host, cpu_util, mem_util, last_seen_ns,
-  has_gpu }`.
+  `system.gpu.utilization` row sets `has_gpu`. `HostSummary { host, cpu_util, mem_util, disk_util +
+  disk_util_avg + disk_groups, gpu_util + gpu_util_avg + gpu_groups, last_seen_ns, has_gpu }`.
+
+  **Split resources cross as a pair.** Disk and GPU are label-split (mountpoints, devices), so
+  `fill_group_gauge` groups by `(host.name, get_field(attributes, <mountpoint|gpu>))`, takes each
+  group's window-avg, and folds **both** the MAX and the MEAN of those per-group values into the
+  summary, plus the group count. Neither number is sufficient alone: the max is what keeps a full
+  `/` from being averaged away against an idle `/boot/efi`, and the mean is what stops that max
+  from reading as a saturated host when one group is hot and the rest idle (a 4-GPU node with one
+  card at 76% and three near zero is a 20%-average host). The UI renders them side by side —
+  see the `HostStatTiles.vue`/`HostCard.vue` notes below.
 - **`infra_host_detail(host, start_ns, end_ns) -> HostDetail`** — per-host metadata: latest
   `system.cpu.logical.count` (→ `cores`), `system.memory.limit` (→ `total_ram_bytes`), the latest
   `os.type` long-tail attribute (→ `os`, read via `get_field` since it's not promoted), and the
@@ -136,7 +145,7 @@ already was, without adding a new storage engine:
 
 | Route | Purpose |
 |---|---|
-| `GET /api/infra/hosts?start=<ns>&end=<ns>` | distinct hosts + latest CPU/memory/disk/GPU utilization vitals (`cpuUtil`/`memUtil`/`diskUtil`/`gpuUtil`, nullable fractions; `diskUtil`/`gpuUtil` are the WORST mountpoint/GPU, not a plain average) + `hasGpu` |
+| `GET /api/infra/hosts?start=<ns>&end=<ns>` | distinct hosts + latest CPU/memory/disk/GPU utilization vitals (`cpuUtil`/`memUtil`/`diskUtil`/`gpuUtil`, nullable fractions) + `hasGpu`. `diskUtil`/`gpuUtil` are the WORST mountpoint/GPU, and they never travel alone: `diskUtilAvg`/`gpuUtilAvg` carry the mean across groups and `diskGroups`/`gpuGroups` the group count, so a client can render "85% / 30%" instead of a bare max |
 | `GET /api/infra/hosts/:host?start=<ns>&end=<ns>` | one host's metadata (OS, cores, RAM, GPU names, last-seen) |
 | `GET /api/infra/hosts/:host/processes?start=<ns>&end=<ns>` | the supervised processes running on one host + their latest resource usage (`process`, `cpuPct` (a percent, not a fraction), `rssBytes`, `fds`, `threads`, `restarts` — all nullable; `lastSeenNs`). Processes are the distinct `service.name` values among `process.*` metrics scoped to the host, enumerated from the CPU metric, and capped at the top 200 by CPU. Powers the per-host Processes table |
 | `GET /api/infra/hosts/:host/timeseries?resource=cpu\|memory\|disk\|network\|gpu\|gpu_memory\|gpu_temp\|gpu_power\|load&start=<ns>&end=<ns>&buckets=<n>` | curated bucketed series for one resource panel (`buckets` optional, default 48, clamped 1–500) |
@@ -190,7 +199,9 @@ convention as the RUM sub-routes).
   - **`HostCard.vue`** — one card per host: name + a small `⚠ <RESOURCE>` flag naming the single
     worst-degraded resource, labeled `Meter` rows for CPU/MEM/DSK (a null value skips its row) plus
     a GPU row when `gpuUtil` is present, and a relative last-seen footer. A warn/error border tint
-    mirrors the flag's severity. No GPU device names (not in this API — see `HostStatTiles.vue`
+    mirrors the flag's severity. The **DSK/GPU** rows read `85% / 30%` — worst group over the mean
+    across groups, from the API pair above — dropping to a single number when the resource has one
+    group (the mean would just repeat the max). CPU/MEM are never split, so they stay single. No GPU device names (not in this API — see `HostStatTiles.vue`
     below for those). `HostTable.vue` is removed (dead code); its coverage moved to
     `HostCard.test.ts` and `hostStats.test.ts`.
 - **`InfraHostDetailView.vue`** — host header (OS/cores/RAM/GPU names) + a glance stat-tile row
@@ -203,10 +214,26 @@ convention as the RUM sub-routes).
   - **`HostStatTiles.vue`** — a responsive tile grid (CPU · Memory with a used/total-bytes sub-label ·
     worst-mountpoint Disk · Network combined rate · GPU util + GPU temp when `hasGpu`), each value
     derived from the **last point** of the shared series via pure helpers in
-    `lib/infra/hostStats.ts` (`latestValue`/`latestTotal`/`worstSeries`/`sparkValues`, table-tested in
-    `HostStatTiles.test.ts`/`hostStats.test.ts`). Utilization tiles tint `warning`/`error` at the
-    shared **80%/90%** thresholds (`utilAccent`); the CPU and Memory tiles additionally render a
-    `Sparkline` off the same series through `StatTile`'s `#spark` slot.
+    `lib/infra/hostStats.ts` (`latestValue`/`latestTotal`/`latestMean`/`worstSeries`/`groupStat`/
+    `sparkValues`, table-tested in `HostStatTiles.test.ts`/`hostStats.test.ts`). Utilization tiles
+    tint `warning`/`error` at the shared **80%/90%** thresholds (`utilAccent`); the CPU and Memory
+    tiles additionally render a `Sparkline` off the same series through `StatTile`'s `#spark` slot.
+
+    The **Disk/GPU/GPU-temp** tiles are the split resources, and they show the same max·avg pair the
+    API sends for the host list — derived client-side by `groupStat()` from the very series the
+    panels below chart, so a tile and its chart can never disagree:
+
+    ```
+    Disk                     GPU                     GPU temp
+    85% max · 30% avg        76% max · 20% avg       74°C max · 52°C avg
+    /data of 5 mounts        gpu 2 of 4              gpu 2 of 4
+    ```
+
+    The big number stays the **worst** group (`StatTile`'s `value`, and what `utilAccent` tints);
+    the mean rides beside it in `StatTile`'s `secondary` slot, and the `sub` slot names which group
+    the max came from and out of how many. With a single mountpoint or GPU the pair collapses to a
+    plain reading — the mean would only repeat the max. CPU/Memory/Network are not split and never
+    show a pair.
   - **`HostResourcePanels.vue`** — now purely presentational (no queries of its own; reads `res`);
     each chart lives in a titled `charts/ChartPanel` card: a **CPU** card with a `Segmented`
     total/per-core toggle in its `#summary` slot (`cpuSeriesForMode`, a client-side label filter over
@@ -214,7 +241,9 @@ convention as the RUM sub-routes).
     2-column **Memory** + **Network I/O** row; a **Disk** card listing per-mountpoint `Meter`s
     worst-first above the trend chart; and, only when `hasGpu`, a 4-card **GPU** section
     (Utilization/Memory/Temperature/Power), the device name(s) carried in the utilization card's
-    subtitle.
+    subtitle. Every split card's subtitle states the split — `5 mountpoints`, `4 devices`
+    (`NVIDIA A2 · 4 devices` on the utilization card) — so the max·avg pair on the tiles above has
+    something visible to point at instead of leaving the reader to count legend entries.
   Below the trend panels it renders the **`HostProcessesTable`** component — every supervised process
   on the host, one row per `service.name`, driven by `useInfraHostProcesses(host, startNs, endNs)`
   (`GET /api/infra/hosts/:host/processes`, 15s poll). Built on the shared `ui/table` primitives with

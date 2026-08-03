@@ -2,6 +2,8 @@
 // One host in the /infra fleet card grid (replaces a HostTable row): name + a small "⚠ <RESOURCE>"
 // flag naming the single worst-degraded resource, labeled CPU/MEM/DSK/GPU Meter rows (a null
 // resource skips its row — GPU only when the host reports one), and a relative last-seen footer.
+// The DSK/GPU rows read "85% / 30%" — worst mountpoint/device over the mean across them — because
+// those two headlines are a max, and a max alone reads as a saturated host.
 // Card idiom matches StatTile via the shared `ui/card` Card primitive (rounded-lg border bg-card
 // p-4, hover lift); a warn/error border tint mirrors the flag's severity. No GPU device names —
 // not part of this API (see HostStatTiles/HostResourcePanels on /infra/:host for those).
@@ -19,6 +21,16 @@ interface Row {
   key: string
   label: string
   value: number
+  /// Set only on the label-split resources (disk mountpoints, GPU devices) when there is more than
+  /// one group: `value` is the worst group, this is the mean across them. Rendered as the second
+  /// number in "85% / 30%" so a card can't imply a whole host is full when one mountpoint is —
+  /// same max·avg pairing as the /infra/:host tiles.
+  mean?: number
+}
+
+function split(value: number | null, mean: number | null, groups: number): Partial<Row> | null {
+  if (value == null) return null
+  return { value, mean: groups > 1 && mean != null ? mean : undefined }
 }
 
 const rows = computed<Row[]>(() => {
@@ -26,8 +38,10 @@ const rows = computed<Row[]>(() => {
   const list: Row[] = []
   if (h.cpuUtil != null) list.push({ key: 'cpu', label: 'CPU', value: h.cpuUtil })
   if (h.memUtil != null) list.push({ key: 'mem', label: 'MEM', value: h.memUtil })
-  if (h.diskUtil != null) list.push({ key: 'disk', label: 'DSK', value: h.diskUtil })
-  if (h.gpuUtil != null) list.push({ key: 'gpu', label: 'GPU', value: h.gpuUtil })
+  const dsk = split(h.diskUtil, h.diskUtilAvg, h.diskGroups)
+  if (dsk) list.push({ key: 'disk', label: 'DSK', ...dsk } as Row)
+  const gpu = split(h.gpuUtil, h.gpuUtilAvg, h.gpuGroups)
+  if (gpu) list.push({ key: 'gpu', label: 'GPU', ...gpu } as Row)
   return list
 })
 
@@ -85,7 +99,13 @@ function select(): void {
       <div v-for="r in rows" :key="r.key" class="flex items-center gap-3 text-xs">
         <span class="w-8 shrink-0 font-mono text-muted-foreground">{{ r.label }}</span>
         <Meter :value="r.value" :tone="utilAccent(r.value) ?? 'info'" class="flex-1" />
-        <span class="w-10 shrink-0 text-right tabular-nums text-muted-foreground">{{ formatPct(r.value) }}</span>
+        <span
+          class="shrink-0 text-right tabular-nums text-muted-foreground"
+          :class="r.mean == null ? 'w-10' : 'w-[4.5rem]'"
+          :title="r.mean == null ? undefined : `worst ${formatPct(r.value)} · average ${formatPct(r.mean)}`"
+        >
+          {{ formatPct(r.value) }}<template v-if="r.mean != null"><span class="text-muted-foreground/60"> / {{ formatPct(r.mean) }}</span></template>
+        </span>
       </div>
     </div>
 

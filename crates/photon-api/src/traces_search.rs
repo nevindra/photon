@@ -13,9 +13,10 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use photon_query::{SpanQueryRequest, TraceSearchResult, TraceSummary};
+use photon_query::{SpanQueryRequest, TraceSummary};
 
 use crate::query_params::{build_span_query_request, QueryParamError};
+use crate::search::engine_failure;
 use crate::traces::span_row_to_json;
 use crate::AppState;
 
@@ -100,8 +101,11 @@ fn next_cursor(page_len: usize, limit: usize, offset: usize, matched_count: u64)
 }
 
 /// `POST /api/traces/search` — rolled-up trace summaries whose spans match the filter request.
-/// A fresh system (or a hard engine error) yields an empty `traces` array and zero `matched_count`,
-/// not a 500 — mirroring `search::search`'s empty-server behavior.
+/// A fresh system yields an empty `traces` array and zero `matched_count` — but that empty page
+/// comes from the engine's own `Ok` path (`span_survivors_df` returns `None` when nothing survives
+/// pruning), NOT from swallowing an error. A genuine engine failure is a 500: reporting
+/// "0 traces" for a query that actually blew up is indistinguishable from "your window is empty",
+/// which silently hid a `ResourcesExhausted` from the shared query pool in production.
 pub(crate) async fn traces_search(
     State(state): State<AppState>,
     Json(req): Json<SpanSearchRequest>,
@@ -130,13 +134,7 @@ pub(crate) async fn traces_search(
     let started = Instant::now();
     let result = match state.span_query.search_traces(query).await {
         Ok(r) => r,
-        Err(e) => {
-            eprintln!("photon-api: warning: traces search failed, returning empty results: {e}");
-            TraceSearchResult {
-                traces: Vec::new(),
-                matched_count: 0,
-            }
-        }
+        Err(e) => return engine_failure("traces search", &e),
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let cursor = next_cursor(result.traces.len(), limit, offset, result.matched_count);
@@ -151,9 +149,10 @@ pub(crate) async fn traces_search(
 }
 
 /// `POST /api/spans/search` — raw span rows matching the filter request, in the same JSON shape
-/// as `GET /api/traces/:trace_id`'s spans. A fresh system (or a hard engine error) yields an empty
-/// `rows` array and a zero `matched_count` — both come from the same `search_spans_with_count`
-/// call, so they can't disagree (mirrors `search::search`).
+/// as `GET /api/traces/:trace_id`'s spans. A fresh system yields an empty `rows` array and a zero
+/// `matched_count` from the engine's `Ok` path — both come from the same
+/// `search_spans_with_count` call, so they can't disagree. A genuine engine failure is a 500, for
+/// the reason spelled out on [`traces_search`].
 pub(crate) async fn spans_search(
     State(state): State<AppState>,
     Json(req): Json<SpanSearchRequest>,
@@ -183,10 +182,7 @@ pub(crate) async fn spans_search(
     // and re-opening every surviving Parquet file.
     let (rows, matched_count) = match state.span_query.search_spans_with_count(query).await {
         Ok((batches, matched_count)) => (span_batches_to_rows(&batches), matched_count),
-        Err(e) => {
-            eprintln!("photon-api: warning: spans search failed, returning empty results: {e}");
-            (Vec::new(), 0)
-        }
+        Err(e) => return engine_failure("spans search", &e),
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let cursor = next_cursor(rows.len(), limit, offset, matched_count);

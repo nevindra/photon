@@ -207,6 +207,32 @@ invariants (pruning stays conservative, local-fs-only, two-pass logs untouched).
 - **Effort/Risk:** S / S.
 - **Invariant check:** OK.
 
+### F12 — skip-index pruning is a sequential loop of random reads · P1 · speed (spinning disk) · **FIXED**
+- **Where:** `span_engine.rs` `span_prune` — `for entry in manifest.candidates(..)`, one
+  synchronous `.idx` read per candidate, all inside a single `spawn_blocking`. The same shape
+  exists in `lib.rs::prune` (logs), `metric_engine.rs::prune` (metrics), and
+  `span_engine.rs::trace_candidates`.
+- **What:** Each candidate's `.idx` sidecar is a separate small file, so pruning is N **random**
+  reads. Issued one at a time, each pays full rotational latency on a spinning disk with no
+  opportunity for the I/O scheduler to reorder them.
+- **Why it matters:** Measured on a production 3 TB rotational volume (`/sys/block/sda/queue/rotational = 1`):
+  **10.9 ms/file sequential**, so a 7-day trace search over 2,707 candidates spent **~16 s in
+  prune alone**, before DataFusion opened a single Parquet file. Warm page cache hid it entirely
+  (0.104 ms/file), which is why the symptom read as erratic rather than slow. This — not data
+  volume — was the dominant cost: the deployment was only ingesting ~68 spans/s (~400 MB/day).
+- **Fixed by:** fanning the candidate list across the blocking pool in `PRUNE_CHUNKS` (64)
+  contiguous slices once it exceeds `PRUNE_PARALLEL_MIN_CANDIDATES` (64) — `span_prune_fanned`.
+  Chunks re-derive `candidates()` from a shared `Arc<Manifest>` (a pure in-memory filter) rather
+  than cloning `FileEntry`s, and are awaited in order so the survivor list stays byte-identical to
+  the sequential prune's. Measured on the same disk: **2.43 ms/file at 64-way, a ~4.5x speedup**.
+  Concurrency sweep: 1→10.89, 4→4.69, 8→4.37, 16→3.40, 32→2.75, 64→2.43 ms/file.
+- **Effort/Risk:** S / low. **Still sequential in the logs and metrics engines** and in
+  `trace_candidates` — same fix applies, not yet done.
+- **Invariant check:** Pruning stays conservative (a missing/undecodable `.idx` still keeps the
+  file); slicing is by index over one immutable manifest snapshot, so no candidate is dropped or
+  double-counted at a chunk boundary (`fanned_prune_over_many_segments_keeps_every_matching_file`,
+  `fanned_prune_still_drops_out_of_window_files`).
+
 ### F11 — histogram cumulative bounds taken from first row only · P3 · correctness
 - **Where:** `metric_dist.rs:301-347` (`histogram_series`): canonical `bounds` = first row with
   non-empty `explicit_bounds`; cumulative delta resets only on *length* change (`cur.len() !=

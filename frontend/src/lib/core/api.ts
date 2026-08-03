@@ -586,8 +586,15 @@ export interface InfraHost {
   host: string
   cpuUtil: number | null
   memUtil: number | null
+  // Disk and GPU are label-split (mountpoints, devices), so they cross as a PAIR: `*Util` is the
+  // worst group, `*UtilAvg` the mean across groups, `*Groups` how many there were. The UI shows
+  // both numbers — a lone max reads as a saturated host when only one group is hot.
   diskUtil: number | null
+  diskUtilAvg: number | null
+  diskGroups: number
   gpuUtil: number | null
+  gpuUtilAvg: number | null
+  gpuGroups: number
   lastSeenNs: string
   hasGpu: boolean
 }
@@ -811,6 +818,21 @@ const http = ky.create({
   },
 })
 
+// Should this error be surfaced to the user instead of silently falling back to the mock corpus?
+//
+// The mock fallback exists for ONE case: no backend at all (pure-frontend dev), where ky throws
+// without a `.response` so `.status` stays undefined. A 4xx/5xx means the backend answered — it is
+// reachable, and swapping in demo data would dress a real failure up as real data. That matters
+// most for 5xx: the search handlers now 500 on a hard engine error (e.g. `ResourcesExhausted` from
+// the shared query pool) instead of returning an empty page, and mocking those would replace a
+// visible failure with a plausible-looking fake result set.
+//
+// 401 is deliberately NOT surfaced here — an expired session is the router auth guard's job, and
+// throwing would turn it into a query error toast instead of a redirect to /login.
+function isRealFailure(e: { status?: number }): boolean {
+  return e.status != null && e.status !== 401
+}
+
 // Convert API rows (timestamp as string nanos) into the shape the UI uses (BigInt). Accepts the
 // mock corpus's already-BigInt timestamps too (BigInt() is a no-op on a bigint), so this bridges
 // both the wire path and the mock fallback — hence the loose `any[]` input (the two corpora carry
@@ -956,7 +978,7 @@ export const api = {
       const res = await http.post('search', { json: request, signal: opts.signal }).json<RawLogSearchResponse>()
       return { rows: hydrate(res.rows), matched_count: res.matched_count, elapsed_ms: res.elapsed_ms }
     } catch (e: any) {
-      if (e.status === 400) throw e // bad query — surface it, don't mock
+      if (isRealFailure(e)) throw e // bad query or a failed backend — surface it, don't mock
       api.mock = true
       await new Promise((r) => setTimeout(r, 180))
       const m = queryMock(request)
@@ -1025,7 +1047,7 @@ export const api = {
         next_cursor: res.next_cursor,
       }
     } catch (e: any) {
-      if (e.status === 400) throw e // bad query — surface it, don't mock
+      if (isRealFailure(e)) throw e // bad query or a failed backend — surface it, don't mock
       api.mock = true
       await new Promise((r) => setTimeout(r, 180))
       const m = mockSearchTraces(request as any)
@@ -1048,7 +1070,7 @@ export const api = {
         next_cursor: res.next_cursor,
       }
     } catch (e: any) {
-      if (e.status === 400) throw e // bad query — surface it, don't mock
+      if (isRealFailure(e)) throw e // bad query or a failed backend — surface it, don't mock
       api.mock = true
       await new Promise((r) => setTimeout(r, 180))
       const m = mockSearchSpans(request as any)

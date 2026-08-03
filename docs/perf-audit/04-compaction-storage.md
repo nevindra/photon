@@ -87,13 +87,14 @@
 - **Effort/Risk:** S–M / low.
 - **Invariant check:** Deletes must stay async / off the ingest+query path.
 
-### 9. Single 10k-row merge threshold → manifest bloat / read amplification at scale  ·  **P2** · read-amplification / scalability
+### 9. Single 10k-row merge threshold → manifest bloat / read amplification at scale  ·  **P2** · read-amplification / scalability  ·  **FIXED**
 - **Where:** `MERGE_ROW_THRESHOLD = 10_000` (`compactor.rs:46`); `merge_once` only ever consolidates files *below* the threshold (`:114-116`), merging into one file that is then "large" and never touched again.
 - **What:** There's one flat merge tier. Every file freezes the moment it crosses 10k rows (a tiny Parquet file). Under steady ingest you accumulate an ever-growing population of ~10k–1M-row files; the manifest grows to thousands of entries and every query prunes + reads an `.idx` for each time-overlapping candidate (`photon-query prune`).
 - **Why it matters:** For the "HUGE data" target this is the dominant long-run query cost — pruning is O(candidate files) and file count is unbounded.
-- **Fix:** Size-tiered / leveled compaction (merge into progressively larger tiers), or raise the threshold substantially and add a periodic "compact everything older than X into day-files" pass. Cadence knobs live in `main.rs:40-44`.
+- **Confirmed in production.** A 14.5-day, 85.3M-span deployment converged to **6,861 files averaging 12,429 rows / 0.83 MiB** — 6,860 of them at or above the old threshold, so merge had become a permanent no-op (98% were themselves *merge outputs* that had frozen). Row counts were pinned just past the threshold (p50 12,326, max 19,756) and the spans manifest reached 10.5 MB. A 7-day trace search had to prune 2,707 candidates.
+- **Fixed by:** replacing the input classifier with an **output target** — `MERGE_TARGET_ROWS = 150_000` in all three compactors. Selection takes files oldest-first until the output would reach the target (min 2, max `MERGE_MAX_FILES_PER_PASS`), so a file climbs toward the target across passes instead of freezing, while peak per-pass memory stays at parity with the old `32 x 10k` ceiling. Regression tests: `merge_once_keeps_consolidating_past_the_old_10k_row_threshold` and `merge_once_stops_selecting_once_the_output_would_reach_the_target` (`span_compactor.rs`). Full size-tiered/leveled compaction remains the longer-term answer if file count becomes the bottleneck again.
 - **Effort/Risk:** L / medium (new compaction policy).
-- **Invariant check:** Keep `(service, timestamp)` sort within each output file; keep min/max from the same `SkipIndex::build`.
+- **Invariant check:** Keep `(service, timestamp)` sort within each output file; keep min/max from the same `SkipIndex::build`. Selection stays **oldest-first** so merged outputs remain time-adjacent — sorting by size instead would fold distant time ranges into one file that survives every window's pruning.
 
 ### 10. Detached, unsupervised compactor tasks → a panic silently stops compaction forever  ·  **P2** · robustness
 - **Where:** `spawn_compactor`/`spawn_span_compactor`/`spawn_metric_compactor` (`main.rs:276/338/388`) `tokio::spawn` and drop the `JoinHandle`. `run_once` errors are logged and the loop continues, but an unexpected **panic** (e.g. a poisoned replicator mutex — `replicator.rs:43/50/72` `.expect("…poisoned")`, or an Arrow kernel panic on malformed data) kills the task with no restart.

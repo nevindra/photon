@@ -28,7 +28,11 @@ fn host_summary_json(h: &HostSummary) -> Value {
         "cpuUtil": h.cpu_util,
         "memUtil": h.mem_util,
         "diskUtil": h.disk_util,
+        "diskUtilAvg": h.disk_util_avg,
+        "diskGroups": h.disk_groups,
         "gpuUtil": h.gpu_util,
+        "gpuUtilAvg": h.gpu_util_avg,
+        "gpuGroups": h.gpu_groups,
         "lastSeenNs": h.last_seen_ns.to_string(),
         "hasGpu": h.has_gpu,
     })
@@ -173,7 +177,11 @@ mod tests {
             cpu_util: Some(0.4),
             mem_util: None,
             disk_util: Some(0.67),
+            disk_util_avg: Some(0.355),
+            disk_groups: 2,
             gpu_util: None,
+            gpu_util_avg: None,
+            gpu_groups: 0,
             last_seen_ns: 1_700_000_000_000_000_000,
             has_gpu: true,
         };
@@ -182,8 +190,14 @@ mod tests {
         assert_eq!(v["hasGpu"], true);
         assert_eq!(v["cpuUtil"], 0.4);
         assert_eq!(v["memUtil"], Value::Null);
+        // The worst mountpoint and the across-mountpoint mean travel together — the UI renders
+        // both, so dropping either half from the payload would strand a tile.
         assert_eq!(v["diskUtil"], 0.67);
+        assert_eq!(v["diskUtilAvg"], 0.355);
+        assert_eq!(v["diskGroups"], 2);
         assert_eq!(v["gpuUtil"], Value::Null);
+        assert_eq!(v["gpuUtilAvg"], Value::Null);
+        assert_eq!(v["gpuGroups"], 0);
     }
 
     #[test]

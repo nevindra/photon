@@ -21,6 +21,25 @@ use photon_query::QueryRequest;
 use crate::query_params::{clamp_limit, resolve_query};
 use crate::AppState;
 
+/// Turn a hard query-engine failure into a 500 carrying the usual `{"error": ...}` body.
+///
+/// Every search handler used to log the error and return an empty-but-200 page instead. That was
+/// meant to keep a *fresh* server (no manifest, no Parquet yet) from 500-ing, but the engines
+/// already handle that on their `Ok` path — nothing survives pruning, so they return an empty
+/// result, not an `Err`. The fallback therefore only ever fired on genuine failures, and rendered
+/// them as "your search matched nothing": a `ResourcesExhausted` from the shared query pool showed
+/// up in production as an empty trace list with no indication anything had gone wrong.
+///
+/// Callers must keep returning the real empty page on `Ok` — only `Err` routes here.
+pub(crate) fn engine_failure(what: &str, e: &PhotonError) -> Response {
+    eprintln!("photon-api: error: {what} failed: {e}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e.to_string() })),
+    )
+        .into_response()
+}
+
 /// The search request sent by the UI. Timestamps arrive as decimal-nanosecond strings (they
 /// exceed JS's safe integer range), everything else is plain.
 #[derive(Debug, Deserialize)]
@@ -92,10 +111,7 @@ pub(crate) async fn search(
     // re-opening every surviving Parquet file.
     let (rows, matched_count) = match state.query.search_with_count(query).await {
         Ok((batches, matched_count)) => (batches_to_rows(&batches), matched_count),
-        Err(e) => {
-            eprintln!("photon-api: warning: search query failed, returning empty results: {e}");
-            (Vec::new(), 0)
-        }
+        Err(e) => return engine_failure("log search", &e),
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
 

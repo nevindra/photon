@@ -26,7 +26,20 @@ use photon_wal::Wal;
 use crate::stream::{fsync_manifest, hot_local_path, write_parquet_streamed, DEFAULT_ZSTD_LEVEL};
 
 const SERVICE_NAME_COLUMN: &str = "service.name";
-const MERGE_ROW_THRESHOLD: u64 = 10_000;
+
+/// Row count a consolidated file is grown *toward* — and, once reached, the point at which a file
+/// is considered done and left alone forever.
+///
+/// This is an **output target**, not an input classifier, and the distinction is load-bearing. An
+/// earlier version partitioned on a 10,000-row `MERGE_ROW_THRESHOLD` with no notion of a target,
+/// which gave merging a **fixed point barely above the threshold**: a pass folded small files
+/// together, the output landed just over 10,000 rows, and every later pass then classified that
+/// output as "large" and never touched it again. Steady ingest converged to thousands of ~12k-row
+/// (~0.8 MiB) Parquet files that merge could no longer consolidate, and every query paid a
+/// per-file open for each one. Sized so the worst case (two files at `target - 1` merging into
+/// one) decodes about as many rows as the old `MERGE_MAX_FILES_PER_PASS x MERGE_ROW_THRESHOLD`
+/// ceiling did — peak merge memory stays at parity with the pre-target code.
+const MERGE_TARGET_ROWS: u64 = 150_000;
 
 /// Cap on how many small files a single `merge_once` pass consolidates. Without a cap, a pass's
 /// peak memory is bounded by NOTHING — after downtime, a merge-failure streak, or a burst of tiny
@@ -117,18 +130,35 @@ impl<W: Wal> SpanCompactor<W> {
             .collect();
         let (mut small, large): (Vec<FileEntry>, Vec<FileEntry>) = all
             .into_iter()
-            .partition(|e| e.row_count < MERGE_ROW_THRESHOLD);
+            .partition(|e| e.row_count < MERGE_TARGET_ROWS);
         if small.len() < 2 {
             return Ok(0);
         }
 
-        // Cap peak memory: sort oldest-first (also nudges toward time-adjacency) and merge only
-        // the first MERGE_MAX_FILES_PER_PASS. The remainder is `carry` — NOT merged this pass, but
-        // it MUST be added back into the new manifest (and its objects left alone) below, or those
-        // files' rows are silently lost. The 10s merge cadence folds `carry` in over subsequent
-        // passes.
+        // Sort oldest-first — merging time-ADJACENT files is what keeps each output's [min_ts,
+        // max_ts] narrow, which is what makes the manifest's time-overlap pruning effective. (Do
+        // not "improve" this by sorting on size: it would fold distant time ranges into one file
+        // that then survives every window's pruning.)
+        //
+        // Then take files until the output would reach MERGE_TARGET_ROWS — always at least 2 (or
+        // the pass rewrites a single file to no effect), never more than MERGE_MAX_FILES_PER_PASS.
+        // Both bounds cap peak memory, since a pass holds ~2x the decoded union of its inputs. The
+        // remainder is `carry` — NOT merged this pass, but it MUST be added back into the new
+        // manifest (and its objects left alone) below, or those files' rows are silently lost. The
+        // 10s merge cadence folds `carry` in over subsequent passes, so a file climbs toward the
+        // target across passes instead of stalling at whatever one pass could reach.
         small.sort_by_key(|e| e.min_ts_nanos);
-        let carry = small.split_off(small.len().min(MERGE_MAX_FILES_PER_PASS));
+        let mut selected_rows: u64 = 0;
+        let mut take = 0;
+        for e in &small {
+            if take >= MERGE_MAX_FILES_PER_PASS || (take >= 2 && selected_rows >= MERGE_TARGET_ROWS)
+            {
+                break;
+            }
+            selected_rows = selected_rows.saturating_add(e.row_count);
+            take += 1;
+        }
+        let carry = small.split_off(take);
         let selected = small;
 
         // Allocate the consolidated file's id from the MERGED (high-bit) namespace, disjoint from
@@ -850,6 +880,130 @@ mod tests {
             .find(|e| e.segment_id == SegmentId(1))
             .expect("the reused-id (segment 1) entry must be present");
         assert_eq!(reused_entry.row_count, 2);
+    }
+
+    #[tokio::test]
+    async fn merge_once_keeps_consolidating_past_the_old_10k_row_threshold() {
+        // Regression for the merge FIXED POINT. `merge_once` used to partition on a 10,000-row
+        // `MERGE_ROW_THRESHOLD` used as an input classifier, with no notion of a target output
+        // size. That made merging self-limiting: a pass folded small files together, its own
+        // output landed just past 10k rows, and every later pass then classified that output as
+        // "large" and skipped it forever. Under steady ingest (a 32 MiB WAL segment compacts to
+        // ~12k span rows) EVERY file was born above the threshold, so merge silently became a
+        // no-op and the file population grew without bound — the state that made a 7-day trace
+        // search open thousands of Parquet files.
+        //
+        // Files at 12k rows are above the OLD threshold but below MERGE_TARGET_ROWS, so they must
+        // still merge. Under the old code this test's first assert sees 0.
+        const ROWS_PER_FILE: usize = 12_000;
+        const FILES: usize = 4;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = test_storage(tmp.path());
+        let schema = SpanSchema::new(&[SERVICE_NAME_COLUMN.to_string()]);
+
+        let segments: Vec<(SegmentId, Vec<RecordBatch>)> = (0..FILES)
+            .map(|f| {
+                let mut b = SpanBatchBuilder::new(&schema);
+                for r in 0..ROWS_PER_FILE {
+                    // Distinct, increasing start times so each file owns a disjoint time range —
+                    // merge selects oldest-first, so this also pins the selection order.
+                    b.append(&span("t", "svc", (f * ROWS_PER_FILE + r) as i64));
+                }
+                (SegmentId(f as u64), vec![b.finish().unwrap()])
+            })
+            .collect();
+
+        let wal = Arc::new(FakeWal {
+            segments: Mutex::new(segments),
+        });
+        let replicator = Arc::new(Replicator::new(storage.clone()));
+        let compactor = SpanCompactor::new(wal, storage.clone(), replicator, schema);
+
+        while compactor.run_once().await.unwrap().is_some() {}
+        let before = load_manifest(&storage).await;
+        let before_entries = before.candidates(i64::MIN, i64::MAX);
+        assert_eq!(before_entries.len(), FILES);
+        for e in &before_entries {
+            assert!(
+                e.row_count > 10_000,
+                "fixture must sit ABOVE the old threshold to exercise the regression, got {}",
+                e.row_count
+            );
+            assert!(
+                e.row_count < MERGE_TARGET_ROWS,
+                "fixture must sit BELOW the new target so it is still eligible to merge"
+            );
+        }
+
+        // The fix: these are all still mergeable. (Old code: 0.)
+        let merged = compactor.merge_once().await.unwrap();
+        assert_eq!(
+            merged, FILES,
+            "files above the old 10k threshold must still consolidate"
+        );
+
+        let after = load_manifest(&storage).await;
+        let entries = after.candidates(i64::MIN, i64::MAX);
+        assert_eq!(entries.len(), 1, "all four files fold into one");
+        assert_eq!(
+            entries[0].row_count,
+            (FILES * ROWS_PER_FILE) as u64,
+            "no rows lost across the merge"
+        );
+
+        // And it terminates: one file left, nothing more to do (no rewrite churn).
+        assert_eq!(compactor.merge_once().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn merge_once_stops_selecting_once_the_output_would_reach_the_target() {
+        // The row bound is what caps a pass's peak memory (a pass holds ~2x the decoded union of
+        // its inputs), so selection must stop at MERGE_TARGET_ROWS even when the file cap and the
+        // supply of small files would both allow more. Two files at 60% of the target each: the
+        // second crosses it, so the third must be carried forward rather than merged.
+        let rows_per_file = (MERGE_TARGET_ROWS as usize * 6) / 10;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = test_storage(tmp.path());
+        let schema = SpanSchema::new(&[SERVICE_NAME_COLUMN.to_string()]);
+
+        let segments: Vec<(SegmentId, Vec<RecordBatch>)> = (0..3)
+            .map(|f| {
+                let mut b = SpanBatchBuilder::new(&schema);
+                for r in 0..rows_per_file {
+                    b.append(&span("t", "svc", (f * rows_per_file + r) as i64));
+                }
+                (SegmentId(f as u64), vec![b.finish().unwrap()])
+            })
+            .collect();
+
+        let wal = Arc::new(FakeWal {
+            segments: Mutex::new(segments),
+        });
+        let replicator = Arc::new(Replicator::new(storage.clone()));
+        let compactor = SpanCompactor::new(wal, storage.clone(), replicator, schema);
+
+        while compactor.run_once().await.unwrap().is_some() {}
+        assert_eq!(
+            compactor.merge_once().await.unwrap(),
+            2,
+            "stops at 2, not 3"
+        );
+
+        let entries_owned: Vec<FileEntry> = {
+            let m = load_manifest(&storage).await;
+            m.candidates(i64::MIN, i64::MAX)
+                .into_iter()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(entries_owned.len(), 2, "1 merged output + 1 carried file");
+        let total: u64 = entries_owned.iter().map(|e| e.row_count).sum();
+        assert_eq!(total, (3 * rows_per_file) as u64, "no rows lost");
+
+        // The merged output is at/over the target, so it is now "large" and left alone; the single
+        // remaining small file has no partner, so the next pass is a no-op. Merging has converged.
+        assert_eq!(compactor.merge_once().await.unwrap(), 0);
     }
 
     #[tokio::test]

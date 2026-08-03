@@ -26,6 +26,25 @@ use crate::{cached_manifest, col_ref, session, ManifestCache};
 /// in-window files, and a hint-less call scans every candidate (fully correct, just less pruned).
 const TRACE_TIME_HINT_PADDING_NANOS: i64 = 3_600_000_000_000;
 
+/// How many chunks a large candidate list is fanned across when pruning.
+///
+/// Skip-index pruning is one small **random** read per candidate (`entry.path` -> its `.idx`
+/// sidecar). Done in a sequential loop, every one of those pays full rotational latency on a
+/// spinning disk — measured ~10 ms/file on a 7.2k-RPM volume, so a 7-day window over ~2,700
+/// candidates spent ~16 s in prune alone before DataFusion opened a single Parquet file. Keeping
+/// many reads in flight lets the I/O scheduler reorder them by physical position: the same disk
+/// served ~2.4 ms/file at this fan-out, a ~4.5x speedup, which is what makes a wide window usable
+/// on commodity storage rather than only on SSD/NVMe.
+///
+/// Costs nothing where it doesn't help: on flash (already concurrency-hungry) it is neutral-to-
+/// positive, and on a warm page cache each read is ~0.1 ms so the chunks finish immediately.
+/// Tokio's blocking pool is 512 threads by default, so this fan-out never starves it.
+const PRUNE_CHUNKS: usize = 64;
+
+/// Below this many candidates, the task fan-out costs more than the seeks it saves — prune inline
+/// on a single blocking task instead.
+const PRUNE_PARALLEL_MIN_CANDIDATES: usize = 64;
+
 /// Sort order for `SpanQueryEngine::search_spans`. `Recent` is the default — newest spans
 /// first, matching the UI's default trace/span explorer view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -273,23 +292,81 @@ impl SpanQueryEngine {
         Ok(surviving)
     }
 
+    /// [`span_prune`](Self::span_prune), fanned across the blocking pool in [`PRUNE_CHUNKS`]
+    /// contiguous slices once the candidate list is big enough to be worth it.
+    ///
+    /// Each chunk re-derives `manifest.candidates(..)` from the same `Arc<Manifest>` and walks
+    /// only its own index range. That recomputation is a pure in-memory filter over the manifest
+    /// (no I/O) and costs far less than cloning ~2,700 `FileEntry`s — each carries an
+    /// `attribute_keys: Vec<String>` — into the tasks would.
+    ///
+    /// Chunks are awaited **in order** and their outputs concatenated, so the surviving-file list
+    /// is byte-identical to the sequential prune's. Nothing downstream may depend on that (there
+    /// is an `ORDER BY` in every plan), but keeping it deterministic means a parallel prune can
+    /// never be the reason two identical queries disagree.
+    async fn span_prune_fanned(&self, req: &SpanQueryRequest) -> Result<Vec<String>, PhotonError> {
+        let manifest = self.load_spans_manifest()?;
+        let total = manifest
+            .candidates(req.start_ts_nanos, req.end_ts_nanos)
+            .len();
+
+        if total < PRUNE_PARALLEL_MIN_CANDIDATES {
+            let engine = self.clone();
+            let req = req.clone();
+            return spawn_blocking(move || engine.span_prune(&req))
+                .await
+                .map_err(|e| PhotonError::Query(format!("span prune task panicked: {e}")))?;
+        }
+
+        let chunk = total.div_ceil(PRUNE_CHUNKS);
+        let mut tasks = Vec::with_capacity(PRUNE_CHUNKS);
+        for lo in (0..total).step_by(chunk) {
+            let hi = (lo + chunk).min(total);
+            let engine = self.clone();
+            let req = req.clone();
+            let manifest = Arc::clone(&manifest);
+            tasks.push(spawn_blocking(move || {
+                let text_tokens = span_text_tokens(&req);
+                let candidates = manifest.candidates(req.start_ts_nanos, req.end_ts_nanos);
+                let mut kept: Vec<String> = Vec::new();
+                for entry in &candidates[lo..hi] {
+                    if engine.keep_span_search_candidate(entry, &req, text_tokens.as_deref())? {
+                        kept.push(
+                            engine
+                                .hot_dir
+                                .join(&entry.path)
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                }
+                Ok::<Vec<String>, PhotonError>(kept)
+            }));
+        }
+
+        let mut surviving = Vec::new();
+        for task in tasks {
+            surviving.extend(
+                task.await
+                    .map_err(|e| PhotonError::Query(format!("span prune task panicked: {e}")))??,
+            );
+        }
+        Ok(surviving)
+    }
+
     /// Prune, then open the surviving spans Parquet files as one DataFrame (unfiltered — the
     /// caller applies `span_base_predicate`). `None` when nothing survives pruning, so the
     /// caller can return an empty/zero result without touching DataFusion.
     ///
     /// Pruning (manifest `stat`/read + per-candidate `.idx` reads) is synchronous `std::fs` I/O;
-    /// it runs in `spawn_blocking` so it never blocks a tokio worker thread. `self` is cheap to
-    /// clone (a `PathBuf`, a small `SpanSchema`, and an `Arc`-shared manifest cache), so the
-    /// clone moved into the blocking closure still shares the manifest cache with `self`.
+    /// it runs on the blocking pool so it never blocks a tokio worker thread. `self` is cheap to
+    /// clone (a `PathBuf`, a small `SpanSchema`, and an `Arc`-shared manifest cache), so each
+    /// clone moved into a blocking closure still shares the manifest cache with `self`.
     pub(crate) async fn span_survivors_df(
         &self,
         req: &SpanQueryRequest,
     ) -> Result<Option<DataFrame>, PhotonError> {
-        let engine = self.clone();
-        let req = req.clone();
-        let surviving = spawn_blocking(move || engine.span_prune(&req))
-            .await
-            .map_err(|e| PhotonError::Query(format!("span prune task panicked: {e}")))??;
+        let surviving = self.span_prune_fanned(req).await?;
         if surviving.is_empty() {
             return Ok(None);
         }

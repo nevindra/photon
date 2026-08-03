@@ -22,6 +22,15 @@ export function latestTotal(list?: SeriesLike[]): number | null {
   return vals.reduce((a, b) => a + b, 0)
 }
 
+// Mean of the last point across a label-split series set (e.g. per-GPU utilization). Pairs with
+// `worstSeries` on tiles whose headline is a max — the max alone reads as if the whole device is
+// busy when only one member of the set is.
+export function latestMean(list?: SeriesLike[]): number | null {
+  const vals = (list ?? []).map(latestValue).filter((v): v is number => v != null)
+  if (!vals.length) return null
+  return vals.reduce((a, b) => a + b, 0) / vals.length
+}
+
 export function worstSeries(
   list: SeriesLike[] | undefined,
   labelKey: string,
@@ -33,6 +42,27 @@ export function worstSeries(
     if (!best || v > best.value) best = { label: s.labels[labelKey] ?? '', value: v }
   }
   return best
+}
+
+// A label-split resource (disk mountpoints, GPU devices) folded for one tile: the worst group, the
+// mean across groups, that group's label, and how many groups carried a value. Mirrors the
+// backend's `GroupStat` on /api/infra/hosts — the tile derives it client-side from the series it
+// already charts, so the tile and the chart below it can never disagree.
+export interface GroupStat {
+  worst: number | null
+  mean: number | null
+  label: string | null
+  groups: number
+}
+
+export function groupStat(list: SeriesLike[] | undefined, labelKey: string): GroupStat {
+  const w = worstSeries(list, labelKey)
+  return {
+    worst: w?.value ?? null,
+    mean: latestMean(list),
+    label: w?.label ?? null,
+    groups: (list ?? []).filter((s) => latestValue(s) != null).length,
+  }
 }
 
 // Shared glance thresholds: ≥90% error, ≥80% warning, else no accent.

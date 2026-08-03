@@ -98,13 +98,33 @@ pub struct HostSummary {
     /// plain per-host avg would dilute a real problem on one mountpoint (e.g. a full `/`) with
     /// an idle one (e.g. `/boot/efi`).
     pub disk_util: Option<f64>,
+    /// The MEAN of those same per-mountpoint window-avgs — the headline's companion, never its
+    /// replacement: `disk_util` says how bad the worst mountpoint is, this says how much of that
+    /// is the host as a whole. The UI shows both so neither number can be misread alone.
+    pub disk_util_avg: Option<f64>,
+    /// How many `(host, mountpoint)` groups the pair above was folded from.
+    pub disk_groups: usize,
     /// The WORST GPU's window-avg `system.gpu.utilization` in `[0,1]` — the MAX across the
     /// host's `(host, gpu)` groups, if any GPU point was reported.
     pub gpu_util: Option<f64>,
+    /// The MEAN of those same per-GPU window-avgs (see `disk_util_avg`).
+    pub gpu_util_avg: Option<f64>,
+    /// How many `(host, gpu)` groups the pair above was folded from — i.e. the host's GPU count.
+    pub gpu_groups: usize,
     /// Newest sample timestamp seen for the host's CPU metric (epoch nanos); `0` if unknown.
     pub last_seen_ns: i64,
     /// Whether any `system.gpu.utilization` row exists for the host in the window.
     pub has_gpu: bool,
+}
+
+/// A label-split resource (disk mountpoints, GPUs) folded to one host: the worst group, the mean
+/// across groups, and how many groups there were. `fill_group_gauge` produces it; the summary
+/// carries both numbers so the UI never has to present a max as if it spoke for the whole host.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GroupStat {
+    max: f64,
+    mean: f64,
+    groups: usize,
 }
 
 /// Per-host metadata for the host-detail header.
@@ -292,7 +312,11 @@ impl MetricsQueryEngine {
                             cpu_util: cpu(i),
                             mem_util: None,
                             disk_util: None,
+                            disk_util_avg: None,
+                            disk_groups: 0,
                             gpu_util: None,
+                            gpu_util_avg: None,
+                            gpu_groups: 0,
                             last_seen_ns: last(i).unwrap_or(0),
                             has_gpu: false,
                         });
@@ -308,14 +332,18 @@ impl MetricsQueryEngine {
         .await?;
         // GPU presence: any gpu-utilization row for the host in-window.
         self.mark_gpu_presence(&mut out, start_ns, end_ns).await?;
-        // Worst-mountpoint disk utilization (max of per-mountpoint window-avg).
-        self.fill_worst_gauge(&mut out, FS_UTIL, "mountpoint", start_ns, end_ns, |h, v| {
-            h.disk_util = Some(v)
+        // Disk: worst mountpoint AND the mean across mountpoints (both shown in the UI).
+        self.fill_group_gauge(&mut out, FS_UTIL, "mountpoint", start_ns, end_ns, |h, g| {
+            h.disk_util = Some(g.max);
+            h.disk_util_avg = Some(g.mean);
+            h.disk_groups = g.groups;
         })
         .await?;
-        // Worst-GPU utilization (max of per-gpu window-avg).
-        self.fill_worst_gauge(&mut out, GPU_UTIL, "gpu", start_ns, end_ns, |h, v| {
-            h.gpu_util = Some(v)
+        // GPU: worst device AND the mean across devices.
+        self.fill_group_gauge(&mut out, GPU_UTIL, "gpu", start_ns, end_ns, |h, g| {
+            h.gpu_util = Some(g.max);
+            h.gpu_util_avg = Some(g.mean);
+            h.gpu_groups = g.groups;
         })
         .await?;
 
@@ -367,22 +395,25 @@ impl MetricsQueryEngine {
         Ok(())
     }
 
-    /// Set a headline gauge on the hosts already discovered by `infra_hosts`, aggregating the
-    /// WORST (max) window-avg across a non-promoted data-point breakdown attribute — e.g. the
-    /// worst mountpoint's disk utilization, or the worst GPU's utilization. Unlike
-    /// `fill_latest_gauge` (a plain per-host avg), this groups by `(host.name,
-    /// get_field(attributes, group_attr))` first, then folds the MAX per host into `out` — a
-    /// plain avg would dilute a real problem on one group (a full `/` disk) with an idle one
-    /// (`/boot/efi`). Hosts absent from `out` (no CPU signal) are ignored — same semantics as
-    /// `fill_latest_gauge`.
-    async fn fill_worst_gauge(
+    /// Set a headline gauge on the hosts already discovered by `infra_hosts`, aggregating a
+    /// non-promoted data-point breakdown attribute — e.g. per-mountpoint disk utilization, or
+    /// per-GPU utilization. Unlike `fill_latest_gauge` (a plain per-host avg), this groups by
+    /// `(host.name, get_field(attributes, group_attr))` first, then folds BOTH the MAX and the
+    /// MEAN of those per-group window-avgs (plus the group count) into `out`.
+    ///
+    /// Both halves are load-bearing and neither is sufficient alone: the max is what makes a full
+    /// `/` visible instead of averaged away against an idle `/boot/efi`, and the mean is what
+    /// stops that max from reading as if the whole host were saturated when one group is hot and
+    /// the rest idle. The UI renders them side by side. Hosts absent from `out` (no CPU signal)
+    /// are ignored — same semantics as `fill_latest_gauge`.
+    async fn fill_group_gauge(
         &self,
         out: &mut BTreeMap<String, HostSummary>,
         metric: &str,
         group_attr: &str,
         start_ns: i64,
         end_ns: i64,
-        set: impl Fn(&mut HostSummary, f64),
+        set: impl Fn(&mut HostSummary, GroupStat),
     ) -> Result<(), PhotonError> {
         let req = MetricRequest {
             metric: metric.to_string(),
@@ -397,33 +428,44 @@ impl MetricsQueryEngine {
         let group = get_field(col_ref(metric_schema::ATTRIBUTES), group_attr);
         let batches = df
             .filter(metric_base_predicate(&req))
-            .map_err(|e| PhotonError::Query(format!("infra fill_worst_gauge filter: {e}")))?
+            .map_err(|e| PhotonError::Query(format!("infra fill_group_gauge filter: {e}")))?
             .aggregate(
                 vec![col_ref(HOST_ATTR).alias("host"), group.alias("group")],
                 vec![avg(col_ref(metric_schema::VALUE)).alias("v")],
             )
-            .map_err(|e| PhotonError::Query(format!("infra fill_worst_gauge aggregate: {e}")))?
+            .map_err(|e| PhotonError::Query(format!("infra fill_group_gauge aggregate: {e}")))?
             .collect()
             .await
-            .map_err(|e| PhotonError::Query(format!("infra fill_worst_gauge collect: {e}")))?;
-        let mut worst: BTreeMap<String, f64> = BTreeMap::new();
+            .map_err(|e| PhotonError::Query(format!("infra fill_group_gauge collect: {e}")))?;
+        // (max, sum, n) per host — one row per (host, group), so `n` is the group count.
+        let mut acc: BTreeMap<String, (f64, f64, usize)> = BTreeMap::new();
         for b in &batches {
             let host = str_col(b, 0)?;
             let v = f64_col(b, 2);
             for i in 0..b.num_rows() {
                 if host.is_valid(i) {
                     if let Some(val) = v(i) {
-                        worst
-                            .entry(host.value(i).to_string())
-                            .and_modify(|m| *m = m.max(val))
-                            .or_insert(val);
+                        acc.entry(host.value(i).to_string())
+                            .and_modify(|(m, s, n)| {
+                                *m = m.max(val);
+                                *s += val;
+                                *n += 1;
+                            })
+                            .or_insert((val, val, 1));
                     }
                 }
             }
         }
-        for (host, val) in worst {
+        for (host, (max, sum, n)) in acc {
             if let Some(hs) = out.get_mut(&host) {
-                set(hs, val);
+                set(
+                    hs,
+                    GroupStat {
+                        max,
+                        mean: sum / n as f64,
+                        groups: n,
+                    },
+                );
             }
         }
         Ok(())
@@ -1271,6 +1313,40 @@ mod tests {
 
         assert_eq!(web2.disk_util, None, "web-2 has no filesystem points");
         assert_eq!(web2.gpu_util, None, "web-2 has no GPU points");
+    }
+
+    #[tokio::test]
+    async fn infra_hosts_carries_the_across_group_mean_beside_the_worst_group() {
+        let (_dir, engine) = super::tests_fixture::two_hosts_cpu().await;
+        let mut hosts = engine.infra_hosts(0, i64::MAX).await.unwrap();
+        hosts.sort_by(|a, b| a.host.cmp(&b.host));
+        let web1 = &hosts[0];
+
+        // That same ~0.355 the max deliberately avoids is still reported — as its own field, so
+        // the UI can show "67% max · 36% avg" instead of a bare 67% that reads like a full host.
+        let avg = web1
+            .disk_util_avg
+            .expect("web-1 reported filesystem points");
+        assert!(
+            (avg - 0.355).abs() < 1e-9,
+            "expected the across-mountpoint mean (0.355), got {avg}"
+        );
+        assert_eq!(web1.disk_groups, 2, "`/` and `/boot/efi`");
+
+        // A single-GPU host: mean == max, and the group count says why (nothing to average over).
+        let gpu_avg = web1.gpu_util_avg.expect("web-1 reported a GPU point");
+        assert!(
+            (gpu_avg - 0.80).abs() < 1e-9,
+            "expected 0.80, got {gpu_avg}"
+        );
+        assert_eq!(web1.gpu_groups, 1);
+
+        // A host with no points for the resource has no pair at all, not a zero.
+        let web2 = &hosts[1];
+        assert_eq!(web2.disk_util_avg, None);
+        assert_eq!(web2.disk_groups, 0);
+        assert_eq!(web2.gpu_util_avg, None);
+        assert_eq!(web2.gpu_groups, 0);
     }
 
     #[tokio::test]

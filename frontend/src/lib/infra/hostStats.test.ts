@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
-  latestValue, latestTotal, worstSeries, utilAccent, sparkValues, cpuSeriesForMode, formatPct,
-  hostStatus,
+  latestValue, latestTotal, latestMean, worstSeries, utilAccent, sparkValues, cpuSeriesForMode,
+  formatPct, hostStatus,
 } from './hostStats'
 import type { SeriesLike } from './hostStats'
 
@@ -19,6 +19,13 @@ describe('hostStats', () => {
   it('latestTotal sums latest values across series (net rx+tx)', () => {
     expect(latestTotal([s({ direction: 'receive' }, [100]), s({ direction: 'transmit' }, [40])])).toBe(140)
     expect(latestTotal([])).toBeNull()
+  })
+  it('latestMean averages latest values across series, skipping the value-less ones', () => {
+    const gpu = [s({ gpu: '0' }, [0.01]), s({ gpu: '1' }, [0.03]), s({ gpu: '2' }, [0.76])]
+    expect(latestMean(gpu)).toBeCloseTo(0.2667, 4)
+    expect(latestMean([...gpu, s({ gpu: '3' }, [null])])).toBeCloseTo(0.2667, 4)
+    expect(latestMean([])).toBeNull()
+    expect(latestMean(undefined)).toBeNull()
   })
   it('worstSeries picks the max latest value and its label', () => {
     const disk = [s({ mountpoint: '/' }, [0.67]), s({ mountpoint: '/boot/efi' }, [0.04])]

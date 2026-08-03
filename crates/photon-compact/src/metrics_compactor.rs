@@ -30,7 +30,20 @@ use crate::stream::{fsync_manifest, hot_local_path, write_parquet_streamed, DEFA
 
 const SERVICE_NAME_COLUMN: &str = "service.name";
 const HOST_NAME_COLUMN: &str = "host.name";
-const MERGE_ROW_THRESHOLD: u64 = 10_000;
+
+/// Row count a consolidated file is grown *toward* — and, once reached, the point at which a file
+/// is considered done and left alone forever.
+///
+/// This is an **output target**, not an input classifier, and the distinction is load-bearing. An
+/// earlier version partitioned on a 10,000-row `MERGE_ROW_THRESHOLD` with no notion of a target,
+/// which gave merging a **fixed point barely above the threshold**: a pass folded small files
+/// together, the output landed just over 10,000 rows, and every later pass then classified that
+/// output as "large" and never touched it again. Steady ingest converged to thousands of ~12k-row
+/// (~0.8 MiB) Parquet files that merge could no longer consolidate, and every query paid a
+/// per-file open for each one. Sized so the worst case (two files at `target - 1` merging into
+/// one) decodes about as many rows as the old `MERGE_MAX_FILES_PER_PASS x MERGE_ROW_THRESHOLD`
+/// ceiling did — peak merge memory stays at parity with the pre-target code.
+const MERGE_TARGET_ROWS: u64 = 150_000;
 
 /// Cap on how many small files a single `merge_once` pass consolidates. Without a cap, a pass's
 /// peak memory is bounded by NOTHING — after downtime, a merge-failure streak, or a burst of tiny
@@ -121,18 +134,35 @@ impl<W: Wal> MetricsCompactor<W> {
             .collect();
         let (mut small, large): (Vec<FileEntry>, Vec<FileEntry>) = all
             .into_iter()
-            .partition(|e| e.row_count < MERGE_ROW_THRESHOLD);
+            .partition(|e| e.row_count < MERGE_TARGET_ROWS);
         if small.len() < 2 {
             return Ok(0);
         }
 
-        // Cap peak memory: sort oldest-first (also nudges toward time-adjacency) and merge only
-        // the first MERGE_MAX_FILES_PER_PASS. The remainder is `carry` — NOT merged this pass, but
-        // it MUST be added back into the new manifest (and its objects left alone) below, or those
-        // files' rows are silently lost. The 10s merge cadence folds `carry` in over subsequent
-        // passes.
+        // Sort oldest-first — merging time-ADJACENT files is what keeps each output's [min_ts,
+        // max_ts] narrow, which is what makes the manifest's time-overlap pruning effective. (Do
+        // not "improve" this by sorting on size: it would fold distant time ranges into one file
+        // that then survives every window's pruning.)
+        //
+        // Then take files until the output would reach MERGE_TARGET_ROWS — always at least 2 (or
+        // the pass rewrites a single file to no effect), never more than MERGE_MAX_FILES_PER_PASS.
+        // Both bounds cap peak memory, since a pass holds ~2x the decoded union of its inputs. The
+        // remainder is `carry` — NOT merged this pass, but it MUST be added back into the new
+        // manifest (and its objects left alone) below, or those files' rows are silently lost. The
+        // 10s merge cadence folds `carry` in over subsequent passes, so a file climbs toward the
+        // target across passes instead of stalling at whatever one pass could reach.
         small.sort_by_key(|e| e.min_ts_nanos);
-        let carry = small.split_off(small.len().min(MERGE_MAX_FILES_PER_PASS));
+        let mut selected_rows: u64 = 0;
+        let mut take = 0;
+        for e in &small {
+            if take >= MERGE_MAX_FILES_PER_PASS || (take >= 2 && selected_rows >= MERGE_TARGET_ROWS)
+            {
+                break;
+            }
+            selected_rows = selected_rows.saturating_add(e.row_count);
+            take += 1;
+        }
+        let carry = small.split_off(take);
         let selected = small;
 
         // Merged id from the disjoint high-bit namespace (see the logs `Compactor` / the spans

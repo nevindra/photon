@@ -11,6 +11,11 @@ const props = defineProps<{
   accent?: 'success' | 'error' | 'warning' | 'info' | 'neutral'
   delta?: number | string
   deltaDirection?: 'up' | 'down' | 'flat'
+  /// A second, co-equal reading of the same resource rendered beside `value` at a smaller size —
+  /// e.g. the across-device mean next to a worst-device max. Use it when the headline alone is
+  /// ambiguous, not for units or context (that's `sub`). Mutually exclusive with `delta` in
+  /// practice: both occupy the slot to the right of the value.
+  secondary?: string
   sub?: string
   class?: HTMLAttributes['class']
 }>()
@@ -53,6 +58,9 @@ const deltaColorClass = computed(() => {
           <p :class="cn('text-2xl font-semibold tabular-nums text-foreground', props.mono && 'font-mono')">
             {{ props.value }}
           </p>
+          <span v-if="props.secondary" class="text-sm font-medium tabular-nums text-muted-foreground">
+            {{ props.secondary }}
+          </span>
           <div v-if="props.delta !== undefined" class="flex items-center gap-1">
             <component :is="DeltaIcon" :class="cn('h-3.5 w-3.5', deltaColorClass)" />
             <span :class="cn('text-xs font-medium', deltaColorClass)">{{ props.delta }}</span>

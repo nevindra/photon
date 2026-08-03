@@ -12,7 +12,11 @@ function makeHost(overrides: Partial<InfraHost> = {}): InfraHost {
     cpuUtil: 0.32,
     memUtil: 0.54,
     diskUtil: 0.45,
+    diskUtilAvg: 0.45,
+    diskGroups: 1,
     gpuUtil: null,
+    gpuUtilAvg: null,
+    gpuGroups: 0,
     lastSeenNs: (BigInt(Date.now() - 12_000) * 1_000_000n).toString(),
     hasGpu: false,
     ...overrides,
@@ -41,9 +45,35 @@ describe('HostCard', () => {
     const withoutGpu = mount(HostCard, { props: { host: makeHost() } })
     expect(withoutGpu.text()).not.toContain('GPU')
 
-    const withGpu = mount(HostCard, { props: { host: makeHost({ hasGpu: true, gpuUtil: 0.61 }) } })
+    const withGpu = mount(HostCard, {
+      props: { host: makeHost({ hasGpu: true, gpuUtil: 0.61, gpuUtilAvg: 0.61, gpuGroups: 1 }) },
+    })
     expect(withGpu.text()).toContain('GPU')
     expect(withGpu.text()).toContain('61%')
+  })
+
+  it('pairs the worst group with the across-group mean on the split resources only', () => {
+    const w = mount(HostCard, {
+      props: {
+        host: makeHost({
+          diskUtil: 0.85, diskUtilAvg: 0.3, diskGroups: 5,
+          hasGpu: true, gpuUtil: 0.76, gpuUtilAvg: 0.2, gpuGroups: 4,
+        }),
+      },
+    })
+    expect(w.text()).toContain('85% / 30%')   // worst mountpoint over the 5-mount mean
+    expect(w.text()).toContain('76% / 20%')   // worst GPU over the 4-device mean
+    // CPU/MEM aren't label-split — one number, no misleading pair to disambiguate.
+    expect(w.text()).toContain('32%')
+    expect(w.text()).not.toContain('32% /')
+  })
+
+  it('omits the mean when the resource has a single group (it would just repeat the max)', () => {
+    const w = mount(HostCard, {
+      props: { host: makeHost({ diskUtil: 0.45, diskUtilAvg: 0.45, diskGroups: 1 }) },
+    })
+    expect(w.text()).toContain('45%')
+    expect(w.text()).not.toContain('45% / 45%')
   })
 
   it('emits select with the host name on click', async () => {

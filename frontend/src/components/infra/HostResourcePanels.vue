@@ -32,6 +32,21 @@ const diskMeters = computed(() =>
     .filter((m) => m.frac != null)
     .sort((a, b) => (b.frac ?? 0) - (a.frac ?? 0)),
 )
+
+// Every chart in this layer is a per-group breakdown, but only the legend said so — which is what
+// made the tiles above ("85%", "76%") read as whole-host numbers. State the split in the card
+// subtitle so the max·avg pair on the tile has something to point at.
+const diskSubtitle = computed(() => {
+  const n = diskMeters.value.length
+  return n > 1 ? `${n} mountpoints` : (diskMeters.value[0]?.mountpoint ?? '')
+})
+const gpuCount = computed(
+  () => (props.res.gpu.data.value?.series ?? []).filter((s) => latestValue(s) != null).length,
+)
+const gpuSubtitle = computed(() => (gpuCount.value > 1 ? `${gpuCount.value} devices` : ''))
+const gpuUtilSubtitle = computed(() =>
+  [props.gpuNames.join(', '), gpuSubtitle.value].filter(Boolean).join(' · '),
+)
 </script>
 
 <template>
@@ -60,7 +75,7 @@ const diskMeters = computed(() =>
       </ChartPanel>
     </div>
 
-    <ChartPanel title="Disk">
+    <ChartPanel title="Disk" :subtitle="diskSubtitle">
       <div v-if="diskMeters.length" class="mb-3 flex flex-col gap-2">
         <div v-for="m in diskMeters" :key="m.mountpoint" class="flex items-center gap-3 text-xs">
           <span class="w-32 truncate font-mono text-muted-foreground">{{ m.mountpoint }}</span>
@@ -72,16 +87,16 @@ const diskMeters = computed(() =>
     </ChartPanel>
 
     <div v-if="hasGpu" class="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-4">
-      <ChartPanel title="GPU utilization" :subtitle="gpuNames.join(', ')">
+      <ChartPanel title="GPU utilization" :subtitle="gpuUtilSubtitle">
         <MetricChart :series="res.gpu.data.value?.series ?? []" percent :y-range="[0, 100]" :start-ms="startMs" :end-ms="endMs" :loading="res.gpu.isLoading.value" viz="line" />
       </ChartPanel>
-      <ChartPanel title="GPU memory">
+      <ChartPanel title="GPU memory" :subtitle="gpuSubtitle">
         <MetricChart :series="res.gpuMemory.data.value?.series ?? []" percent :y-range="[0, 100]" :start-ms="startMs" :end-ms="endMs" :loading="res.gpuMemory.isLoading.value" viz="line" />
       </ChartPanel>
-      <ChartPanel title="GPU temperature">
+      <ChartPanel title="GPU temperature" :subtitle="gpuSubtitle">
         <MetricChart :series="res.gpuTemp.data.value?.series ?? []" unit="°C" :start-ms="startMs" :end-ms="endMs" :loading="res.gpuTemp.isLoading.value" viz="line" />
       </ChartPanel>
-      <ChartPanel title="GPU power">
+      <ChartPanel title="GPU power" :subtitle="gpuSubtitle">
         <MetricChart :series="res.gpuPower.data.value?.series ?? []" unit="W" :start-ms="startMs" :end-ms="endMs" :loading="res.gpuPower.isLoading.value" viz="line" />
       </ChartPanel>
     </div>

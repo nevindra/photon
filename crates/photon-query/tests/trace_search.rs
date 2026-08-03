@@ -744,6 +744,111 @@ async fn ranking_caps_rollup_at_max_candidate_traces_while_matched_count_is_full
 /// the crate-private constant.
 const MAX_TRACES_OVER_CAP: usize = 2001;
 
+/// Comfortably past `PRUNE_PARALLEL_MIN_CANDIDATES` (64) so pruning takes the fanned path, and not
+/// an exact multiple of `PRUNE_CHUNKS` (64) — so the final chunk is a short one and any
+/// off-by-one in the `lo..hi` slicing shows up as a lost or duplicated file.
+const PRUNE_FANOUT_SEGMENTS: usize = 205;
+
+/// Pruning fans a large candidate list across the blocking pool (one `.idx` read per candidate is
+/// a random seek, and issuing them concurrently is what keeps a wide window usable on a spinning
+/// disk). The fan-out slices the candidate list by index, so it must return EXACTLY the sequential
+/// prune's file set — no chunk-boundary drops, no double-counting.
+///
+/// One segment per trace, well past the fan-out threshold, so every surviving file contributes
+/// exactly one trace: the rollup count is then a direct read-out of how many files pruning kept.
+#[tokio::test]
+async fn fanned_prune_over_many_segments_keeps_every_matching_file() {
+    let tmp = TempDir::new().unwrap();
+    let entries: Vec<FileEntry> = (0..PRUNE_FANOUT_SEGMENTS)
+        .map(|i| {
+            let id = format!("t{i:05}");
+            write_segment(
+                tmp.path(),
+                SegmentId(i as u64),
+                &[span(
+                    &id,
+                    "s0",
+                    None,
+                    "api",
+                    "GET /",
+                    1000 + i as i64 * 1000,
+                    Some(1000 + i as i64 * 1000 + 10),
+                    Some(10),
+                    None,
+                )],
+            )
+        })
+        .collect();
+    write_manifest(tmp.path(), entries);
+
+    let res = engine(tmp.path())
+        .search_traces(req(SpanSort::Recent, PRUNE_FANOUT_SEGMENTS, 0, None))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.matched_count, PRUNE_FANOUT_SEGMENTS as u64,
+        "every segment's trace must survive the fanned prune"
+    );
+    let mut got = ids(&res.traces);
+    got.sort();
+    let want: Vec<String> = (0..PRUNE_FANOUT_SEGMENTS)
+        .map(|i| format!("t{i:05}"))
+        .collect();
+    assert_eq!(
+        got, want,
+        "no trace dropped or duplicated at a chunk boundary"
+    );
+}
+
+/// The same fan-out, but with a time window that excludes part of the corpus: the parallel path
+/// must prune exactly as aggressively as the sequential one — dropping the out-of-window files
+/// without letting a chunk boundary smuggle one through.
+#[tokio::test]
+async fn fanned_prune_still_drops_out_of_window_files() {
+    let tmp = TempDir::new().unwrap();
+    let entries: Vec<FileEntry> = (0..PRUNE_FANOUT_SEGMENTS)
+        .map(|i| {
+            let id = format!("t{i:05}");
+            write_segment(
+                tmp.path(),
+                SegmentId(i as u64),
+                &[span(
+                    &id,
+                    "s0",
+                    None,
+                    "api",
+                    "GET /",
+                    1000 + i as i64 * 1000,
+                    Some(1000 + i as i64 * 1000 + 10),
+                    Some(10),
+                    None,
+                )],
+            )
+        })
+        .collect();
+    write_manifest(tmp.path(), entries);
+
+    // Keep only the last 50 segments' spans (starts 1000 + i*1000).
+    let kept = 50;
+    let start = 1000 + (PRUNE_FANOUT_SEGMENTS - kept) as i64 * 1000;
+    let r = SpanQueryRequest {
+        start_ts_nanos: start,
+        end_ts_nanos: i64::MAX,
+        query: None,
+        sort: SpanSort::Recent,
+        limit: PRUNE_FANOUT_SEGMENTS,
+        offset: 0,
+        projected_attributes: Vec::new(),
+    };
+    let res = engine(tmp.path()).search_traces(r).await.unwrap();
+
+    assert_eq!(
+        res.matched_count, kept as u64,
+        "the fanned prune must drop out-of-window files, not just reorder them"
+    );
+}
+
 // NOTE: These fixtures write the same on-disk artifacts (`data-spans/seg-*.parquet` + `.idx`
 // spans skip index + `manifest/spans-manifest.json`) that `photon_compact::SpanCompactor::run_once`
 // produces — via the exact `write_segment`/`write_parquet`/`write_idx`/`write_manifest` pattern

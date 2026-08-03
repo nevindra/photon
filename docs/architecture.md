@@ -97,7 +97,12 @@ the sort key → stream one zstd Parquet (level from `[storage] zstd_level`) + b
 `.idx` sidecar → append a `FileEntry` (carrying the Parquet's on-disk `bytes`, so `storage_stats` is
 manifest arithmetic rather than one `stat()` per file per sampler tick) to that signal's manifest →
 enqueue an async hot→durable replicate → a lower-frequency `merge_once` consolidates small files
-(**bounded per pass**, oldest-first, so a merge can't hold the whole small-file union in RAM) →
+**toward `MERGE_TARGET_ROWS` (150k rows)**, oldest-first so outputs stay time-adjacent and prune
+well, taking files until either that target or `MERGE_MAX_FILES_PER_PASS` is reached (**bounded per
+pass**, so a merge can't hold the whole small-file union in RAM). The target is an _output_ size,
+not an input filter — the earlier 10k-row input threshold made merging self-limiting (a pass's own
+output immediately counted as "large" and froze), which let the file population grow without bound
+under steady ingest →
 `purge_before(cutoff)` enforces retention. Both `merge_once` and `purge_before` also **enqueue async
 durable deletes** for the objects they unlink from hot, so the durable replica honors retention
 instead of accumulating every file ever written. (An empty/torn-tail segment compacts to zero rows
@@ -214,6 +219,15 @@ there is no `[[rum.apps]]` config surface anymore.
 
 Handlers live in `crates/photon-api/src/*.rs`; the aggregation logic they call lives in
 `photon-query`. Every route except the open ones requires the signed `photon_session` cookie.
+
+**Search-handler failure contract.** `POST /api/search`, `/api/traces/search`, and
+`/api/spans/search` return an empty page for a genuinely empty result (a fresh server prunes down
+to nothing and the engines return that on their `Ok` path), but a hard engine failure is a **500**
+carrying `{"error": ...}` — see `search::engine_failure`. These handlers used to log the error and
+return an empty-but-200 page, which rendered a `ResourcesExhausted` from the shared query pool as
+"your search matched nothing". The frontend mirrors this: `api.ts`'s mock fallback triggers only
+when there is no HTTP response at all (real dev-without-backend), never on a 4xx/5xx, so a failing
+backend can't be silently replaced with demo data.
 
 - **Ingest (gRPC + HTTP, bearer token):** gRPC `POST /v1/logs`, `/v1/traces`, `/v1/metrics` (OTLP); HTTP `POST /v1/logs`, `/v1/traces`, `/v1/metrics` (OTLP), `/api/v1/write` (Prometheus remote-write 1.0, snappy+protobuf). All share `[ingest].token`.
 - **Open (no session):** `POST /api/login`, `POST /api/setup` (first-run), `GET /api/session` (boot).
