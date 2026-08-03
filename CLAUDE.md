@@ -15,7 +15,7 @@ yet); RBAC/multi-tenancy/clustering are deliberately out of scope until there's 
   storage/durability, the `/api/*` surface, and the load-bearing invariants.
 - [`docs/subsystems/`](docs/subsystems/) — **one doc per feature**: `logs`, `traces`,
   `services-apm`, `metrics`, `rum` (incl. the `@photon/rum` SDK), `uptime`, `infra` (host/GPU
-  resource monitoring), `data`, `auth` — each with its key files, endpoints, and UI.
+  resource monitoring), `federation` (tenant egress + central aggregation), `data`, `auth` — each with its key files, endpoints, and UI.
 - [`docs/frontend.md`](docs/frontend.md) — the Vue app: routes/views, the `ui/` primitives, `lib/`.
 - [`docs/conventions.md`](docs/conventions.md) — conventions & gotchas.
 - [`README.md`](README.md) — the public-facing overview and positioning.
@@ -158,10 +158,11 @@ photon-compact  three per-signal compactors (Compactor/SpanCompactor/MetricsComp
 photon-query    three engines: QueryEngine (logs), SpanQueryEngine (traces/APM/RED), MetricsQueryEngine
                 (metrics + RUM vitals). Reassembles Prometheus classic histograms (`le`-bucket →
                 quantile) at query time. Manifest + skip-index pruning, then DataFusion over survivors.
-photon-ingest   OTLP gRPC (tonic) + HTTP (axum) receivers for logs/traces/metrics, mapping, token auth.
-                + Prometheus remote-write 1.0 (/api/v1/write, snappy+protobuf → metrics WAL). Both
-                front doors accept gzipped requests (stock OTel Collector gzips by default) and share
-                one `[ingest].max_body_bytes` cap (~16 MiB) enforced on the *decompressed* size.
+photon-ingest   OTLP gRPC (tonic) + HTTP (axum) receivers for logs/traces/metrics, mapping, token auth
+                (local token + federated tenant tokens). + Prometheus remote-write 1.0 (/api/v1/write,
+                snappy+protobuf → metrics WAL; rejects tenant tokens). Both front doors accept gzipped
+                requests (stock OTel Collector gzips by default) and share one `[ingest].max_body_bytes`
+                cap (~16 MiB) enforced on the *decompressed* size.
 photon-uptime   always-on synthetic HTTP/TCP/ICMP monitors → embedded SQLite. Trait: UptimeStore.
 photon-alerts   system-wide webhook alert engine: per-signal rules (metrics/logs/traces/RUM), a pure
                 Ok→Pending→Triggered state machine per (rule, series), SQLite rules/channels/incidents,
@@ -175,7 +176,8 @@ photon-api      axum REST + session auth (argon2, signed cookies) + embedded Vue
                 seams RumSink/RumAppStore/UserStore/UsageStore/ReplicationStatus/DataAdmin (photon-api
                 can't dep photon-wal).
 photon-server   the binary: config load, wiring, background-task supervision (3 compactor loops, the
-                alert-engine scheduler, etc.).
+                alert-engine scheduler, etc.). Optional `federation/` module spawns summary pusher
+                (tenant-side) and full-mode forwarder (both sides share the module; central runs forwarder only).
 photon-loadgen  dev-only OTLP/HTTP logs+traces+metrics load generator (its own binary).
 photon-agent    standalone host/GPU resource-metrics agent (its own binary, like photon-loadgen):
                 samples host (sysinfo) + NVIDIA GPU (nvml-wrapper, default-on `gpu` feature), POSTs

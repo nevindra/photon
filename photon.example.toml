@@ -127,3 +127,17 @@ default_apdex_threshold_ms = 500
 #     --host-name my-gpu-box                         # or $PHOTON_AGENT_HOST; defaults to the OS hostname
 # NVIDIA GPU sampling is on by default (falls back gracefully with no driver present); disable
 # with --no-gpu / $PHOTON_AGENT_NO_GPU=true. See docs/subsystems/infra.md.
+
+# --- Federation (tenant egress + central aggregation) ----------------------------------------
+# Optional [federation] config (omit the whole section to disable). Enables a tenant-side Photon
+# to push telemetry back to a central Photon instance, egress-only. Two modes:
+#   - "summary" (default): periodic health snapshots (ingest counters, incident count, disk usage)
+#   - "full" (opt-in): raw OTLP mirror (logs/traces/metrics) + summary, best-effort queue
+# Central stamps every federated record with a server-resolved `tenant` resource attribute
+# (client labels are overwritten for security). See docs/subsystems/federation.md.
+# [federation]
+# endpoint = "https://central.example.com:8080"    # required: central's public OTLP/HTTP endpoint
+# token = "tk_tenant_…"                            # required: per-tenant token (minted by central, never generated locally)
+# mode = "summary"                                 # optional: "summary" (default) or "full"
+# interval_secs = 30                               # optional: summary push interval in seconds (default 30, min 5)
+# queue_batches = 1024                             # optional: full-mode tee queue size (default 1024, min 16); dropped on overflow
