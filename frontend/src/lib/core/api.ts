@@ -606,9 +606,9 @@ export interface InfraSeriesResult {
   resource: string
   series: MetricSeries[]
 }
-// One process (a mandor worker) running on a host, with its latest resource usage over the window.
-// `cpuPct` is a percent (not a 0..1 ratio). Every numeric field is nullable — a process may report
-// CPU without every other metric present in the window.
+// One supervised process (keyed by `service.name`) running on a host, with its latest resource
+// usage over the window. `cpuPct` is a percent (not a 0..1 ratio). Every numeric field is nullable —
+// a process may report CPU without every other metric present in the window.
 export interface InfraProcess {
   process: string
   cpuPct: number | null

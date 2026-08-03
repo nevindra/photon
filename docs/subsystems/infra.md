@@ -138,8 +138,34 @@ already was, without adding a new storage engine:
 |---|---|
 | `GET /api/infra/hosts?start=<ns>&end=<ns>` | distinct hosts + latest CPU/memory/disk/GPU utilization vitals (`cpuUtil`/`memUtil`/`diskUtil`/`gpuUtil`, nullable fractions; `diskUtil`/`gpuUtil` are the WORST mountpoint/GPU, not a plain average) + `hasGpu` |
 | `GET /api/infra/hosts/:host?start=<ns>&end=<ns>` | one host's metadata (OS, cores, RAM, GPU names, last-seen) |
-| `GET /api/infra/hosts/:host/processes?start=<ns>&end=<ns>` | the mandor workers running on one host + their latest resource usage (`process`, `cpuPct` (a percent, not a fraction), `rssBytes`, `fds`, `threads`, `restarts` — all nullable; `lastSeenNs`). Processes are the distinct `service.name` values among `process.*` metrics scoped to the host, enumerated from `process.cpu.percent`. Powers the per-host Processes table |
+| `GET /api/infra/hosts/:host/processes?start=<ns>&end=<ns>` | the supervised processes running on one host + their latest resource usage (`process`, `cpuPct` (a percent, not a fraction), `rssBytes`, `fds`, `threads`, `restarts` — all nullable; `lastSeenNs`). Processes are the distinct `service.name` values among `process.*` metrics scoped to the host, enumerated from the CPU metric, and capped at the top 200 by CPU. Powers the per-host Processes table |
 | `GET /api/infra/hosts/:host/timeseries?resource=cpu\|memory\|disk\|network\|gpu\|gpu_memory\|gpu_temp\|gpu_power\|load&start=<ns>&end=<ns>&buckets=<n>` | curated bucketed series for one resource panel (`buckets` optional, default 48, clamped 1–500) |
+
+### Per-host processes (`infra_host_processes`)
+
+A process row is **one `service.name` on the host**: two instances of the same service on a host
+collapse into a single row and their gauges average together. (OTel would key finer on
+`process.pid` / `process.executable.name`; that finer identity is out of scope for this vertical.)
+The query enumerates processes from the CPU metric and caps the result at the top 200 by CPU
+(`PROC_ROW_CAP`), matching the repo's bounded-table convention.
+
+Metric names follow the OTel process semantic conventions as the **primary** contract, with the
+original bespoke names kept as a **fallback** so both OTel-Collector producers and pre-semconv
+producers work. A producer uses one scheme consistently, so the query picks the scheme from whichever
+CPU metric enumerates processes and reads every other gauge in that same scheme:
+
+| field | semconv (primary) | bespoke (fallback) | aggregation |
+|---|---|---|---|
+| cpu | `process.cpu.utilization` (0..1 → ×100 for the percent shown) | `process.cpu.percent` (already 0..100) | avg |
+| memory | `process.memory.usage` (bytes) | `process.memory.rss` | avg |
+| fds | `process.unix.file_descriptor.count` | `process.open_fds` | avg |
+| threads | `process.thread.count` | `process.threads` | avg |
+| restarts | *(no OTel semconv — Photon-specific extension)* | `process.restarts` | **max** |
+
+`process.restarts` has **no OTel semconv equivalent** — it is a Photon-specific extension emitted by
+supervised-process producers (e.g. a process supervisor like mandor). It is a cumulative counter, so
+it is aggregated with `max` (last value), not `avg`: averaging a 0→1→3 series would render a nonsense
+"1.3". All other gauges are window-averaged.
 
 Handler: `crates/photon-api/src/infra.rs`, registered in `crates/photon-api/src/lib.rs` alongside
 `/api/metrics/*`, behind the same session auth (`require_auth`) as the rest of the authenticated API.
@@ -189,19 +215,20 @@ convention as the RUM sub-routes).
     worst-first above the trend chart; and, only when `hasGpu`, a 4-card **GPU** section
     (Utilization/Memory/Temperature/Power), the device name(s) carried in the utilization card's
     subtitle.
-  Below the trend panels it renders a **Processes** table — every mandor worker on the host, one row
-  per `service.name`, driven by `useInfraHostProcesses(host, startNs, endNs)` (`GET
-  /api/infra/hosts/:host/processes`, 15s poll). Columns: Process, CPU %, RSS (human-readable via
-  `formatBytes`), FDs, Threads, Restarts; all header cells are click-to-sort, defaulting to CPU
-  descending so the heaviest process is on top (nulls sort last). Covered by
-  `InfraHostDetailView.test.ts`.
+  Below the trend panels it renders the **`HostProcessesTable`** component — every supervised process
+  on the host, one row per `service.name`, driven by `useInfraHostProcesses(host, startNs, endNs)`
+  (`GET /api/infra/hosts/:host/processes`, 15s poll). Built on the shared `ui/table` primitives with
+  columns Process, CPU %, RSS (human-readable via `formatBytes`), FDs, Threads, Restarts; all header
+  cells are click-to-sort (lucide `ArrowUp`/`ArrowDown` indicator), defaulting to CPU descending so
+  the heaviest process is on top (nulls sort last, rendered as `—`), with an `EmptyState` when no
+  process is reporting. Covered by `InfraHostDetailView.test.ts`.
   On mount, sets the global scope to `{ type: 'host', id: host, label: host }` via `lib/core/context.ts`'s
   `setScope`, so the time range + host scope carry through `AppShell`'s `ContextBar` and the
   "Related ▾" menu (`RelatedMenu`) the same way a service or RUM app scope would.
 - **Components** (`frontend/src/components/infra/`): `HostFleetKpis.vue`, `HostCard.vue`,
-  `HostStatTiles.vue`, `HostResourcePanels.vue` — together reuse existing primitives (`ui/card`,
-  `ui/meter`, `ui/segmented`, `ui/sparkline`, `ui/stat-tile`, `charts/ChartPanel`,
-  `components/metrics/MetricChart.vue`), no bespoke chart code.
+  `HostStatTiles.vue`, `HostResourcePanels.vue`, `HostProcessesTable.vue` — together reuse existing
+  primitives (`ui/card`, `ui/meter`, `ui/segmented`, `ui/sparkline`, `ui/stat-tile`, `ui/table`,
+  `ui/empty-state`, `charts/ChartPanel`, `components/metrics/MetricChart.vue`), no bespoke chart code.
 - **Queries** (`frontend/src/lib/infra/infraQueries.ts`): `useInfraHosts`, `useInfraHost`,
   `useInfraHostSeries` (one resource at a time) and `useHostResourceSeries` (the nine-query bundle
   above, hoisted once per host-detail view so its children share one cache read) — same TanStack

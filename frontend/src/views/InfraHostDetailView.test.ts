@@ -10,6 +10,7 @@ import { createRouter, createMemoryHistory } from 'vue-router'
 import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { customRange, clearScope, setTimeRange } from '@/lib/core/context'
+import { api } from '@/lib/core/api'
 import InfraHostDetailView from './InfraHostDetailView.vue'
 
 // NOTE: `vi.mock` is hoisted to the top of the file, so its factory must not close over any
@@ -109,6 +110,36 @@ describe('InfraHostDetailView processes table', () => {
     // Ascending now: cron-loop (3.1) < worker (18.3) < api (42.5).
     expect(rows[0].attributes('data-process')).toBe('cron-loop')
     expect(rows[2].attributes('data-process')).toBe('api')
+
+    wrapper.unmount()
+  })
+
+  it('renders null numeric metrics as — and sorts them last', async () => {
+    // A process reporting only CPU — every other numeric metric is null this window.
+    vi.mocked(api.infraHostProcesses).mockResolvedValueOnce({
+      processes: [
+        { process: 'api', cpuPct: 42.5, rssBytes: 512 * 1024 ** 2, fds: 128, threads: 12, restarts: 1, lastSeenNs: '1700000000000000000' },
+        { process: 'sidecar', cpuPct: 1.4, rssBytes: null, fds: null, threads: null, restarts: null, lastSeenNs: '1700000000000000000' },
+      ],
+    })
+    const { wrapper } = await mountView()
+    await flushPromises()
+
+    // The null-metric row renders every missing numeric as an em dash.
+    const sidecar = wrapper.findAll('[data-testid="process-row"]').find((r) => r.attributes('data-process') === 'sidecar')
+    expect(sidecar).toBeTruthy()
+    expect(sidecar!.text()).toContain('—')
+
+    // Sort by RSS descending: the row whose rssBytes is null sorts last regardless of direction.
+    const rssHeader = wrapper.findAll('th').find((th) => th.text().startsWith('RSS'))
+    await rssHeader!.trigger('click') // -> desc
+    let rows = wrapper.findAll('[data-testid="process-row"]')
+    expect(rows[rows.length - 1].attributes('data-process')).toBe('sidecar')
+
+    // And still last when the same column is toggled to ascending.
+    await rssHeader!.trigger('click') // -> asc
+    rows = wrapper.findAll('[data-testid="process-row"]')
+    expect(rows[rows.length - 1].attributes('data-process')).toBe('sidecar')
 
     wrapper.unmount()
   })

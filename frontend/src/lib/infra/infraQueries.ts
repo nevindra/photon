@@ -47,7 +47,7 @@ export function useInfraHost(
   })
 }
 
-// Per-host process (mandor worker) roster + resource usage for the Processes table. Polls every
+// Per-host supervised-process roster + resource usage for the Processes table. Polls every
 // 15s like the other host queries and keeps the previous host/window's rows on screen across a
 // change (`keepPreviousData`), gated on a non-empty host like `useInfraHost`.
 export function useInfraHostProcesses(

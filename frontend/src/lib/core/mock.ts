@@ -1665,14 +1665,25 @@ export function mockInfraHost(host: string): InfraHostDetail {
   }
 }
 
-// Per-host process (mandor worker) rosters for the Processes table. `api` is deliberately the
-// heaviest CPU worker so the default CPU-desc sort has something to prove. Field names match the
-// real API's camelCase JSON exactly (cpuPct/rssBytes/fds/threads/restarts/lastSeenNs).
-const INFRA_PROCESSES: Record<string, { process: string; cpuPct: number; rssBytes: number; fds: number; threads: number; restarts: number }[]> = {
+// Per-host supervised-process rosters for the Processes table. `api` is deliberately the heaviest
+// CPU process so the default CPU-desc sort has something to prove. Field names match the real API's
+// camelCase JSON exactly (cpuPct/rssBytes/fds/threads/restarts/lastSeenNs).
+type MockProcess = {
+  process: string
+  cpuPct: number | null
+  rssBytes: number | null
+  fds: number | null
+  threads: number | null
+  restarts: number | null
+}
+const INFRA_PROCESSES: Record<string, MockProcess[]> = {
   'web-1': [
     { process: 'api', cpuPct: 42.5, rssBytes: 512 * 1024 ** 2, fds: 128, threads: 12, restarts: 0 },
     { process: 'worker', cpuPct: 18.3, rssBytes: 256 * 1024 ** 2, fds: 64, threads: 8, restarts: 2 },
     { process: 'cron-loop', cpuPct: 3.1, rssBytes: 48 * 1024 ** 2, fds: 16, threads: 3, restarts: 0 },
+    // A process reporting only CPU — every other metric is missing this window (renders as `—`,
+    // and its nulls sort last regardless of the active sort column).
+    { process: 'sidecar', cpuPct: 1.4, rssBytes: null, fds: null, threads: null, restarts: null },
   ],
   'web-2': [
     { process: 'api', cpuPct: 51.2, rssBytes: 640 * 1024 ** 2, fds: 160, threads: 14, restarts: 1 },
