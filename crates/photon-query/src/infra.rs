@@ -684,6 +684,7 @@ impl MetricsQueryEngine {
     /// `process.restarts` cumulative counter). Host-scoped like `host_latest_scalar` (skip-index
     /// prune + `host.name = <host>` predicate). Processes absent from `out` (no CPU signal) are
     /// ignored — this only enriches known processes, mirroring `fill_latest_gauge`.
+    #[allow(clippy::too_many_arguments)]
     async fn fill_process_gauge(
         &self,
         out: &mut BTreeMap<String, ProcessSummary>,
