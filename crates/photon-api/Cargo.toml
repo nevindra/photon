@@ -37,3 +37,9 @@ tower-http = { workspace = true, features = ["cors", "compression-gzip", "compre
 tempfile = "3"
 parquet = { workspace = true }
 tower = "0.5"
+# Only for tenants.rs's `/api/tenants/summary` test: seed a real compacted MetricsQueryEngine
+# (WAL -> MetricsCompactor -> hot dir), mirroring photon-query/tests/metric_query.rs.
+photon-wal = { path = "../photon-wal" }
+photon-compact = { path = "../photon-compact" }
+photon-storage = { path = "../photon-storage" }
+object_store = { workspace = true }

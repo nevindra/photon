@@ -10,9 +10,14 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use photon_core::metric_agg::Agg;
+use photon_core::query::{
+    MetricFieldResolver, MetricResolvedKind, MetricResolvedQuery, MetricResolvedTerm,
+};
 use photon_core::{PhotonError, TenantTokenMap};
+use photon_query::{MetricSeriesRequest, MetricsQueryEngine, SeriesPoint};
 use rusqlite::{params, Connection};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Mutex;
 
@@ -423,6 +428,229 @@ pub(crate) async fn delete_tenant(
     }
 }
 
+// ---------------------------------------------------------------------------
+// `GET /api/tenants/summary` — the curated Home-board endpoint: one round trip over the four
+// `photon.federation.*` metrics per tenant instead of N `/api/metrics/query` calls from the UI.
+// ---------------------------------------------------------------------------
+
+/// Curated per-tenant health snapshot for the Home tenant board.
+#[derive(Debug, Clone, Serialize)]
+pub struct TenantSummary {
+    pub name: String,
+    /// From the `mode` attr of `photon.federation.up`; `None` = never reported (in this window).
+    pub mode: Option<String>,
+    /// `"up" | "stale" | "down"`.
+    pub status: String,
+    /// Unix milliseconds; `0` = never.
+    pub last_seen_ms: i64,
+    /// Differenced from `photon.federation.ingest.rows` (summed across signals) over the window.
+    pub ingest_rows_per_sec: f64,
+    /// Latest `photon.federation.incidents.open`.
+    pub open_incidents: f64,
+    /// Sum of the latest `photon.federation.disk.hot_bytes` across signals.
+    pub hot_bytes: f64,
+    pub ui_url: Option<String>,
+    /// `(ms, rows/sec)` points for the card sparkline.
+    pub spark: Vec<(i64, f64)>,
+}
+
+/// Central doesn't know each tenant's configured `interval_secs`, so staleness is a fixed
+/// threshold rather than a multiple of it — revisit if per-tenant configurable intervals land.
+const SUMMARY_FRESH_AFTER_SECS: i64 = 120;
+const SUMMARY_STALE_AFTER_SECS: i64 = 600;
+const SUMMARY_WINDOW_SECS: i64 = 15 * 60;
+const SUMMARY_BUCKETS: usize = 30;
+
+/// `tenant:"{name}"` as a resolved metrics filter, built directly (no grammar round trip needed —
+/// tenant names are always `[a-z0-9-]{1,64}`, so resolution can't fail).
+fn tenant_metric_filter(name: &str, promoted: &[String]) -> MetricResolvedQuery {
+    let field = MetricFieldResolver::new(promoted)
+        .resolve_field_name("tenant")
+        .expect("resolve_field_name never errors on a plain label name");
+    MetricResolvedQuery {
+        terms: vec![MetricResolvedTerm {
+            negated: false,
+            kind: MetricResolvedKind::Match {
+                field,
+                values: vec![name.to_string()],
+            },
+        }],
+    }
+}
+
+/// The latest non-null value of a metric over the window (group_by=[] so at most one series).
+async fn latest_value(
+    engine: &MetricsQueryEngine,
+    metric: &str,
+    agg: Agg,
+    filter: &MetricResolvedQuery,
+    start: i64,
+    end: i64,
+) -> f64 {
+    let req = MetricSeriesRequest {
+        metric: metric.to_string(),
+        agg: Some(agg),
+        group_by: vec![],
+        filter: Some(filter.clone()),
+        start_ts_nanos: start,
+        end_ts_nanos: end,
+        buckets: SUMMARY_BUCKETS,
+    };
+    let series = engine
+        .query_series(req)
+        .await
+        .map(|r| r.series)
+        .unwrap_or_default();
+    series
+        .first()
+        .and_then(|s| s.points.iter().rev().find_map(|p| p.v))
+        .unwrap_or(0.0)
+}
+
+/// Headline rows/sec (last-minus-first of the cumulative sum, divided by the fixed window,
+/// clamped at 0 so a counter reset never reads as negative throughput) + a sparkline of the
+/// bucket-to-bucket rate.
+fn rate_and_spark(points: &[SeriesPoint]) -> (f64, Vec<(i64, f64)>) {
+    let present: Vec<&SeriesPoint> = points.iter().filter(|p| p.v.is_some()).collect();
+    let ingest_rows_per_sec = match (present.first(), present.last()) {
+        (Some(a), Some(b)) => ((b.v.unwrap() - a.v.unwrap()) / SUMMARY_WINDOW_SECS as f64).max(0.0),
+        _ => 0.0,
+    };
+    let spark = present
+        .windows(2)
+        .filter_map(|w| {
+            let dt_secs = (w[1].t - w[0].t) as f64 / 1e9;
+            if dt_secs <= 0.0 {
+                return None;
+            }
+            let rate = ((w[1].v.unwrap() - w[0].v.unwrap()) / dt_secs).max(0.0);
+            Some((w[1].t / 1_000_000, rate))
+        })
+        .collect();
+    (ingest_rows_per_sec, spark)
+}
+
+async fn build_tenant_summary(
+    engine: &MetricsQueryEngine,
+    tenant: &Tenant,
+    promoted: &[String],
+    now_ms: i64,
+) -> TenantSummary {
+    let end = now_ms * 1_000_000;
+    let start = end - SUMMARY_WINDOW_SECS * 1_000_000_000;
+    let filter = tenant_metric_filter(&tenant.name, promoted);
+
+    let up_req = MetricSeriesRequest {
+        metric: "photon.federation.up".to_string(),
+        agg: None,
+        group_by: vec!["mode".to_string()],
+        filter: Some(filter.clone()),
+        start_ts_nanos: start,
+        end_ts_nanos: end,
+        buckets: SUMMARY_BUCKETS,
+    };
+    let up_series = engine
+        .query_series(up_req)
+        .await
+        .map(|r| r.series)
+        .unwrap_or_default();
+    let mut last_seen_ns = 0i64;
+    let mut mode = None;
+    for s in &up_series {
+        for p in &s.points {
+            if p.v.is_some() && p.t > last_seen_ns {
+                last_seen_ns = p.t;
+                mode = s.labels.get("mode").cloned();
+            }
+        }
+    }
+    let last_seen_ms = if last_seen_ns > 0 {
+        last_seen_ns / 1_000_000
+    } else {
+        0
+    };
+    let age_secs = if last_seen_ms > 0 {
+        (now_ms - last_seen_ms) / 1000
+    } else {
+        i64::MAX
+    };
+    let status = if age_secs <= SUMMARY_FRESH_AFTER_SECS {
+        "up"
+    } else if age_secs <= SUMMARY_STALE_AFTER_SECS {
+        "stale"
+    } else {
+        "down"
+    };
+
+    let rows_req = MetricSeriesRequest {
+        metric: "photon.federation.ingest.rows".to_string(),
+        agg: Some(Agg::Sum),
+        group_by: vec![],
+        filter: Some(filter.clone()),
+        start_ts_nanos: start,
+        end_ts_nanos: end,
+        buckets: SUMMARY_BUCKETS,
+    };
+    let rows_series = engine
+        .query_series(rows_req)
+        .await
+        .map(|r| r.series)
+        .unwrap_or_default();
+    let (ingest_rows_per_sec, spark) = rows_series
+        .first()
+        .map(|s| rate_and_spark(&s.points))
+        .unwrap_or_default();
+
+    let open_incidents = latest_value(
+        engine,
+        "photon.federation.incidents.open",
+        Agg::Last,
+        &filter,
+        start,
+        end,
+    )
+    .await;
+    let hot_bytes = latest_value(
+        engine,
+        "photon.federation.disk.hot_bytes",
+        Agg::Sum,
+        &filter,
+        start,
+        end,
+    )
+    .await;
+
+    TenantSummary {
+        name: tenant.name.clone(),
+        mode,
+        status: status.to_string(),
+        last_seen_ms,
+        ingest_rows_per_sec,
+        open_incidents,
+        hot_bytes,
+        ui_url: tenant.ui_url.clone(),
+        spark,
+    }
+}
+
+/// `GET /api/tenants/summary` — curated per-tenant health for the Home board.
+pub(crate) async fn summary(State(st): State<AppState>) -> Response {
+    let Some(api) = st.tenants.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let list = match api.list().await {
+        Ok(l) => l,
+        Err(e) => return err_500(e),
+    };
+    let promoted = st.metrics_query.promoted_attributes().to_vec();
+    let now = now_ms();
+    let mut out = Vec::with_capacity(list.len());
+    for t in &list {
+        out.push(build_tenant_summary(&st.metrics_query, t, &promoted, now).await);
+    }
+    Json(out).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,10 +748,7 @@ mod tests {
         assert!(validate_tenant_name("").is_err(), "empty");
         assert!(validate_tenant_name("Acme").is_err(), "uppercase");
         assert!(validate_tenant_name("ac me").is_err(), "spaces");
-        assert!(
-            validate_tenant_name(&"a".repeat(65)).is_err(),
-            "too long"
-        );
+        assert!(validate_tenant_name(&"a".repeat(65)).is_err(), "too long");
     }
 
     #[test]
@@ -708,6 +933,209 @@ mod tests {
     async fn disabled_subsystem_404s() {
         let state = crate::test_state_with_tenants(None);
         let resp = list_tenants(axum::extract::State(state)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- GET /api/tenants/summary ---------------------------------------------------------
+
+    fn tenant_attrs(
+        tenant: &str,
+        extra: &[(&str, &str)],
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut a = std::collections::BTreeMap::new();
+        a.insert("tenant".to_string(), tenant.to_string());
+        for (k, v) in extra {
+            a.insert((*k).to_string(), (*v).to_string());
+        }
+        a
+    }
+
+    fn up_point(tenant: &str, mode: &str, ts: i64) -> photon_core::metric_record::MetricPoint {
+        photon_core::metric_record::MetricPoint {
+            metric_name: "photon.federation.up".to_string(),
+            metric_type: photon_core::metric_schema::metric_type::GAUGE,
+            timestamp_nanos: ts,
+            value: Some(1.0),
+            attributes: tenant_attrs(tenant, &[("mode", mode)]),
+            ..Default::default()
+        }
+    }
+
+    fn rows_point(tenant: &str, ts: i64, value: f64) -> photon_core::metric_record::MetricPoint {
+        photon_core::metric_record::MetricPoint {
+            metric_name: "photon.federation.ingest.rows".to_string(),
+            metric_type: photon_core::metric_schema::metric_type::SUM,
+            temporality: Some(2), // cumulative
+            is_monotonic: Some(true),
+            timestamp_nanos: ts,
+            start_timestamp_nanos: Some(0),
+            value: Some(value),
+            attributes: tenant_attrs(tenant, &[("signal", "logs")]),
+            ..Default::default()
+        }
+    }
+
+    fn incidents_point(
+        tenant: &str,
+        ts: i64,
+        value: f64,
+    ) -> photon_core::metric_record::MetricPoint {
+        photon_core::metric_record::MetricPoint {
+            metric_name: "photon.federation.incidents.open".to_string(),
+            metric_type: photon_core::metric_schema::metric_type::GAUGE,
+            timestamp_nanos: ts,
+            value: Some(value),
+            attributes: tenant_attrs(tenant, &[]),
+            ..Default::default()
+        }
+    }
+
+    fn hot_bytes_point(
+        tenant: &str,
+        ts: i64,
+        value: f64,
+    ) -> photon_core::metric_record::MetricPoint {
+        photon_core::metric_record::MetricPoint {
+            metric_name: "photon.federation.disk.hot_bytes".to_string(),
+            metric_type: photon_core::metric_schema::metric_type::GAUGE,
+            timestamp_nanos: ts,
+            value: Some(value),
+            attributes: tenant_attrs(tenant, &[("signal", "logs")]),
+            ..Default::default()
+        }
+    }
+
+    /// Ingest -> compact -> engine, mirroring `photon-query/tests/metric_query.rs`'s
+    /// `engine_with`. Promoted attributes are just `tenant` (this endpoint's only filter/group
+    /// column). The `tempfile::TempDir` is leaked into the return so the hot dir outlives the
+    /// test.
+    async fn engine_with(
+        points: Vec<photon_core::metric_record::MetricPoint>,
+    ) -> (MetricsQueryEngine, tempfile::TempDir) {
+        use photon_core::config::WalConfig;
+        use photon_core::metric_record::MetricBatchBuilder;
+        use photon_core::metric_schema::{metric_type, MetricSchema};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let hot_dir = tmp.path().to_path_buf();
+        // Sort keys `service.name`/`host.name` must exist as columns even though this test never
+        // populates them (metrics_compactor.rs's `sort_metrics` requires both unconditionally,
+        // mirroring how `photon-server` always injects `host.name` into the real schema).
+        let schema = MetricSchema::new(&[
+            "service.name".to_string(),
+            "host.name".to_string(),
+            "tenant".to_string(),
+        ]);
+        let wal_cfg = WalConfig {
+            segment_max_bytes: 1,
+            segment_max_age_secs: 0,
+            group_commit_max_delay_ms: 0,
+        };
+        let wal = std::sync::Arc::new(
+            photon_wal::DiskWal::open_arrow(
+                hot_dir.join("wal-metrics"),
+                schema.arrow.clone(),
+                wal_cfg,
+            )
+            .await
+            .unwrap(),
+        );
+        for p in &points {
+            let mut b = MetricBatchBuilder::new(&schema);
+            b.append(p);
+            wal.append(b.finish().unwrap()).await.unwrap();
+            wal.sync().await.unwrap();
+        }
+        // Trailing append (far before any test window) to close the last real data segment.
+        let seal = photon_core::metric_record::MetricPoint {
+            metric_name: "__seal__".to_string(),
+            metric_type: metric_type::GAUGE,
+            timestamp_nanos: 1,
+            value: Some(0.0),
+            attributes: tenant_attrs("__seal__", &[]),
+            ..Default::default()
+        };
+        let mut tail = MetricBatchBuilder::new(&schema);
+        tail.append(&seal);
+        wal.append(tail.finish().unwrap()).await.unwrap();
+        wal.sync().await.unwrap();
+
+        let storage = photon_storage::Storage {
+            hot: std::sync::Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(&hot_dir).unwrap(),
+            ),
+            durable: None,
+            hot_dir: Some(hot_dir.clone()),
+        };
+        let replicator = std::sync::Arc::new(photon_storage::Replicator::new(storage.clone()));
+        let compactor =
+            photon_compact::MetricsCompactor::new(wal.clone(), storage, replicator, schema.clone());
+        while compactor.run_once().await.unwrap().is_some() {}
+
+        (MetricsQueryEngine::new(hot_dir, schema).unwrap(), tmp)
+    }
+
+    fn now_nanos() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64
+    }
+
+    #[tokio::test]
+    async fn summary_reports_fresh_and_never_reported_tenants() {
+        let now = now_nanos();
+        let points = vec![
+            up_point("acme", "summary", now - 5_000_000_000),
+            rows_point("acme", now - 600_000_000_000, 0.0),
+            rows_point("acme", now - 5_000_000_000, 300.0),
+            incidents_point("acme", now - 5_000_000_000, 2.0),
+            hot_bytes_point("acme", now - 5_000_000_000, 4096.0),
+        ];
+        let (engine, _tmp) = engine_with(points).await;
+
+        let store = SqliteTenantStore::open_in_memory().unwrap();
+        store.create(&tenant("acme", "tk_acme")).await.unwrap();
+        store
+            .create(&tenant("initech", "tk_initech"))
+            .await
+            .unwrap();
+        let api = TenantApi::new(std::sync::Arc::new(store), TenantTokenMap::default())
+            .await
+            .unwrap();
+
+        let state = crate::test_state_with_tenants_and_metrics(Some(api), engine);
+        let resp = summary(axum::extract::State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Vec<Value> = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let acme = body.iter().find(|t| t["name"] == "acme").unwrap();
+        assert_eq!(acme["status"], "up");
+        assert_eq!(acme["mode"], "summary");
+        assert!(acme["last_seen_ms"].as_i64().unwrap() > 0);
+        assert!(
+            acme["ingest_rows_per_sec"].as_f64().unwrap() > 0.0,
+            "acme: {acme}"
+        );
+        assert_eq!(acme["open_incidents"], 2.0);
+        assert_eq!(acme["hot_bytes"], 4096.0);
+
+        let initech = body.iter().find(|t| t["name"] == "initech").unwrap();
+        assert_eq!(initech["status"], "down");
+        assert_eq!(initech["mode"], Value::Null);
+        assert_eq!(initech["last_seen_ms"], 0);
+        assert_eq!(initech["ingest_rows_per_sec"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn summary_disabled_subsystem_404s() {
+        let state = crate::test_state_with_tenants(None);
+        let resp = summary(axum::extract::State(state)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

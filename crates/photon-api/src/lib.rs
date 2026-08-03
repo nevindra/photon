@@ -368,6 +368,7 @@ impl ApiServer {
                 "/tenants",
                 get(tenants::list_tenants).post(tenants::create_tenant),
             )
+            .route("/tenants/summary", get(tenants::summary))
             .route(
                 "/tenants/:name",
                 axum::routing::patch(tenants::update_tenant).delete(tenants::delete_tenant),
@@ -502,6 +503,33 @@ pub(crate) fn test_state_with_rum(rum: Option<rum::RumApi>) -> AppState {
         rum,
         alerts: s.alerts,
         tenants: s.tenants,
+        federation: s.federation,
+    }))
+}
+
+/// An [`AppState`] over the seeded test server, carrying the given tenant registry and a
+/// caller-supplied `metrics_query` engine (so `tenants.rs`'s `/api/tenants/summary` test can seed
+/// real compacted `photon.federation.*` data instead of the empty engine `test_server()` builds).
+#[cfg(test)]
+pub(crate) fn test_state_with_tenants_and_metrics(
+    tenants: Option<tenants::TenantApi>,
+    metrics_query: MetricsQueryEngine,
+) -> AppState {
+    let s = test_server();
+    AppState(Arc::new(AppStateInner {
+        query: s.query,
+        span_query: s.span_query,
+        metrics_query,
+        users: s.users,
+        key: s.key,
+        uptime: s.uptime,
+        data: s.data,
+        live: s.live,
+        usage: s.usage,
+        replication: s.replication,
+        rum: s.rum,
+        alerts: s.alerts,
+        tenants,
         federation: s.federation,
     }))
 }
