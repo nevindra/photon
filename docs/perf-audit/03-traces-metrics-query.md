@@ -221,17 +221,30 @@ invariants (pruning stays conservative, local-fs-only, two-pass logs untouched).
   (0.104 ms/file), which is why the symptom read as erratic rather than slow. This — not data
   volume — was the dominant cost: the deployment was only ingesting ~68 spans/s (~400 MB/day).
 - **Fixed by:** fanning the candidate list across the blocking pool in `PRUNE_CHUNKS` (64)
-  contiguous slices once it exceeds `PRUNE_PARALLEL_MIN_CANDIDATES` (64) — `span_prune_fanned`.
-  Chunks re-derive `candidates()` from a shared `Arc<Manifest>` (a pure in-memory filter) rather
-  than cloning `FileEntry`s, and are awaited in order so the survivor list stays byte-identical to
-  the sequential prune's. Measured on the same disk: **2.43 ms/file at 64-way, a ~4.5x speedup**.
+  contiguous slices once it exceeds `PRUNE_PARALLEL_MIN_CANDIDATES` (64). Chunks re-derive
+  `candidates()` from a shared `Arc<Manifest>` (a pure in-memory filter) rather than cloning
+  `FileEntry`s, and are awaited in order so the survivor list stays byte-identical to the
+  sequential prune's. Measured on the same disk: **2.43 ms/file at 64-way, a ~4.5x speedup**.
   Concurrency sweep: 1→10.89, 4→4.69, 8→4.37, 16→3.40, 32→2.75, 64→2.43 ms/file.
-- **Effort/Risk:** S / low. **Still sequential in the logs and metrics engines** and in
-  `trace_candidates` — same fix applies, not yet done.
+  **Applied to all three engines** — `span_prune_fanned` (`span_engine.rs`), `prune_fanned`
+  (`lib.rs`, logs) and `prune_fanned` (`metric_engine.rs`, metrics). Both constants live once in
+  `lib.rs` and are shared: unlike the per-signal query logic, the disk behaviour they compensate
+  for is a property of the machine, not the signal. Each engine keeps its **sequential** `prune`
+  as-is for its synchronous callers (`metric_catalog.rs`) and unit tests; only the DataFrame path
+  fans out.
+- **Effort/Risk:** S / low. `span_engine.rs::trace_candidates` (the `get_trace` path) is still
+  sequential — deliberately: a `time_hint` narrows it to a ±1 h window, so its candidate list is
+  normally far below the fan-out threshold and would take the inline branch anyway.
 - **Invariant check:** Pruning stays conservative (a missing/undecodable `.idx` still keeps the
   file); slicing is by index over one immutable manifest snapshot, so no candidate is dropped or
-  double-counted at a chunk boundary (`fanned_prune_over_many_segments_keeps_every_matching_file`,
-  `fanned_prune_still_drops_out_of_window_files`).
+  double-counted at a chunk boundary. Spans and logs assert this end-to-end over a 205-segment
+  corpus (`fanned_prune_over_many_segments_keeps_every_matching_file` /
+  `…_matching_row`, plus `fanned_prune_still_drops_out_of_window_files`); metrics asserts the
+  stronger property directly — `prune_fanned` is compared **file-for-file against `prune`** on the
+  same corpus, both on a full scan and a narrowed window, with alternating metric names so the
+  bloom really drops about half the files rather than the equivalence holding vacuously
+  (`fanned_prune_matches_sequential_prune_file_for_file`,
+  `fanned_prune_matches_sequential_prune_on_a_narrowed_window`).
 
 ### F11 — histogram cumulative bounds taken from first row only · P3 · correctness
 - **Where:** `metric_dist.rs:301-347` (`histogram_series`): canonical `bounds` = first row with

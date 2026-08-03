@@ -21,7 +21,9 @@ use photon_storage::Storage;
 
 use crate::metric_predicate::metric_resolved_query_to_expr;
 use crate::metric_query::ProbeMeta;
-use crate::{cached_manifest, col_ref, session, ManifestCache};
+use crate::{
+    cached_manifest, col_ref, session, ManifestCache, PRUNE_CHUNKS, PRUNE_PARALLEL_MIN_CANDIDATES,
+};
 
 #[derive(Clone)]
 pub struct MetricsQueryEngine {
@@ -258,6 +260,63 @@ impl MetricsQueryEngine {
         Ok(surviving)
     }
 
+    /// [`prune`](Self::prune), fanned across the blocking pool in [`PRUNE_CHUNKS`] contiguous
+    /// slices once the candidate list is big enough to be worth it.
+    ///
+    /// Each chunk re-derives `manifest.candidates(..)` from the same `Arc<Manifest>` and walks only
+    /// its own index range — a pure in-memory filter, cheaper than cloning every `FileEntry` into
+    /// the tasks. Chunks are awaited **in order** and concatenated, so the surviving-file list is
+    /// byte-identical to the sequential prune's.
+    async fn prune_fanned(&self, req: &MetricRequest) -> Result<Vec<String>, PhotonError> {
+        let manifest = self.load_metrics_manifest()?;
+        let total = manifest
+            .candidates(req.start_ts_nanos, req.end_ts_nanos)
+            .len();
+
+        if total < PRUNE_PARALLEL_MIN_CANDIDATES {
+            let engine = self.clone();
+            let req = req.clone();
+            return spawn_blocking(move || engine.prune(&req))
+                .await
+                .map_err(|e| PhotonError::Query(format!("metrics prune task panicked: {e}")))?;
+        }
+
+        let chunk = total.div_ceil(PRUNE_CHUNKS);
+        let mut tasks = Vec::with_capacity(PRUNE_CHUNKS);
+        for lo in (0..total).step_by(chunk) {
+            let hi = (lo + chunk).min(total);
+            let engine = self.clone();
+            let req = req.clone();
+            let manifest = Arc::clone(&manifest);
+            tasks.push(spawn_blocking(move || {
+                let candidates = manifest.candidates(req.start_ts_nanos, req.end_ts_nanos);
+                let mut kept: Vec<String> = Vec::new();
+                for entry in &candidates[lo..hi] {
+                    if engine.keep_candidate(entry, &req.metric, req.host.as_deref())? {
+                        kept.push(
+                            engine
+                                .hot_dir
+                                .join(&entry.path)
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                }
+                Ok::<Vec<String>, PhotonError>(kept)
+            }));
+        }
+
+        let mut surviving = Vec::new();
+        for task in tasks {
+            surviving.extend(
+                task.await.map_err(|e| {
+                    PhotonError::Query(format!("metrics prune task panicked: {e}"))
+                })??,
+            );
+        }
+        Ok(surviving)
+    }
+
     /// Decide whether a candidate file survives pruning. `manifest.candidates()` already filtered
     /// on time overlap; the extra pruning power is the `metric_name` bloom — a single-token check,
     /// like the spans `trace_id` bloom — plus, when a host is requested, the skip-index `host.name`
@@ -332,11 +391,7 @@ impl MetricsQueryEngine {
                 .map_err(|e| PhotonError::Query(format!("read test metrics batch: {e}")))?;
             return Ok(Some(df));
         }
-        let engine = self.clone();
-        let req_c = req.clone();
-        let surviving = spawn_blocking(move || engine.prune(&req_c))
-            .await
-            .map_err(|e| PhotonError::Query(format!("metrics prune task panicked: {e}")))??;
+        let surviving = self.prune_fanned(req).await?;
         if surviving.is_empty() {
             return Ok(None);
         }
@@ -568,6 +623,104 @@ mod tests {
         assert_eq!(s.file_count, 2);
         // 999 (recorded field, proving no stat of the 100-byte file) + 250 (legacy fallback stat).
         assert_eq!(s.bytes, 999 + 250);
+    }
+
+    /// Comfortably past `PRUNE_PARALLEL_MIN_CANDIDATES` (64) so pruning takes the fanned path, and
+    /// not an exact multiple of `PRUNE_CHUNKS` (64) — so the final chunk is a short one and any
+    /// off-by-one in the `lo..hi` slicing shows up as a lost or duplicated file.
+    const PRUNE_FANOUT_SEGMENTS: usize = 205;
+
+    /// The fan-out slices the candidate list by index across the blocking pool, so it must return
+    /// EXACTLY what the sequential prune returns — same files, same order, no chunk-boundary drop
+    /// or duplicate. Asserted directly against `prune` rather than through a query, so the two
+    /// implementations are compared on the same corpus with nothing in between.
+    ///
+    /// Alternating metric names means the `metric_name` bloom genuinely drops about half the
+    /// files: an equivalence that only held because everything survived would prove nothing.
+    #[tokio::test]
+    async fn fanned_prune_matches_sequential_prune_file_for_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().to_path_buf();
+        let schema = MetricSchema::new(&["service.name".to_string(), "host.name".to_string()]);
+
+        let segments: Vec<(SegmentId, Vec<RecordBatch>)> = (0..PRUNE_FANOUT_SEGMENTS)
+            .map(|i| {
+                let name = if i % 2 == 0 { "cpu.usage" } else { "mem.usage" };
+                (
+                    SegmentId(i as u64),
+                    vec![batch(&schema, &[point(name, 1000 + i as i64 * 1000)])],
+                )
+            })
+            .collect();
+        compact(&hot, &schema, segments).await;
+
+        let engine = MetricsQueryEngine::new(hot, schema).unwrap();
+        let req = MetricRequest {
+            metric: "cpu.usage".to_string(),
+            start_ts_nanos: 0,
+            end_ts_nanos: i64::MAX,
+            filter: None,
+            host: None,
+        };
+
+        let sequential = engine.prune(&req).unwrap();
+        let fanned = engine.prune_fanned(&req).await.unwrap();
+
+        assert_eq!(
+            fanned, sequential,
+            "fanned prune must be file-for-file identical to the sequential prune"
+        );
+        // The bloom really is pruning — otherwise the equivalence above is vacuous.
+        assert!(
+            sequential.len() < PRUNE_FANOUT_SEGMENTS,
+            "fixture must exercise real pruning, but all {PRUNE_FANOUT_SEGMENTS} files survived"
+        );
+        assert!(
+            !sequential.is_empty(),
+            "fixture must keep some files, otherwise the comparison is trivially empty"
+        );
+    }
+
+    /// The same corpus under a narrowed window: the fanned path must prune exactly as aggressively
+    /// as the sequential one, not merely return the same files it happened to keep on a full scan.
+    #[tokio::test]
+    async fn fanned_prune_matches_sequential_prune_on_a_narrowed_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().to_path_buf();
+        let schema = MetricSchema::new(&["service.name".to_string(), "host.name".to_string()]);
+
+        let segments: Vec<(SegmentId, Vec<RecordBatch>)> = (0..PRUNE_FANOUT_SEGMENTS)
+            .map(|i| {
+                (
+                    SegmentId(i as u64),
+                    vec![batch(
+                        &schema,
+                        &[point("cpu.usage", 1000 + i as i64 * 1000)],
+                    )],
+                )
+            })
+            .collect();
+        compact(&hot, &schema, segments).await;
+
+        let engine = MetricsQueryEngine::new(hot, schema).unwrap();
+        let kept = 50usize;
+        let req = MetricRequest {
+            metric: "cpu.usage".to_string(),
+            start_ts_nanos: 1000 + (PRUNE_FANOUT_SEGMENTS - kept) as i64 * 1000,
+            end_ts_nanos: i64::MAX,
+            filter: None,
+            host: None,
+        };
+
+        let sequential = engine.prune(&req).unwrap();
+        let fanned = engine.prune_fanned(&req).await.unwrap();
+
+        assert_eq!(fanned, sequential, "identical under a narrowed window too");
+        assert_eq!(
+            sequential.len(),
+            kept,
+            "time pruning must drop the out-of-window files"
+        );
     }
 
     #[tokio::test]

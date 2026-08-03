@@ -148,6 +148,28 @@ pub struct QueryRequest {
     pub limit: usize,
 }
 
+/// How many chunks a large candidate list is fanned across when pruning. Shared by all three
+/// engines' prune paths (logs, spans, metrics), which are otherwise deliberately duplicated per
+/// signal — the disk behaviour this compensates for is a property of the machine, not the signal.
+///
+/// Skip-index pruning is one small **random** read per candidate (`entry.path` -> its `.idx`
+/// sidecar). Done in a sequential loop, every one of those pays full rotational latency on a
+/// spinning disk — measured ~10.9 ms/file on a 7.2k-RPM volume, so a 7-day window over ~2,700
+/// candidates spent ~16 s in prune alone before DataFusion opened a single Parquet file. Keeping
+/// many reads in flight lets the I/O scheduler reorder them by physical position: the same disk
+/// served ~2.43 ms/file at this fan-out, a ~4.5x speedup, which is what makes a wide window usable
+/// on commodity storage rather than only on SSD/NVMe. Concurrency sweep on that disk (ms/file):
+/// 1 -> 10.89, 4 -> 4.69, 8 -> 4.37, 16 -> 3.40, 32 -> 2.75, 64 -> 2.43.
+///
+/// Costs nothing where it doesn't help: on flash (already concurrency-hungry) it is neutral-to-
+/// positive, and on a warm page cache each read is ~0.1 ms so the chunks finish immediately.
+/// Tokio's blocking pool is 512 threads by default, so this fan-out never starves it.
+pub(crate) const PRUNE_CHUNKS: usize = 64;
+
+/// Below this many candidates, the task fan-out costs more than the seeks it saves — prune inline
+/// on a single blocking task instead.
+pub(crate) const PRUNE_PARALLEL_MIN_CANDIDATES: usize = 64;
+
 /// A parsed manifest cached against the `(mtime, len)` of the file it was read from. The
 /// compactor (same process) rewrites `manifest.json` roughly every 2s, and one UI page load can
 /// fire 6-10 engine calls (search, count, facet, histogram, fields) that each used to re-read
@@ -322,23 +344,79 @@ impl QueryEngine {
         Ok(surviving)
     }
 
+    /// [`prune`](Self::prune), fanned across the blocking pool in [`PRUNE_CHUNKS`] contiguous
+    /// slices once the candidate list is big enough to be worth it.
+    ///
+    /// Each chunk re-derives `manifest.candidates(..)` from the same `Arc<Manifest>` and walks only
+    /// its own index range. That recomputation is a pure in-memory filter over the manifest (no
+    /// I/O) and costs far less than cloning every `FileEntry` — each carries an
+    /// `attribute_keys: Vec<String>` — into the tasks would.
+    ///
+    /// Chunks are awaited **in order** and their outputs concatenated, so the surviving-file list
+    /// is byte-identical to the sequential prune's.
+    async fn prune_fanned(&self, req: &QueryRequest) -> Result<Vec<String>, PhotonError> {
+        let manifest = self.load_manifest()?;
+        let total = manifest
+            .candidates(req.start_ts_nanos, req.end_ts_nanos)
+            .len();
+
+        if total < PRUNE_PARALLEL_MIN_CANDIDATES {
+            let engine = self.clone();
+            let req = req.clone();
+            return spawn_blocking(move || engine.prune(&req))
+                .await
+                .map_err(|e| PhotonError::Query(format!("prune task panicked: {e}")))?;
+        }
+
+        let chunk = total.div_ceil(PRUNE_CHUNKS);
+        let mut tasks = Vec::with_capacity(PRUNE_CHUNKS);
+        for lo in (0..total).step_by(chunk) {
+            let hi = (lo + chunk).min(total);
+            let engine = self.clone();
+            let req = req.clone();
+            let manifest = Arc::clone(&manifest);
+            tasks.push(spawn_blocking(move || {
+                let text_tokens = text_tokens(&req);
+                let candidates = manifest.candidates(req.start_ts_nanos, req.end_ts_nanos);
+                let mut kept: Vec<String> = Vec::new();
+                for entry in &candidates[lo..hi] {
+                    if engine.keep_candidate(entry, &req, text_tokens.as_deref())? {
+                        kept.push(
+                            engine
+                                .hot_dir
+                                .join(&entry.path)
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                }
+                Ok::<Vec<String>, PhotonError>(kept)
+            }));
+        }
+
+        let mut surviving = Vec::new();
+        for task in tasks {
+            surviving.extend(
+                task.await
+                    .map_err(|e| PhotonError::Query(format!("prune task panicked: {e}")))??,
+            );
+        }
+        Ok(surviving)
+    }
+
     /// Prune, then open the surviving Parquet files as one DataFrame (unfiltered — the caller
     /// applies `base_predicate`). `None` when nothing survives pruning (so the caller returns an
     /// empty/zero result without touching DataFusion).
     ///
     /// Pruning (manifest `stat`/read + per-candidate `.idx` reads) is synchronous `std::fs` I/O;
-    /// it runs in `spawn_blocking` so it never blocks a tokio worker thread. `self` is cheap to
-    /// clone (a `PathBuf`, a small `LogSchema`, and two `Arc`-shared caches), so the clone moved
-    /// into the blocking closure still shares the manifest/services caches with `self`.
+    /// it runs on the blocking pool so it never blocks a tokio worker thread. `self` is cheap to
+    /// clone (a `PathBuf`, a small `LogSchema`, and two `Arc`-shared caches), so each clone moved
+    /// into a blocking closure still shares the manifest/services caches with `self`.
     pub(crate) async fn survivors_df(
         &self,
         req: &QueryRequest,
     ) -> Result<Option<datafusion::dataframe::DataFrame>, PhotonError> {
-        let engine = self.clone();
-        let req = req.clone();
-        let surviving = spawn_blocking(move || engine.prune(&req))
-            .await
-            .map_err(|e| PhotonError::Query(format!("prune task panicked: {e}")))??;
+        let surviving = self.prune_fanned(req).await?;
         if surviving.is_empty() {
             return Ok(None);
         }

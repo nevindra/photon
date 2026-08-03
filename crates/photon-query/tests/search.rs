@@ -600,3 +600,103 @@ async fn sql_count_returns_total_rows() {
         .value(0);
     assert_eq!(n, 5, "total rows across both segments");
 }
+
+/// Comfortably past `PRUNE_PARALLEL_MIN_CANDIDATES` (64) so pruning takes the fanned path, and not
+/// an exact multiple of `PRUNE_CHUNKS` (64) — so the final chunk is a short one and any off-by-one
+/// in the `lo..hi` slicing shows up as a lost or duplicated file.
+const PRUNE_FANOUT_SEGMENTS: usize = 205;
+
+/// Pruning fans a large candidate list across the blocking pool (one `.idx` read per candidate is
+/// a random seek, and issuing them concurrently is what keeps a wide window usable on a spinning
+/// disk). The fan-out slices the candidate list by index, so it must return EXACTLY the sequential
+/// prune's file set — no chunk-boundary drops, no double-counting.
+///
+/// One row per segment, well past the fan-out threshold, so the row count is a direct read-out of
+/// how many files pruning kept.
+#[tokio::test]
+async fn fanned_prune_over_many_segments_keeps_every_matching_row() {
+    let dir = TempDir::new().unwrap();
+    let s = schema();
+    let entries: Vec<FileEntry> = (0..PRUNE_FANOUT_SEGMENTS)
+        .map(|i| {
+            write_segment(
+                dir.path(),
+                SegmentId(i as u64),
+                &[record(1000 + i as i64 * 1000, "api", &format!("row{i:05}"))],
+                &s,
+            )
+        })
+        .collect();
+    write_manifest(dir.path(), entries);
+
+    let out = engine(&dir)
+        .search(QueryRequest {
+            start_ts_nanos: 0,
+            end_ts_nanos: i64::MAX,
+            services: vec![],
+            severities: vec![],
+            text: None,
+            query: None,
+            limit: PRUNE_FANOUT_SEGMENTS,
+        })
+        .await
+        .unwrap();
+
+    let got = rows(&out);
+    assert_eq!(
+        got.len(),
+        PRUNE_FANOUT_SEGMENTS,
+        "every segment's row must survive the fanned prune"
+    );
+    let mut bodies: Vec<String> = got.iter().map(|(_, _, b)| b.clone()).collect();
+    bodies.sort();
+    let want: Vec<String> = (0..PRUNE_FANOUT_SEGMENTS)
+        .map(|i| format!("row{i:05}"))
+        .collect();
+    assert_eq!(
+        bodies, want,
+        "no row dropped or duplicated at a chunk boundary"
+    );
+}
+
+/// The same fan-out, but with a time window that excludes part of the corpus: the parallel path
+/// must prune exactly as aggressively as the sequential one — dropping the out-of-window files
+/// rather than letting a chunk boundary smuggle one through.
+#[tokio::test]
+async fn fanned_prune_still_drops_out_of_window_files() {
+    let dir = TempDir::new().unwrap();
+    let s = schema();
+    let entries: Vec<FileEntry> = (0..PRUNE_FANOUT_SEGMENTS)
+        .map(|i| {
+            write_segment(
+                dir.path(),
+                SegmentId(i as u64),
+                &[record(1000 + i as i64 * 1000, "api", &format!("row{i:05}"))],
+                &s,
+            )
+        })
+        .collect();
+    write_manifest(dir.path(), entries);
+
+    // Keep only the last 50 segments' rows (timestamps 1000 + i*1000).
+    let kept = 50usize;
+    let start = 1000 + (PRUNE_FANOUT_SEGMENTS - kept) as i64 * 1000;
+    let out = engine(&dir)
+        .search(QueryRequest {
+            start_ts_nanos: start,
+            end_ts_nanos: i64::MAX,
+            services: vec![],
+            severities: vec![],
+            text: None,
+            query: None,
+            limit: PRUNE_FANOUT_SEGMENTS,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows(&out).len(),
+        kept,
+        "the fanned prune must drop out-of-window files, not just reorder them"
+    );
+}

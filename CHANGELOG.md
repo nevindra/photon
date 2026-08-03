@@ -128,13 +128,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paid full rotational latency on a spinning disk. Measured on a 3 TB rotational volume:
   **10.9 ms/file**, so a 7-day trace search over 2,707 candidates spent **~16 s in prune alone**
   before DataFusion opened a single Parquet file — while a warm page cache hid it completely
-  (0.10 ms/file), which is why the symptom read as erratic rather than slow. `span_prune` now
-  splits candidates into 64 contiguous slices once the list exceeds 64 entries, each re-deriving
-  `candidates()` from a shared `Arc<Manifest>` (a pure in-memory filter, no `FileEntry` cloning)
-  and awaited in order so the survivor list is byte-identical to the sequential prune's.
-  **~4.5× faster on the same disk** (2.43 ms/file at 64-way; sweep: 1→10.9, 4→4.7, 8→4.4, 16→3.4,
-  32→2.8, 64→2.4). Neutral-to-positive on flash and on a warm cache. The logs/metrics engines and
-  `trace_candidates` still prune sequentially — same fix applies, not yet done.
+  (0.10 ms/file), which is why the symptom read as erratic rather than slow. All three engines —
+  **logs, spans and metrics** — now split candidates into 64 contiguous slices once the list
+  exceeds 64 entries, each re-deriving `candidates()` from a shared `Arc<Manifest>` (a pure
+  in-memory filter, no `FileEntry` cloning) and awaited in order so the survivor list is
+  byte-identical to the sequential prune's. **~4.5× faster on the same disk** (2.43 ms/file at
+  64-way; sweep: 1→10.9, 4→4.7, 8→4.4, 16→3.4, 32→2.8, 64→2.4). Neutral-to-positive on flash and
+  on a warm cache. The two tuning constants live once in `lib.rs` rather than per signal: unlike
+  the query logic they sit in, the disk behaviour they compensate for belongs to the machine, not
+  the signal. Each engine keeps its sequential `prune` for synchronous callers
+  (`metric_catalog.rs`) and unit tests; only the DataFrame path fans out. `trace_candidates` stays
+  sequential on purpose — a `time_hint` narrows it to a ±1 h window, so it sits below the fan-out
+  threshold anyway.
 - **Search handlers no longer report a failed query as an empty result.** `POST /api/search`,
   `/api/traces/search` and `/api/spans/search` caught every engine error, logged a warning and
   returned an empty-but-`200` page. That was meant to keep a *fresh* server from 500-ing, but the

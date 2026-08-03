@@ -17,7 +17,9 @@ use photon_core::PhotonError;
 use photon_index::{interior_tokens, SkipIndex};
 use photon_storage::Storage;
 
-use crate::{cached_manifest, col_ref, session, ManifestCache};
+use crate::{
+    cached_manifest, col_ref, session, ManifestCache, PRUNE_CHUNKS, PRUNE_PARALLEL_MIN_CANDIDATES,
+};
 
 /// ±window applied to a `get_trace` time hint when selecting manifest candidates. A trace's
 /// spans cluster within seconds of the originating row, so one hour is comfortably conservative:
@@ -25,25 +27,6 @@ use crate::{cached_manifest, col_ref, session, ManifestCache};
 /// spans — is a documented v1 edge; the `trace_id` bloom is the correctness pruner for the
 /// in-window files, and a hint-less call scans every candidate (fully correct, just less pruned).
 const TRACE_TIME_HINT_PADDING_NANOS: i64 = 3_600_000_000_000;
-
-/// How many chunks a large candidate list is fanned across when pruning.
-///
-/// Skip-index pruning is one small **random** read per candidate (`entry.path` -> its `.idx`
-/// sidecar). Done in a sequential loop, every one of those pays full rotational latency on a
-/// spinning disk — measured ~10 ms/file on a 7.2k-RPM volume, so a 7-day window over ~2,700
-/// candidates spent ~16 s in prune alone before DataFusion opened a single Parquet file. Keeping
-/// many reads in flight lets the I/O scheduler reorder them by physical position: the same disk
-/// served ~2.4 ms/file at this fan-out, a ~4.5x speedup, which is what makes a wide window usable
-/// on commodity storage rather than only on SSD/NVMe.
-///
-/// Costs nothing where it doesn't help: on flash (already concurrency-hungry) it is neutral-to-
-/// positive, and on a warm page cache each read is ~0.1 ms so the chunks finish immediately.
-/// Tokio's blocking pool is 512 threads by default, so this fan-out never starves it.
-const PRUNE_CHUNKS: usize = 64;
-
-/// Below this many candidates, the task fan-out costs more than the seeks it saves — prune inline
-/// on a single blocking task instead.
-const PRUNE_PARALLEL_MIN_CANDIDATES: usize = 64;
 
 /// Sort order for `SpanQueryEngine::search_spans`. `Recent` is the default — newest spans
 /// first, matching the UI's default trace/span explorer view.
