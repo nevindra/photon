@@ -530,8 +530,15 @@ impl MetricsQueryEngine {
 
         // Enumerate from the semconv CPU metric first (0..1 fraction → ×100); if a producer emits
         // none, fall back to the bespoke metric (already a 0..100 percent → ×1).
-        self.enumerate_processes_from_cpu(&mut out, PROC_CPU_SEMCONV, 100.0, host, start_ns, end_ns)
-            .await?;
+        self.enumerate_processes_from_cpu(
+            &mut out,
+            PROC_CPU_SEMCONV,
+            100.0,
+            host,
+            start_ns,
+            end_ns,
+        )
+        .await?;
         let used_semconv = !out.is_empty();
         if out.is_empty() {
             self.enumerate_processes_from_cpu(
@@ -553,17 +560,35 @@ impl MetricsQueryEngine {
         };
 
         // CPU/memory/fds/threads are gauges → window-avg. `restarts` is a cumulative counter → max.
-        self.fill_process_gauge(&mut out, mem, ProcAgg::Avg, host, start_ns, end_ns, |p, v| {
-            p.rss_bytes = Some(v)
-        })
+        self.fill_process_gauge(
+            &mut out,
+            mem,
+            ProcAgg::Avg,
+            host,
+            start_ns,
+            end_ns,
+            |p, v| p.rss_bytes = Some(v),
+        )
         .await?;
-        self.fill_process_gauge(&mut out, fds, ProcAgg::Avg, host, start_ns, end_ns, |p, v| {
-            p.fds = Some(v)
-        })
+        self.fill_process_gauge(
+            &mut out,
+            fds,
+            ProcAgg::Avg,
+            host,
+            start_ns,
+            end_ns,
+            |p, v| p.fds = Some(v),
+        )
         .await?;
-        self.fill_process_gauge(&mut out, threads, ProcAgg::Avg, host, start_ns, end_ns, |p, v| {
-            p.threads = Some(v)
-        })
+        self.fill_process_gauge(
+            &mut out,
+            threads,
+            ProcAgg::Avg,
+            host,
+            start_ns,
+            end_ns,
+            |p, v| p.threads = Some(v),
+        )
         .await?;
         self.fill_process_gauge(
             &mut out,
@@ -659,6 +684,7 @@ impl MetricsQueryEngine {
     /// `process.restarts` cumulative counter). Host-scoped like `host_latest_scalar` (skip-index
     /// prune + `host.name = <host>` predicate). Processes absent from `out` (no CPU signal) are
     /// ignored — this only enriches known processes, mirroring `fill_latest_gauge`.
+    #[allow(clippy::too_many_arguments)]
     async fn fill_process_gauge(
         &self,
         out: &mut BTreeMap<String, ProcessSummary>,
@@ -1309,13 +1335,21 @@ mod tests {
 
         let api = procs.iter().find(|p| p.process == "api").unwrap();
         // window-avg CPU of 40 and 60 = 50 (bespoke `process.cpu.percent`, already a percent).
-        assert!((api.cpu_pct.unwrap() - 50.0).abs() < 1e-9, "got {:?}", api.cpu_pct);
+        assert!(
+            (api.cpu_pct.unwrap() - 50.0).abs() < 1e-9,
+            "got {:?}",
+            api.cpu_pct
+        );
         assert_eq!(api.rss_bytes, Some(536_870_912.0));
         assert_eq!(api.fds, Some(128.0));
         assert_eq!(api.threads, Some(12.0));
         // Restarts is a cumulative counter aggregated with MAX: the 0→1→3 series renders 3, not the
         // ~1.33 an avg would give.
-        assert_eq!(api.restarts, Some(3.0), "restarts must be max(0,1,3)=3, not the avg");
+        assert_eq!(
+            api.restarts,
+            Some(3.0),
+            "restarts must be max(0,1,3)=3, not the avg"
+        );
         assert!(api.last_seen_ns > 0);
 
         let worker = procs.iter().find(|p| p.process == "worker").unwrap();
@@ -1331,7 +1365,11 @@ mod tests {
             .unwrap();
         let api = procs.iter().find(|p| p.process == "api").unwrap();
         // `process.cpu.utilization` 0.5 (a 0..1 fraction) is surfaced as 50%.
-        assert!((api.cpu_pct.unwrap() - 50.0).abs() < 1e-9, "got {:?}", api.cpu_pct);
+        assert!(
+            (api.cpu_pct.unwrap() - 50.0).abs() < 1e-9,
+            "got {:?}",
+            api.cpu_pct
+        );
         // The remaining gauges are read from their semconv names, not the bespoke ones.
         assert_eq!(api.rss_bytes, Some(536_870_912.0));
         assert_eq!(api.fds, Some(128.0));
