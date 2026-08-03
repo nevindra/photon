@@ -24,6 +24,7 @@ mod search;
 mod services;
 pub mod settings;
 mod stream;
+pub mod tenants;
 mod traces;
 mod traces_agg;
 mod traces_search;
@@ -83,6 +84,9 @@ pub struct ApiServer {
     /// the `ConditionSource` seam). `None` keeps `/api/alerts/*` returning 404 — set via
     /// [`ApiServer::with_alerts`].
     alerts: Option<alerts::AlertsApi>,
+    /// The tenant registry (federation control plane). `None` keeps `/api/tenants*` returning
+    /// 404 — set via [`ApiServer::with_tenant_store`].
+    tenants: Option<Arc<dyn tenants::TenantStore>>,
 }
 
 /// Shared, immutable application state: a cheap-to-clone handle over an `Arc`. Handlers pull
@@ -111,6 +115,9 @@ pub(crate) struct AppStateInner {
     pub(crate) rum: Option<rum::RumApi>,
     /// The alerts vertical; read by `alerts.rs`. `None` disables `/api/alerts/*`.
     pub(crate) alerts: Option<alerts::AlertsApi>,
+    /// The tenant registry; read by the tenant management handlers (Task 4). Only written here.
+    #[allow(dead_code)]
+    pub(crate) tenants: Option<Arc<dyn tenants::TenantStore>>,
 }
 
 impl std::ops::Deref for AppState {
@@ -150,6 +157,7 @@ impl ApiServer {
             replication: None,
             rum: None,
             alerts: None,
+            tenants: None,
         }
     }
 
@@ -203,6 +211,13 @@ impl ApiServer {
         self
     }
 
+    /// Attach the tenant registry (federation control plane), built by `photon-server`. Leaving
+    /// it unset keeps `/api/tenants*` returning 404 — the subsystem is optional.
+    pub fn with_tenant_store(mut self, tenants: Option<Arc<dyn tenants::TenantStore>>) -> Self {
+        self.tenants = tenants;
+        self
+    }
+
     /// Bind `addr` and serve until the process is terminated.
     pub async fn serve(self, addr: SocketAddr) -> Result<(), PhotonError> {
         let app = self.into_router();
@@ -230,6 +245,7 @@ impl ApiServer {
             replication: self.replication,
             rum: self.rum,
             alerts: self.alerts,
+            tenants: self.tenants,
         }));
 
         // Everything except `/api/login` requires a valid signed `photon_session` cookie.
@@ -451,6 +467,7 @@ pub(crate) fn test_state_with_rum(rum: Option<rum::RumApi>) -> AppState {
         replication: s.replication,
         rum,
         alerts: s.alerts,
+        tenants: s.tenants,
     }))
 }
 
