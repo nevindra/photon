@@ -19,6 +19,7 @@ photon-uptime = { path = "../photon-uptime" }
 photon-alerts = { path = "../photon-alerts" }
 argon2 = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
 # Federation summary pusher/forwarder POST to a tenant-configured (possibly https) endpoint, so
@@ -30,6 +31,8 @@ tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
+# Federation forwarder test: an in-process stub that captures the POSTs the forwarder makes.
+axum = { workspace = true }
 # BE-6 live-tail e2e: real over-the-wire server driven via HTTP (login, OTLP POST, SSE read).
 snap = { workspace = true }
 tempfile = "3"

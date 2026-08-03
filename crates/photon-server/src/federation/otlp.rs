@@ -82,7 +82,10 @@ fn mode_str(mode: FederationMode) -> &'static str {
 /// Pure builder: a `SummarySnapshot` -> the OTLP `ExportMetricsServiceRequest` pushed to
 /// `{endpoint}/v1/metrics`. Resource attr `service.name = "photon"`; every datapoint carries
 /// `mode`.
-pub fn build_summary(snapshot: &SummarySnapshot, mode: FederationMode) -> ExportMetricsServiceRequest {
+pub fn build_summary(
+    snapshot: &SummarySnapshot,
+    mode: FederationMode,
+) -> ExportMetricsServiceRequest {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -204,11 +207,8 @@ mod tests {
         };
         let dp = &g.data_points[0];
         assert_eq!(dp.value, Some(NumVal::AsDouble(1.0)));
-        assert!(dp
-            .attributes
-            .iter()
-            .any(|kv| kv.key == "mode" && kv.value.as_ref().unwrap().value
-                == Some(Value::StringValue("full".to_string()))));
+        assert!(dp.attributes.iter().any(|kv| kv.key == "mode"
+            && kv.value.as_ref().unwrap().value == Some(Value::StringValue("full".to_string()))));
     }
 
     #[test]

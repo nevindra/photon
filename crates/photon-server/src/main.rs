@@ -47,12 +47,12 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 /// The alerts `ConditionSource` seam over the three query engines (wired into the scheduler in a
 /// later task). Kept as a module so it can carry its own tests without bloating `main`.
 mod alerts_source;
+/// Tenant-side federation: the summary pusher (always on when `[federation]` is present) and,
+/// in `full` mode, the OTLP tee/forwarder that mirrors raw batches to central.
+mod federation;
 /// Adapter that mirrors uptime up/down transitions onto the shared alerts store + channels while
 /// preserving the legacy per-monitor webhook. Kept as a module so it can carry its own tests.
 mod uptime_bridge;
-/// Tenant-side federation: the summary pusher (always on when `[federation]` is present) and,
-/// in `full` mode, the OTLP tee/forwarder (Task 6).
-mod federation;
 
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
@@ -69,13 +69,13 @@ use photon_api::{
     RetentionAtomics, SqliteUsageStore, UsageStore,
 };
 use photon_compact::{Compactor, MetricsCompactor, SpanCompactor};
-use photon_core::config::Config;
+use photon_core::config::{Config, FederationMode};
 use photon_core::ingest_counters::IngestCounters;
 use photon_core::metric_schema::MetricSchema;
 use photon_core::schema::LogSchema;
 use photon_core::span_schema::SpanSchema;
 use photon_core::TenantTokenMap;
-use photon_ingest::IngestServer;
+use photon_ingest::{FederationTee, IngestServer};
 use photon_query::{MetricsQueryEngine, QueryEngine, SpanQueryEngine};
 use photon_storage::{Replicator, Storage};
 use photon_wal::{BroadcastingWal, DiskWal, Wal};
@@ -444,9 +444,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let alerts_api = spawn_alerts(&cfg.alerts, &cfg.storage.db_path, alerts_source)?;
 
     // Tenant-side federation: `summary` mode always pushes synthetic health metrics; `full` mode
-    // additionally tees raw OTLP (Task 6, not yet wired). Absent `[federation]` = fully inert.
-    let federation_stats = Arc::new(federation::FederationStats::default());
+    // additionally tees every accepted OTLP batch to central. Absent `[federation]` = fully inert.
+    let mut federation_stats_dropped = None;
+    let mut federation_rx = None;
+    if let Some(fed) = cfg
+        .federation
+        .as_ref()
+        .filter(|f| f.mode == FederationMode::Full)
+    {
+        let (tee, rx) = FederationTee::channel(fed.queue_batches);
+        // The tee's own drop counter IS the stats counter, so `/api/federation/status` reports
+        // queue-full drops and forwarder give-ups as one number.
+        federation_stats_dropped = Some(tee.dropped.clone());
+        ingest.federation_tee = Some(tee);
+        federation_rx = Some(rx);
+    }
+    let federation_stats = Arc::new(federation::FederationStats {
+        dropped: federation_stats_dropped.unwrap_or_default(),
+        ..Default::default()
+    });
     if let Some(fed) = cfg.federation.clone() {
+        if let Some(rx) = federation_rx {
+            federation::spawn_forwarder(fed.clone(), rx, federation_stats.clone());
+        }
         federation::spawn_summary_pusher(
             fed,
             federation::SummaryDeps {

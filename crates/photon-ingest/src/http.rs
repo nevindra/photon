@@ -32,6 +32,9 @@ pub(crate) struct HttpState<W: Wal + Send + Sync + 'static> {
     /// Federation: bearer token -> tenant name, consulted when the local token doesn't
     /// match. Empty on a non-central node, so tenant auth simply never matches.
     pub(crate) tenant_tokens: TenantTokenMap,
+    /// Federation `full` mode: the raw decoded body is offered here for best-effort
+    /// forwarding to central. `None` on a non-federated node.
+    pub(crate) federation_tee: Option<crate::FederationTee>,
 }
 
 /// Decode a raw protobuf body into an `ExportLogsServiceRequest`. Pure — no I/O — so the
@@ -83,6 +86,11 @@ async fn ingest_logs<W: Wal + Send + Sync + 'static>(
         Ok(req) => req,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // Full-mode federation: mirror the accepted payload to central. `Bytes` clone is a
+    // refcount bump and `offer` is try_send-only, so this never touches the ack path.
+    if let Some(tee) = &state.federation_tee {
+        tee.offer(crate::TeeSignal::Logs, body.clone());
+    }
     // Frees the request buffer before the WAL fsync await; up to `max_body_bytes` (~16 MiB)
     // per in-flight request would otherwise stay pinned for the duration of the append.
     drop(body);
@@ -190,6 +198,7 @@ mod tests {
             in_flight: Arc::new(Semaphore::new(1)),
             counters: Arc::new(photon_core::ingest_counters::IngestCounters::new()),
             tenant_tokens: TenantTokenMap::default(),
+            federation_tee: None,
         };
 
         let _first_permit = state
@@ -342,6 +351,7 @@ mod counter_tests {
             in_flight: Arc::new(Semaphore::new(4)),
             counters: Arc::new(IngestCounters::new()),
             tenant_tokens,
+            federation_tee: None,
         });
 
         let req = ExportLogsServiceRequest {
@@ -396,6 +406,7 @@ mod counter_tests {
             in_flight: Arc::new(Semaphore::new(4)),
             counters: counters.clone(),
             tenant_tokens: TenantTokenMap::default(),
+            federation_tee: None,
         });
 
         let mut headers = HeaderMap::new();

@@ -26,6 +26,9 @@ pub(crate) struct GrpcTraceService<W: Wal + Send + Sync + 'static> {
     /// Federation: bearer token -> tenant name, consulted when the local token doesn't
     /// match. Empty on a non-central node, so tenant auth simply never matches.
     pub(crate) tenant_tokens: TenantTokenMap,
+    /// Federation `full` mode: the accepted request is re-encoded and offered here for
+    /// best-effort forwarding to central (gRPC never sees the raw wire bytes).
+    pub(crate) federation_tee: Option<crate::FederationTee>,
 }
 
 #[tonic::async_trait]
@@ -55,6 +58,14 @@ impl<W: Wal + Send + Sync + 'static> TraceService for GrpcTraceService<W> {
         let mut req = request.into_inner();
         if let Auth::Tenant(tenant) = &auth {
             stamp_tenant_traces(&mut req, tenant);
+        }
+        // Full-mode federation: prost re-encode (gRPC decoded the body for us). try_send-only,
+        // so a stalled forwarder can never delay the ack.
+        if let Some(tee) = &self.federation_tee {
+            tee.offer(
+                crate::TeeSignal::Traces,
+                prost::Message::encode_to_vec(&req).into(),
+            );
         }
         let mut builder = SpanBatchBuilder::with_capacity(&self.schema, estimate_rows(&req));
         otlp_traces_into_builder(req, &mut builder);
