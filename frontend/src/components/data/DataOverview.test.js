@@ -15,12 +15,20 @@ vi.mock('@/lib/data/dataQueries', () => ({
   usageWindow: ref('24h'),
 }))
 
+// The federation status strip is `v-if="fed?.enabled"` off `useFederationStatus()` — stub it the
+// same synchronous-ref way as the dataQueries composables above so each test can set the fixture.
+const mockFedState = { status: ref({ enabled: false, status: null }) }
+vi.mock('@/lib/tenants/tenantsQueries', () => ({
+  useFederationStatus: () => ({ data: mockFedState.status }),
+}))
+
 import DataOverview from '@/components/data/DataOverview.vue'
 
-function mountOverview(overrides = {}) {
+function mountOverview(overrides = {}, fed) {
   const storage = structuredClone(mockStorage)
   Object.assign(storage, overrides) // e.g. override `durable` to the not-configured shape
   mockOverviewState.storage = ref(storage)
+  mockFedState.status = ref(fed ?? { enabled: false, status: null })
   return mount(DataOverview)
 }
 
@@ -74,5 +82,51 @@ describe('DataOverview', () => {
       },
     })
     expect(w.get('[data-testid="storage-composition"]').text()).toContain('No data yet.')
+  })
+
+  it('hides the federation status strip when federation is disabled', () => {
+    const w = mountOverview({}, { enabled: false, status: null })
+    expect(w.find('[data-testid="federation-status"]').exists()).toBe(false)
+  })
+
+  it('shows the federation status strip with mode, endpoint and counters when enabled', () => {
+    const w = mountOverview(
+      {},
+      {
+        enabled: true,
+        status: {
+          mode: 'summary',
+          endpoint: 'https://central.example.com',
+          last_push_ms: Date.now() - 5_000,
+          last_error: null,
+          pushed: 42,
+          dropped: 1,
+          queued: 0,
+        },
+      },
+    )
+    const strip = w.get('[data-testid="federation-status"]').text()
+    expect(strip).toContain('summary')
+    expect(strip).toContain('https://central.example.com')
+    expect(strip).toMatch(/42/)
+  })
+
+  it('shows the last error in destructive text when set', () => {
+    const w = mountOverview(
+      {},
+      {
+        enabled: true,
+        status: {
+          mode: 'summary',
+          endpoint: 'https://central.example.com',
+          last_push_ms: 0,
+          last_error: 'connection refused',
+          pushed: 0,
+          dropped: 0,
+          queued: 3,
+        },
+      },
+    )
+    expect(w.get('[data-testid="federation-status"]').text()).toContain('connection refused')
   })
 })
