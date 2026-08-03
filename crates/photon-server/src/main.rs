@@ -71,6 +71,7 @@ use photon_core::ingest_counters::IngestCounters;
 use photon_core::metric_schema::MetricSchema;
 use photon_core::schema::LogSchema;
 use photon_core::span_schema::SpanSchema;
+use photon_core::TenantTokenMap;
 use photon_ingest::IngestServer;
 use photon_query::{MetricsQueryEngine, QueryEngine, SpanQueryEngine};
 use photon_storage::{Replicator, Storage};
@@ -389,7 +390,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e| format!("invalid PHOTON_API_ADDR {api_addr_str:?}: {e}"))?;
 
-    let ingest = IngestServer::new(
+    // Central-side federation: bearer token -> tenant name, shared live between ingest auth
+    // resolution and the tenant registry (which rebuilds it on every mutation). Empty by
+    // default = tenant auth never matches, so a non-central node behaves exactly as before.
+    let tenant_tokens = TenantTokenMap::default();
+    let mut ingest = IngestServer::new(
         wal.clone(),
         spans_wal.clone(),
         metrics_wal.clone(),
@@ -401,6 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.ingest.max_body_bytes,
         counters.clone(),
     );
+    ingest.tenant_tokens = tenant_tokens.clone();
     let span_query = SpanQueryEngine::new(cfg.storage.hot_dir.clone(), span_schema.clone())?;
     let metrics_query =
         MetricsQueryEngine::new(cfg.storage.hot_dir.clone(), metric_schema.clone())?;
@@ -476,6 +482,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(photon_api::RumApi::new(rum_store, sink).await)
     };
 
+    // Tenant registry (federation control plane): the customer Photon installs allowed to push
+    // into this central node. Always enabled — the store starts empty, so an unconfigured node
+    // simply has no tenant tokens and behaves exactly as before. Shares `tenant_tokens` with the
+    // ingest front end constructed above so a mutation here is live for the next ingest request.
+    let tenant_api = {
+        let tenant_store: Arc<dyn photon_api::tenants::TenantStore> = Arc::new(
+            photon_api::tenants::SqliteTenantStore::open(&cfg.storage.db_path)?,
+        );
+        Some(photon_api::TenantApi::new(tenant_store, tenant_tokens.clone()).await?)
+    };
+
     let api = ApiServer::new(
         query,
         span_query,
@@ -488,7 +505,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_data_admin(Some(data_admin))
     .with_live_hub(live_hub)
     .with_usage(usage.clone(), repl_status.clone())
-    .with_rum(rum_api);
+    .with_rum(rum_api)
+    .with_tenant_store(tenant_api);
 
     println!("photon-server listening: otlp-grpc={grpc_addr} otlp-http={http_addr} api={api_addr}");
 

@@ -47,6 +47,7 @@ use photon_query::{MetricsQueryEngine, QueryEngine, SpanQueryEngine};
 pub use data::{DataAdmin, PurgeCommand, PurgeSender, RetentionAtomics};
 pub use rum::{RumApi, RumSink};
 pub use stream::LiveHub;
+pub use tenants::TenantApi;
 pub use usage::{
     signal_from_path, ReplicationStatus, SqliteUsageStore, UsageSampleRow, UsageStore,
 };
@@ -86,7 +87,7 @@ pub struct ApiServer {
     alerts: Option<alerts::AlertsApi>,
     /// The tenant registry (federation control plane). `None` keeps `/api/tenants*` returning
     /// 404 — set via [`ApiServer::with_tenant_store`].
-    tenants: Option<Arc<dyn tenants::TenantStore>>,
+    tenants: Option<tenants::TenantApi>,
 }
 
 /// Shared, immutable application state: a cheap-to-clone handle over an `Arc`. Handlers pull
@@ -115,9 +116,8 @@ pub(crate) struct AppStateInner {
     pub(crate) rum: Option<rum::RumApi>,
     /// The alerts vertical; read by `alerts.rs`. `None` disables `/api/alerts/*`.
     pub(crate) alerts: Option<alerts::AlertsApi>,
-    /// The tenant registry; read by the tenant management handlers (Task 4). Only written here.
-    #[allow(dead_code)]
-    pub(crate) tenants: Option<Arc<dyn tenants::TenantStore>>,
+    /// The tenant registry; read by the tenant management handlers (`tenants.rs`).
+    pub(crate) tenants: Option<tenants::TenantApi>,
 }
 
 impl std::ops::Deref for AppState {
@@ -213,7 +213,7 @@ impl ApiServer {
 
     /// Attach the tenant registry (federation control plane), built by `photon-server`. Leaving
     /// it unset keeps `/api/tenants*` returning 404 — the subsystem is optional.
-    pub fn with_tenant_store(mut self, tenants: Option<Arc<dyn tenants::TenantStore>>) -> Self {
+    pub fn with_tenant_store(mut self, tenants: Option<tenants::TenantApi>) -> Self {
         self.tenants = tenants;
         self
     }
@@ -343,6 +343,18 @@ impl ApiServer {
             .route("/alerts/channels/:id/test", post(alerts::test_channel))
             .route("/alerts/channels/test", post(alerts::test_channel_draft))
             .route("/alerts/incidents", get(alerts::list_incidents))
+            .route(
+                "/tenants",
+                get(tenants::list_tenants).post(tenants::create_tenant),
+            )
+            .route(
+                "/tenants/:name",
+                axum::routing::patch(tenants::update_tenant).delete(tenants::delete_tenant),
+            )
+            .route(
+                "/tenants/:name/rotate-token",
+                post(tenants::rotate_tenant_token),
+            )
             .route("/logout", post(auth::logout))
             .route("/users", get(auth::list_users).post(auth::create_user))
             .route("/users/:username", axum::routing::delete(auth::delete_user))
@@ -468,6 +480,29 @@ pub(crate) fn test_state_with_rum(rum: Option<rum::RumApi>) -> AppState {
         rum,
         alerts: s.alerts,
         tenants: s.tenants,
+    }))
+}
+
+/// An [`AppState`] over the seeded test server, carrying the given tenant registry. Lets
+/// `tenants.rs` drive its handlers directly (they take `State<AppState>`), or `None` to
+/// exercise the disabled (404) path.
+#[cfg(test)]
+pub(crate) fn test_state_with_tenants(tenants: Option<tenants::TenantApi>) -> AppState {
+    let s = test_server();
+    AppState(Arc::new(AppStateInner {
+        query: s.query,
+        span_query: s.span_query,
+        metrics_query: s.metrics_query,
+        users: s.users,
+        key: s.key,
+        uptime: s.uptime,
+        data: s.data,
+        live: s.live,
+        usage: s.usage,
+        replication: s.replication,
+        rum: s.rum,
+        alerts: s.alerts,
+        tenants,
     }))
 }
 
