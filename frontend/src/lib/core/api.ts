@@ -38,6 +38,13 @@ import {
   mockRumErrors,
   mockRumErrorFacets,
   mockRumErrorDetail,
+  mockTenants,
+  mockCreateTenant,
+  mockUpdateTenant,
+  mockRotateTenantToken,
+  mockDeleteTenant,
+  mockTenantsSummary,
+  mockFederationStatus,
   mockInfraHosts,
   mockInfraHost,
   mockInfraHostSeries,
@@ -466,6 +473,41 @@ export interface RumAppInput {
 }
 export interface RumRotateKeyResult {
   key: string
+}
+
+// --- Tenants / Federation ---
+export interface Tenant {
+  name: string
+  token: string // list responses redact this to `…last4`
+  ui_url: string | null
+  created_at: number
+}
+export interface TenantsResult {
+  tenants: Tenant[]
+}
+export interface TenantSummary {
+  name: string
+  mode: string | null
+  status: 'up' | 'stale' | 'down'
+  last_seen_ms: number
+  ingest_rows_per_sec: number
+  open_incidents: number
+  hot_bytes: number
+  ui_url: string | null
+  spark: [number, number][]
+}
+export interface FederationStatusSnapshot {
+  mode: string
+  endpoint: string
+  last_push_ms: number
+  last_error: string | null
+  pushed: number
+  dropped: number
+  queued: number
+}
+export interface FederationStatusResult {
+  enabled: boolean
+  status: FederationStatusSnapshot | null
 }
 export interface RumVitalDist {
   good: number
@@ -1416,6 +1458,79 @@ export const api = {
       if (e.status === 404) return { ok: false, error: e.body?.error }
       api.mock = true
       return mockDeleteRumApp(name)
+    }
+  },
+
+  // --- Tenants / Federation ---
+
+  async tenants(opts: RequestOpts = {}): Promise<TenantsResult> {
+    try {
+      return await http.get('tenants', { signal: opts.signal }).json<TenantsResult>()
+    } catch {
+      api.mock = true
+      return mockTenants()
+    }
+  },
+
+  async tenantsSummary(opts: RequestOpts = {}): Promise<TenantSummary[]> {
+    try {
+      return await http.get('tenants/summary', { signal: opts.signal }).json<TenantSummary[]>()
+    } catch {
+      api.mock = true
+      return mockTenantsSummary()
+    }
+  },
+
+  async createTenant(name: string, uiUrl?: string | null, opts: RequestOpts = {}): Promise<MutationResult & { token?: string }> {
+    try {
+      const res = await http.post('tenants', { json: { name, ui_url: uiUrl ?? null }, signal: opts.signal }).json<Tenant>()
+      return { ok: true, token: res.token }
+    } catch (e: any) {
+      if (e.status === 400 || e.status === 409) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockCreateTenant(name, uiUrl)
+    }
+  },
+
+  async updateTenant(name: string, uiUrl: string | null, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.patch(`tenants/${encodeURIComponent(name)}`, { json: { ui_url: uiUrl }, signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      if (e.status === 400 || e.status === 404) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockUpdateTenant(name, uiUrl)
+    }
+  },
+
+  async rotateTenantToken(name: string, opts: RequestOpts = {}): Promise<MutationResult & { token?: string }> {
+    try {
+      const res = await http.post(`tenants/${encodeURIComponent(name)}/rotate-token`, { signal: opts.signal }).json<{ token: string }>()
+      return { ok: true, token: res.token }
+    } catch (e: any) {
+      if (e.status === 404) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockRotateTenantToken(name)
+    }
+  },
+
+  async deleteTenant(name: string, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.delete(`tenants/${encodeURIComponent(name)}`, { signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      if (e.status === 404) return { ok: false, error: e.body?.error }
+      api.mock = true
+      return mockDeleteTenant(name)
+    }
+  },
+
+  async federationStatus(opts: RequestOpts = {}): Promise<FederationStatusResult> {
+    try {
+      return await http.get('federation/status', { signal: opts.signal }).json<FederationStatusResult>()
+    } catch {
+      api.mock = true
+      return mockFederationStatus()
     }
   },
 
