@@ -50,6 +50,9 @@ mod alerts_source;
 /// Adapter that mirrors uptime up/down transitions onto the shared alerts store + channels while
 /// preserving the legacy per-monitor webhook. Kept as a module so it can carry its own tests.
 mod uptime_bridge;
+/// Tenant-side federation: the summary pusher (always on when `[federation]` is present) and,
+/// in `full` mode, the OTLP tee/forwarder (Task 6).
+mod federation;
 
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
@@ -439,6 +442,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics: metrics_query.clone(),
     });
     let alerts_api = spawn_alerts(&cfg.alerts, &cfg.storage.db_path, alerts_source)?;
+
+    // Tenant-side federation: `summary` mode always pushes synthetic health metrics; `full` mode
+    // additionally tees raw OTLP (Task 6, not yet wired). Absent `[federation]` = fully inert.
+    let federation_stats = Arc::new(federation::FederationStats::default());
+    if let Some(fed) = cfg.federation.clone() {
+        federation::spawn_summary_pusher(
+            fed,
+            federation::SummaryDeps {
+                counters: counters.clone(),
+                query: query.clone(),
+                span_query: span_query.clone(),
+                metrics_query: metrics_query.clone(),
+                alerts: alerts_api.store.clone(),
+            },
+            federation_stats.clone(),
+        );
+    }
 
     // Uptime monitoring is always on: the scheduler + prune tasks run and the uptime tables are
     // opened in the shared control-plane SQLite. With no monitors configured it stays idle (no
