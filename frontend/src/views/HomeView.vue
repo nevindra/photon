@@ -22,6 +22,7 @@ import { useServicesList, useServiceTimeseries } from '@/lib/services/servicesQu
 import { useRumApps, useRumVitals } from '@/lib/rum/rumQueries'
 import { useMonitors } from '@/lib/uptime/uptimeQueries'
 import { useTenantsSummary, type TenantSummary } from '@/lib/tenants/tenantsQueries'
+import { setScope } from '@/lib/core/context'
 import { formatDuration, formatNumber } from '@/lib/core/format'
 
 const router = useRouter()
@@ -185,9 +186,16 @@ function onOpenExemplars({ service }: { service: string }) {
   openService(service)
 }
 
-// Real tenant-scope drill-down lands in Task 12; summary-mode tenants have their own UI to open.
+// Full-mode tenants mirror raw telemetry, so their data is queryable here via the `tenant` scope
+// (Task 12) — drill into Logs pre-scoped. Summary-mode tenants only ever push synthetic health
+// metrics, so there's nothing to browse locally; they link out to the tenant's own UI instead.
 function openTenant(tenant: TenantSummary) {
-  if (tenant.mode === 'summary') window.open(tenant.ui_url ?? '#', '_blank')
+  if (tenant.mode === 'summary') {
+    window.open(tenant.ui_url ?? '#', '_blank')
+    return
+  }
+  setScope({ type: 'tenant', id: tenant.name, label: tenant.name })
+  router.push(correlate({ path: '/logs' }))
 }
 </script>
 

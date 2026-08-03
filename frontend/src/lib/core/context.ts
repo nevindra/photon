@@ -15,7 +15,7 @@ export interface CustomRange {
   endMs: number
 }
 
-export type ScopeType = 'service' | 'rumApp' | 'host' | 'monitor'
+export type ScopeType = 'service' | 'rumApp' | 'host' | 'monitor' | 'tenant'
 
 export interface Scope {
   type: ScopeType
@@ -60,6 +60,15 @@ export function setScope(s: Scope): void {
 }
 export function clearScope(): void {
   scope.value = null
+}
+
+// The first scope type that actually filters: the grammar term the active scope contributes to
+// backend queries (logs/traces/metrics composables append it to the `q`/`filter` string they
+// send). Other scope types (service/rumApp/host/monitor) stay decorative — chip + URL only — this
+// only fires for `tenant`.
+export function scopeQueryTerm(): string | null {
+  const s = scope.value
+  return s?.type === 'tenant' ? `tenant:${s.id}` : null
 }
 
 // --- URL sync ---

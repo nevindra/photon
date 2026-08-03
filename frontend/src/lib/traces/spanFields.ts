@@ -62,6 +62,11 @@ export const SPAN_FIELDS: SpanFieldDescriptor[] = [
     description: 'Parent span ID within a trace',
     kind: 'match',
   },
+  {
+    name: 'tenant',
+    description: 'Federated tenant (stamped by central)',
+    kind: 'match',
+  },
 ]
 
 // name -> catalog entry, or undefined for unknown fields.

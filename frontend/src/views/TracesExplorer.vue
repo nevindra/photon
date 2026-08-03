@@ -43,6 +43,7 @@ import {
   startNs,
   endNs,
   setCustomRange,
+  scopeQueryTerm,
 } from '@/lib/core/context'
 import { correlate } from '@/lib/core/useCorrelate'
 
@@ -127,11 +128,23 @@ const traceAttrCols = ref([])
 // The search bar debounces at 180ms — only the settled text keys the query (and thus refetches).
 const debouncedText = refDebounced(text, 180)
 
+// A `tenant` scope appends its grammar term to every backend request/self-fetching child below —
+// NEVER to `text` itself (that stays the literal, displayed SearchBar value) or the pinned
+// facet/histogram/latency composables would leak into ServicesListView/ServiceDetailView, which
+// also mount SpanVolumeHistogram/LatencyHistogram/TracesFilters but aren't tenant-scoped in v1.
+const scopedText = computed(() => [text.value, scopeQueryTerm()].filter(Boolean).join(' '))
+const scopedDebouncedText = computed(() =>
+  [debouncedText.value.trim(), scopeQueryTerm()].filter(Boolean).join(' '),
+)
+
 // Cache key = the RELATIVE search descriptor. It deliberately excludes the now-anchored absolute
 // window (that would churn the key every millisecond); the absolute start/end are resolved at
 // FETCH time in `buildRequest`. A pinned custom range IS part of the key (it's fixed, not "now").
 // `mode` re-keys when flipping Traces↔Spans; the sorted attribute-column list re-keys so adding a
 // column refetches with the extra projection.
+// `query` here is the RAW debounced text — `useSearchTraces`/`useSearchSpans` (tracesQueries.ts)
+// already append the active scope's grammar term to both the request AND their own queryKey, so
+// this relative descriptor doesn't need to carry it too.
 const searchDescriptor = computed(() => ({
   range: timeRange.value,
   custom: customRange.value ? `${customRange.value.startMs}-${customRange.value.endMs}` : null,
@@ -175,7 +188,7 @@ const drawer = ref(null) // { traceId, spanId, timeHintNs } | null
 const pollMs = ref(false)
 const liveTail = useLiveTail({
   grain: 'spans',
-  query: computed(() => debouncedText.value.trim()),
+  query: scopedDebouncedText,
   onPoll: (v) => {
     if (v === 'once') {
       search.value.refetch()
@@ -462,7 +475,7 @@ if (typeof window !== 'undefined') {
     <div class="flex flex-1 min-h-0">
       <aside class="flex w-[210px] flex-none flex-col overflow-y-auto border-r border-border">
         <TracesFilters
-          :query="text"
+          :query="scopedText"
           :start-ms="aggStartMs"
           :end-ms="aggEndMs"
           @toggle-value="onToggleValue"
@@ -500,14 +513,14 @@ if (typeof window !== 'undefined') {
           </div>
           <SpanVolumeHistogram
             v-if="chartMode === 'volume'"
-            :query="text"
+            :query="scopedText"
             :start-ms="aggStartMs"
             :end-ms="aggEndMs"
             @zoom="onCustomRange"
           />
           <LatencyHistogram
             v-else
-            :query="text"
+            :query="scopedText"
             :start-ms="aggStartMs"
             :end-ms="aggEndMs"
             @brush="onLatencyBrush"

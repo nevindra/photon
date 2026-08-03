@@ -3,7 +3,7 @@ import { SPAN_FIELDS, findSpanField, SPAN_EXAMPLE_QUERIES } from '@/lib/traces/s
 import { tokenize } from '@/lib/core/queryLang'
 
 describe('SPAN_FIELDS catalog', () => {
-  it('is exactly the eight fixed span fields, in a stable order', () => {
+  it('is exactly the nine fixed span fields, in a stable order', () => {
     expect(SPAN_FIELDS.map((f) => f.name)).toEqual([
       'service',
       'operation',
@@ -13,6 +13,7 @@ describe('SPAN_FIELDS catalog', () => {
       'trace_id',
       'span_id',
       'parent_span_id',
+      'tenant',
     ])
   })
 

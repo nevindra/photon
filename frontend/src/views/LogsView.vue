@@ -38,6 +38,7 @@ import {
     startMs,
     endMs,
     setCustomRange,
+    scopeQueryTerm,
 } from "@/lib/core/context";
 import { correlate } from "@/lib/core/useCorrelate";
 
@@ -143,9 +144,14 @@ const debouncedQuery = computed(() => debouncedText.value.trim());
 // must already be initialized. The `searchQuery.refetch()` reference inside `onPoll` is a forward
 // reference to a `const` declared further down; that's safe because `onPoll` is only ever invoked
 // later (in response to a user action), by which point `searchQuery` is long since initialized.
+// Live tail streams over SSE, bypassing logsQueries.ts entirely — so unlike useSearchLogs/
+// useFacet/useHistogram (which append the active tenant scope internally), the scope term has to
+// be folded in here explicitly for Live mode to stay tenant-scoped too.
 const liveTail = useLiveTail({
     grain: "logs",
-    query: computed(() => debouncedText.value.trim()),
+    query: computed(() =>
+        [debouncedText.value.trim(), scopeQueryTerm()].filter(Boolean).join(" "),
+    ),
     onPoll: (v) => {
         if (v === "once") {
             searchQuery.refetch();

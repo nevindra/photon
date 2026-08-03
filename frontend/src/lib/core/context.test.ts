@@ -3,7 +3,7 @@ import {
   timeRange, customRange, scope, nowTick,
   startNs, endNs, prevStartNs, prevEndNs,
   setTimeRange, setCustomRange, setScope, clearScope, RANGE_MS,
-  parseContext, seedContextFromUrl, syncContextToUrl,
+  parseContext, seedContextFromUrl, syncContextToUrl, scopeQueryTerm,
 } from '@/lib/core/context'
 
 beforeEach(() => {
@@ -48,6 +48,14 @@ describe('context time math', () => {
     expect(scope.value?.id).toBe('checkout')
     clearScope()
     expect(scope.value).toBeNull()
+  })
+
+  it('scopeQueryTerm only fires for a tenant scope', () => {
+    expect(scopeQueryTerm()).toBeNull()
+    setScope({ type: 'service', id: 'checkout', label: 'checkout' })
+    expect(scopeQueryTerm()).toBeNull()
+    setScope({ type: 'tenant', id: 'divtik', label: 'divtik' })
+    expect(scopeQueryTerm()).toBe('tenant:divtik')
   })
 })
 

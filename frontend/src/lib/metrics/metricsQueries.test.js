@@ -4,6 +4,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { api } from '@/lib/core/api'
 import { useMetricCatalog, useMetricMetadata, useMetricLabels, useMetricSeries } from '@/lib/metrics/metricsQueries'
+import { setScope, clearScope } from '@/lib/core/context'
 
 // `tracesQueries.js` (the sibling module this file mirrors) has no dedicated test file of its
 // own in this codebase — every query composable here is only ever exercised inside a mounted
@@ -53,7 +54,41 @@ describe('metricsQueries', () => {
     // The cache key registered with TanStack carries only the RELATIVE descriptor —
     // never the absolute start/end ns — so live-tail refetches don't churn the cache key.
     const keys = queryClient.getQueryCache().getAll().map((q) => q.queryKey)
-    expect(keys).toContainEqual(['metric-series', 'm|avg||30m'])
+    expect(keys).toContainEqual(['metric-series', 'm|avg||30m', null])
     expect(JSON.stringify(keys)).not.toContain('"10"')
+  })
+
+  // Task 12: `tenant` is the first ScopeType that actually filters — appended to every query
+  // spec's `filter` string (each MetricQuerySpec, not just the first) and to the cache key.
+  it('useMetricSeries appends the tenant term to each query spec filter under a tenant scope', async () => {
+    const spy = vi.spyOn(api, 'metricQuery').mockResolvedValue({ results: [], step: '1', capped: false, elapsed_ms: 0 })
+    setScope({ type: 'tenant', id: 'divtik', label: 'divtik' })
+    try {
+      const buildRequest = () => ({
+        queries: [{ id: 'a', metric: 'm', group_by: [], filter: 'service:checkout' }],
+        start: '0',
+        end: '10',
+      })
+      const Harness = defineComponent({
+        setup() {
+          useMetricSeries(ref('m|avg||30m'), buildRequest)
+          return () => null
+        },
+      })
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      mount(Harness, { global: { plugins: [[VueQueryPlugin, { queryClient }]] } })
+      await flushPromises()
+
+      expect(spy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          queries: [expect.objectContaining({ filter: 'service:checkout tenant:divtik' })],
+        }),
+        expect.anything(),
+      )
+      const keys = queryClient.getQueryCache().getAll().map((q) => q.queryKey)
+      expect(keys).toContainEqual(['metric-series', 'm|avg||30m', 'tenant:divtik'])
+    } finally {
+      clearScope()
+    }
   })
 })

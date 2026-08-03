@@ -10,6 +10,7 @@ import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import HomeView from './HomeView.vue'
 import { api } from '@/lib/core/api'
+import { scope, clearScope } from '@/lib/core/context'
 
 vi.mock('@/lib/core/api', () => ({
   api: {
@@ -36,6 +37,7 @@ const router = createRouter({
     { path: '/rum', component: { template: '<div/>' } },
     { path: '/rum/:appId', component: { template: '<div/>' } },
     { path: '/uptime', component: { template: '<div/>' } },
+    { path: '/logs', component: { template: '<div/>' } },
     { path: '/login', component: { template: '<div/>' } },
   ],
 })
@@ -84,5 +86,29 @@ describe('HomeView', () => {
     expect(board.text()).toContain('acme')
     expect(board.text()).toContain('globex')
     expect(board.text()).toContain('Unreachable')
+  })
+
+  // Task 12: clicking a full-mode tenant card sets the `tenant` scope and drills into Logs (the
+  // scope then narrows the log search via `scopeQueryTerm()`); a summary-mode card has no local
+  // data to browse, so it links out to the tenant's own UI instead (unchanged from Task 11).
+  it('clicking a full-mode tenant card scopes to that tenant and opens Logs', async () => {
+    clearScope()
+    ;(api.tenantsSummary as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { name: 'globex', mode: 'full', status: 'up', last_seen_ms: Date.now(), ingest_rows_per_sec: 3, open_incidents: 0, hot_bytes: 0, ui_url: null, spark: [] },
+    ])
+    router.push('/home')
+    await router.isReady()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+    const w = mount(
+      { components: { HomeView, TooltipProvider }, template: '<TooltipProvider><HomeView/></TooltipProvider>' },
+      { global: { plugins: [router, [VueQueryPlugin, { queryClient }]] }, attachTo: document.body },
+    )
+    await flushPromises()
+
+    await w.get('[data-tenant="globex"]').trigger('click')
+    await flushPromises()
+
+    expect(scope.value).toEqual({ type: 'tenant', id: 'globex', label: 'globex' })
+    expect(router.currentRoute.value.path).toBe('/logs')
   })
 })
