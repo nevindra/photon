@@ -2,7 +2,7 @@
 //! mapping → metrics-WAL append. Decode errors (and auth failures) are rejected before the WAL
 //! is touched.
 
-use crate::auth::check_bearer_token;
+use crate::auth::{resolve_bearer, stamp_tenant_metrics, Auth};
 use crate::metrics_mapping::{estimate_rows, otlp_metrics_into_builder};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -15,6 +15,7 @@ use photon_core::ingest_counters::IngestCounters;
 use photon_core::metric_record::MetricBatchBuilder;
 use photon_core::metric_schema::MetricSchema;
 use photon_core::PhotonError;
+use photon_core::TenantTokenMap;
 use photon_wal::Wal;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -29,6 +30,9 @@ pub(crate) struct MetricsHttpState<W: Wal + Send + Sync + 'static> {
     pub(crate) in_flight: Arc<Semaphore>,
     /// Cumulative ingest tallies, incremented after a successful WAL append.
     pub(crate) counters: Arc<IngestCounters>,
+    /// Federation: bearer token -> tenant name, consulted when the local token doesn't
+    /// match. Empty on a non-central node, so tenant auth simply never matches.
+    pub(crate) tenant_tokens: TenantTokenMap,
 }
 
 /// Decode a raw protobuf body into an `ExportMetricsServiceRequest`. Pure — no I/O — so the
@@ -58,7 +62,8 @@ async fn ingest_metrics<W: Wal + Send + Sync + 'static>(
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if !check_bearer_token(auth_header, &state.token) {
+    let auth = resolve_bearer(auth_header, &state.token, &state.tenant_tokens);
+    if auth == Auth::Denied {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
 
@@ -73,13 +78,17 @@ async fn ingest_metrics<W: Wal + Send + Sync + 'static>(
         }
     };
 
-    let req = match decode_metrics_request(&body) {
+    let mut req = match decode_metrics_request(&body) {
         Ok(req) => req,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     // Frees the request buffer before the WAL fsync await; up to `max_body_bytes` (~16 MiB)
     // per in-flight request would otherwise stay pinned for the duration of the append.
     drop(body);
+
+    if let Auth::Tenant(tenant) = &auth {
+        stamp_tenant_metrics(&mut req, tenant);
+    }
 
     let mut builder = MetricBatchBuilder::with_capacity(&state.schema, estimate_rows(&req));
     otlp_metrics_into_builder(req, &mut builder);
@@ -160,6 +169,7 @@ mod tests {
             schema: MetricSchema::new(&["service.name".to_string()]),
             in_flight: Arc::new(Semaphore::new(1)),
             counters: Arc::new(photon_core::ingest_counters::IngestCounters::new()),
+            tenant_tokens: TenantTokenMap::default(),
         };
 
         let _first = state

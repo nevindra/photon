@@ -3,7 +3,7 @@
 //! Snappy/decode/auth failures are rejected before the WAL is touched. Writes the *same*
 //! metrics WAL as the OTLP `/v1/metrics` receiver.
 
-use crate::auth::check_bearer_token;
+use crate::auth::{resolve_bearer, Auth};
 use crate::promrw_mapping::promrw_to_points;
 use crate::promrw_proto::WriteRequest;
 use axum::extract::State;
@@ -16,6 +16,7 @@ use photon_core::ingest_counters::IngestCounters;
 use photon_core::metric_record::MetricBatchBuilder;
 use photon_core::metric_schema::MetricSchema;
 use photon_core::PhotonError;
+use photon_core::TenantTokenMap;
 use photon_wal::Wal;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -35,6 +36,9 @@ pub(crate) struct PromRwHttpState<W: Wal + Send + Sync + 'static> {
     pub(crate) max_body_bytes: usize,
     /// Cumulative ingest tallies (the `metrics` signal), incremented after a successful append.
     pub(crate) counters: Arc<IngestCounters>,
+    /// Federation: bearer token -> tenant name, consulted when the local token doesn't
+    /// match. Empty on a non-central node, so tenant auth simply never matches.
+    pub(crate) tenant_tokens: TenantTokenMap,
 }
 
 /// Snappy-decompress then protobuf-decode a remote-write body. Pure — no I/O — so the
@@ -72,8 +76,19 @@ async fn ingest_promrw<W: Wal + Send + Sync + 'static>(
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if !check_bearer_token(auth_header, &state.token) {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    match resolve_bearer(auth_header, &state.token, &state.tenant_tokens) {
+        Auth::Local => {}
+        // Remote-write carries no resource, so there is nowhere to stamp the tenant on.
+        Auth::Tenant(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "tenant tokens not accepted on remote-write",
+            )
+                .into_response()
+        }
+        Auth::Denied => {
+            return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()
+        }
     }
 
     let _permit = match state.in_flight.clone().acquire_owned().await {
@@ -190,6 +205,7 @@ mod tests {
             in_flight: Arc::new(Semaphore::new(4)),
             max_body_bytes: 16 * 1024 * 1024,
             counters: Arc::new(IngestCounters::new()),
+            tenant_tokens: TenantTokenMap::default(),
         })
     }
 
@@ -312,6 +328,7 @@ mod tests {
             in_flight: Arc::new(Semaphore::new(4)),
             max_body_bytes: 64, // tiny cap so we allocate nothing large
             counters: Arc::new(IngestCounters::new()),
+            tenant_tokens: TenantTokenMap::default(),
         });
         let mut encoder = snap::raw::Encoder::new();
         let compressed = encoder.compress_vec(&vec![0u8; 4096]).unwrap(); // claims 4096 > 64
@@ -330,6 +347,7 @@ mod tests {
             in_flight: Arc::new(Semaphore::new(1)),
             max_body_bytes: s.max_body_bytes,
             counters: s.counters.clone(),
+            tenant_tokens: TenantTokenMap::default(),
         };
         let _first = s
             .in_flight
@@ -358,6 +376,7 @@ mod tests {
             in_flight: in_flight.clone(),
             max_body_bytes: 16 * 1024 * 1024,
             counters: Arc::new(IngestCounters::new()),
+            tenant_tokens: TenantTokenMap::default(),
         });
         let _held = in_flight
             .acquire_owned()

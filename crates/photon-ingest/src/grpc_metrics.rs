@@ -1,6 +1,6 @@
 //! tonic `MetricsService`: token check → OTLP→`MetricPoint` mapping → metrics-WAL append.
 
-use crate::auth::check_bearer_token;
+use crate::auth::{resolve_bearer, stamp_tenant_metrics, Auth};
 use crate::metrics_mapping::{estimate_rows, otlp_metrics_into_builder};
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     metrics_service_server::MetricsService, ExportMetricsServiceRequest,
@@ -9,6 +9,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
 use photon_core::ingest_counters::IngestCounters;
 use photon_core::metric_record::MetricBatchBuilder;
 use photon_core::metric_schema::MetricSchema;
+use photon_core::TenantTokenMap;
 use photon_wal::Wal;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -23,6 +24,9 @@ pub(crate) struct GrpcMetricsService<W: Wal + Send + Sync + 'static> {
     pub(crate) in_flight: Arc<Semaphore>,
     /// Cumulative ingest tallies, incremented after a successful WAL append.
     pub(crate) counters: Arc<IngestCounters>,
+    /// Federation: bearer token -> tenant name, consulted when the local token doesn't
+    /// match. Empty on a non-central node, so tenant auth simply never matches.
+    pub(crate) tenant_tokens: TenantTokenMap,
 }
 
 #[tonic::async_trait]
@@ -38,7 +42,8 @@ impl<W: Wal + Send + Sync + 'static> MetricsService for GrpcMetricsService<W> {
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok());
-        if !check_bearer_token(auth_header, &self.token) {
+        let auth = resolve_bearer(auth_header, &self.token, &self.tenant_tokens);
+        if auth == Auth::Denied {
             return Err(tonic::Status::unauthenticated(
                 "missing or invalid bearer token",
             ));
@@ -48,7 +53,10 @@ impl<W: Wal + Send + Sync + 'static> MetricsService for GrpcMetricsService<W> {
             tonic::Status::resource_exhausted(format!("ingest temporarily overloaded: {e}"))
         })?;
 
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        if let Auth::Tenant(tenant) = &auth {
+            stamp_tenant_metrics(&mut req, tenant);
+        }
         let mut builder = MetricBatchBuilder::with_capacity(&self.schema, estimate_rows(&req));
         otlp_metrics_into_builder(req, &mut builder);
         let batch = builder

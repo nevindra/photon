@@ -46,6 +46,7 @@ use photon_core::metric_schema::MetricSchema;
 use photon_core::schema::LogSchema;
 use photon_core::span_schema::SpanSchema;
 use photon_core::PhotonError;
+use photon_core::TenantTokenMap;
 use photon_wal::Wal;
 use promrw_http::PromRwHttpState;
 use std::net::SocketAddr;
@@ -79,6 +80,10 @@ pub struct IngestServer<W: Wal + Send + Sync + 'static> {
     /// Shared with the usage sampler (`photon-server`) so `/api/usage/series` can report
     /// ingest rates without touching the WAL or the compactor.
     counters: Arc<IngestCounters>,
+    /// Central-side federation: bearer token -> tenant name, shared live with the tenant
+    /// registry (which rebuilds it on every mutation). Empty by default = tenant auth never
+    /// matches, so a non-central node behaves exactly as before.
+    pub tenant_tokens: TenantTokenMap,
 }
 
 impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
@@ -106,6 +111,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             max_in_flight,
             max_body_bytes,
             counters,
+            tenant_tokens: TenantTokenMap::default(),
         }
     }
 
@@ -135,6 +141,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.schema.clone(),
             in_flight: in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
         };
         let grpc_trace_service = GrpcTraceService {
             wal: self.spans_wal.clone(),
@@ -142,6 +149,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.span_schema.clone(),
             in_flight: traces_in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
         };
         let grpc_metrics_service = GrpcMetricsService {
             wal: self.metrics_wal.clone(),
@@ -149,6 +157,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.metric_schema.clone(),
             in_flight: metrics_in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
         };
         // `accept_compressed(Gzip)` lets a stock OTel Collector (which gzips gRPC by default)
         // talk to us; `max_decoding_message_size(max_body_bytes)` makes the gRPC front door agree
@@ -178,6 +187,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.schema.clone(),
             in_flight: in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
         });
         let trace_state = Arc::new(TraceHttpState {
             wal: self.spans_wal.clone(),
@@ -185,6 +195,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.span_schema.clone(),
             in_flight: traces_in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
         });
         let metrics_state = Arc::new(MetricsHttpState {
             wal: self.metrics_wal.clone(),
@@ -192,6 +203,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.metric_schema.clone(),
             in_flight: metrics_in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
         });
         let promrw_state = Arc::new(PromRwHttpState {
             wal: self.metrics_wal.clone(),
@@ -200,6 +212,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             in_flight: promrw_in_flight.clone(),
             max_body_bytes: self.max_body_bytes,
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
         });
         let app = build_http_router(
             http_state,
@@ -334,6 +347,7 @@ mod gzip_interop_tests {
                 schema: LogSchema::new(&promoted),
                 in_flight: in_flight.clone(),
                 counters: counters.clone(),
+                tenant_tokens: TenantTokenMap::default(),
             }),
             Arc::new(TraceHttpState {
                 wal: wal.clone(),
@@ -341,6 +355,7 @@ mod gzip_interop_tests {
                 schema: SpanSchema::new(&promoted),
                 in_flight: in_flight.clone(),
                 counters: counters.clone(),
+                tenant_tokens: TenantTokenMap::default(),
             }),
             Arc::new(MetricsHttpState {
                 wal: wal.clone(),
@@ -348,6 +363,7 @@ mod gzip_interop_tests {
                 schema: MetricSchema::new(&promoted),
                 in_flight: in_flight.clone(),
                 counters: counters.clone(),
+                tenant_tokens: TenantTokenMap::default(),
             }),
             Arc::new(PromRwHttpState {
                 wal: wal.clone(),
@@ -356,6 +372,7 @@ mod gzip_interop_tests {
                 in_flight: in_flight.clone(),
                 max_body_bytes,
                 counters: counters.clone(),
+                tenant_tokens: TenantTokenMap::default(),
             }),
             max_body_bytes,
         )
