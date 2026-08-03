@@ -12,6 +12,7 @@ mod assets;
 mod auth;
 mod data;
 mod facet;
+mod federation;
 mod fields;
 mod histogram;
 mod infra;
@@ -45,6 +46,7 @@ use photon_core::PhotonError;
 use photon_query::{MetricsQueryEngine, QueryEngine, SpanQueryEngine};
 
 pub use data::{DataAdmin, PurgeCommand, PurgeSender, RetentionAtomics};
+pub use federation::{FederationStatus, FederationStatusSnapshot};
 pub use rum::{RumApi, RumSink};
 pub use stream::LiveHub;
 pub use tenants::TenantApi;
@@ -88,6 +90,10 @@ pub struct ApiServer {
     /// The tenant registry (federation control plane). `None` keeps `/api/tenants*` returning
     /// 404 — set via [`ApiServer::with_tenant_store`].
     tenants: Option<tenants::TenantApi>,
+    /// A live view of this node's own tenant-side federation pusher/tee. `None` makes
+    /// `/api/federation/status` report `enabled: false` — set via
+    /// [`ApiServer::with_federation_status`].
+    federation: Option<Arc<dyn federation::FederationStatus>>,
 }
 
 /// Shared, immutable application state: a cheap-to-clone handle over an `Arc`. Handlers pull
@@ -118,6 +124,8 @@ pub(crate) struct AppStateInner {
     pub(crate) alerts: Option<alerts::AlertsApi>,
     /// The tenant registry; read by the tenant management handlers (`tenants.rs`).
     pub(crate) tenants: Option<tenants::TenantApi>,
+    /// This node's own federation pusher/tee status; read by `federation.rs`.
+    pub(crate) federation: Option<Arc<dyn federation::FederationStatus>>,
 }
 
 impl std::ops::Deref for AppState {
@@ -158,6 +166,7 @@ impl ApiServer {
             rum: None,
             alerts: None,
             tenants: None,
+            federation: None,
         }
     }
 
@@ -218,6 +227,17 @@ impl ApiServer {
         self
     }
 
+    /// Attach a live view of this node's own tenant-side federation pusher/tee, built by
+    /// `photon-server`. Leaving it unset keeps `/api/federation/status` reporting
+    /// `enabled: false` — the subsystem is optional.
+    pub fn with_federation_status(
+        mut self,
+        federation: Option<Arc<dyn federation::FederationStatus>>,
+    ) -> Self {
+        self.federation = federation;
+        self
+    }
+
     /// Bind `addr` and serve until the process is terminated.
     pub async fn serve(self, addr: SocketAddr) -> Result<(), PhotonError> {
         let app = self.into_router();
@@ -246,6 +266,7 @@ impl ApiServer {
             rum: self.rum,
             alerts: self.alerts,
             tenants: self.tenants,
+            federation: self.federation,
         }));
 
         // Everything except `/api/login` requires a valid signed `photon_session` cookie.
@@ -355,6 +376,7 @@ impl ApiServer {
                 "/tenants/:name/rotate-token",
                 post(tenants::rotate_tenant_token),
             )
+            .route("/federation/status", get(federation::status))
             .route("/logout", post(auth::logout))
             .route("/users", get(auth::list_users).post(auth::create_user))
             .route("/users/:username", axum::routing::delete(auth::delete_user))
@@ -480,6 +502,7 @@ pub(crate) fn test_state_with_rum(rum: Option<rum::RumApi>) -> AppState {
         rum,
         alerts: s.alerts,
         tenants: s.tenants,
+        federation: s.federation,
     }))
 }
 
@@ -503,6 +526,7 @@ pub(crate) fn test_state_with_tenants(tenants: Option<tenants::TenantApi>) -> Ap
         rum: s.rum,
         alerts: s.alerts,
         tenants,
+        federation: s.federation,
     }))
 }
 

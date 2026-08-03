@@ -65,8 +65,8 @@ use argon2::{Argon2, PasswordHasher};
 
 use photon_api::settings::{SettingsStore, SqliteSettingsStore};
 use photon_api::{
-    signal_from_path, ApiServer, DataAdmin, LiveHub, PurgeCommand, ReplicationStatus,
-    RetentionAtomics, SqliteUsageStore, UsageStore,
+    signal_from_path, ApiServer, DataAdmin, FederationStatus, FederationStatusSnapshot, LiveHub,
+    PurgeCommand, ReplicationStatus, RetentionAtomics, SqliteUsageStore, UsageStore,
 };
 use photon_compact::{Compactor, MetricsCompactor, SpanCompactor};
 use photon_core::config::{Config, FederationMode};
@@ -480,6 +480,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // photon-api cannot depend on photon-server, so expose the pusher/tee to the API through the
+    // `FederationStatus` trait — same newtype-over-orphan-rule shape as `ReplStatus` above.
+    struct FedStatus(
+        Option<photon_core::config::FederationConfig>,
+        Arc<federation::FederationStats>,
+    );
+    impl FederationStatus for FedStatus {
+        fn snapshot(&self) -> Option<FederationStatusSnapshot> {
+            let cfg = self.0.as_ref()?;
+            let stats = &self.1;
+            Some(FederationStatusSnapshot {
+                mode: match cfg.mode {
+                    FederationMode::Summary => "summary".to_string(),
+                    FederationMode::Full => "full".to_string(),
+                },
+                endpoint: cfg.endpoint.clone(),
+                last_push_ms: stats.last_push_ms.load(std::sync::atomic::Ordering::Relaxed),
+                last_error: stats.last_error.lock().unwrap().clone(),
+                pushed: stats.pushed.load(std::sync::atomic::Ordering::Relaxed),
+                dropped: stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
+                queued: stats.queued.load(std::sync::atomic::Ordering::Relaxed),
+            })
+        }
+    }
+    let federation_status: Arc<dyn FederationStatus> =
+        Arc::new(FedStatus(cfg.federation.clone(), federation_stats.clone()));
+
     // Uptime monitoring is always on: the scheduler + prune tasks run and the uptime tables are
     // opened in the shared control-plane SQLite. With no monitors configured it stays idle (no
     // probes). It shares the alerts store so a monitor going down/up also opens/closes a shared
@@ -546,7 +573,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_live_hub(live_hub)
     .with_usage(usage.clone(), repl_status.clone())
     .with_rum(rum_api)
-    .with_tenant_store(tenant_api);
+    .with_tenant_store(tenant_api)
+    .with_federation_status(Some(federation_status));
 
     println!("photon-server listening: otlp-grpc={grpc_addr} otlp-http={http_addr} api={api_addr}");
 
