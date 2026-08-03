@@ -9,6 +9,7 @@ import { createRouter, createMemoryHistory } from 'vue-router'
 import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import HomeView from './HomeView.vue'
+import { api } from '@/lib/core/api'
 
 vi.mock('@/lib/core/api', () => ({
   api: {
@@ -19,6 +20,7 @@ vi.mock('@/lib/core/api', () => ({
     }),
     rumVitals: vi.fn().mockResolvedValue({ app: 'web', vitals: [{ metric: 'web_vitals.lcp', p75: 3100, rating: 'needs-improvement' }] }),
     listMonitors: vi.fn().mockResolvedValue([{ id: '1', name: 'api', last_state: 'up' }]),
+    tenantsSummary: vi.fn().mockResolvedValue([]),
   },
 }))
 
@@ -51,5 +53,36 @@ describe('HomeView', () => {
     )
     await flushPromises()
     expect(w.get('[data-testid="home"]').text()).toContain('checkout')
+  })
+
+  it('hides the tenant board when the tenants summary is empty', async () => {
+    router.push('/home')
+    await router.isReady()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+    const w = mount(
+      { components: { HomeView, TooltipProvider }, template: '<TooltipProvider><HomeView/></TooltipProvider>' },
+      { global: { plugins: [router, [VueQueryPlugin, { queryClient }]] }, attachTo: document.body },
+    )
+    await flushPromises()
+    expect(w.find('[data-testid="home-tenants"]').exists()).toBe(false)
+  })
+
+  it('renders a tenant board with one card per tenant, down-tenants marked unreachable', async () => {
+    ;(api.tenantsSummary as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { name: 'acme', mode: 'summary', status: 'up', last_seen_ms: Date.now(), ingest_rows_per_sec: 12, open_incidents: 0, hot_bytes: 1024, ui_url: null, spark: [] },
+      { name: 'globex', mode: 'full', status: 'down', last_seen_ms: Date.now() - 600_000, ingest_rows_per_sec: 0, open_incidents: 2, hot_bytes: 0, ui_url: null, spark: [] },
+    ])
+    router.push('/home')
+    await router.isReady()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+    const w = mount(
+      { components: { HomeView, TooltipProvider }, template: '<TooltipProvider><HomeView/></TooltipProvider>' },
+      { global: { plugins: [router, [VueQueryPlugin, { queryClient }]] }, attachTo: document.body },
+    )
+    await flushPromises()
+    const board = w.get('[data-testid="home-tenants"]')
+    expect(board.text()).toContain('acme')
+    expect(board.text()).toContain('globex')
+    expect(board.text()).toContain('Unreachable')
   })
 })

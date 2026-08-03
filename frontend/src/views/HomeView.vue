@@ -10,6 +10,7 @@ import AppShell from '@/components/common/AppShell.vue'
 import ChartPanel from '@/components/charts/ChartPanel.vue'
 import LineChart from '@/components/charts/LineChart.vue'
 import RedTable from '@/components/metrics/RedTable.vue'
+import TenantCard from '@/components/tenants/TenantCard.vue'
 import { StatTile } from '@/components/ui/stat-tile'
 import { Sparkline } from '@/components/ui/sparkline'
 import { StatusDot } from '@/components/ui/status-dot'
@@ -20,6 +21,7 @@ import { correlate } from '@/lib/core/useCorrelate'
 import { useServicesList, useServiceTimeseries } from '@/lib/services/servicesQueries'
 import { useRumApps, useRumVitals } from '@/lib/rum/rumQueries'
 import { useMonitors } from '@/lib/uptime/uptimeQueries'
+import { useTenantsSummary, type TenantSummary } from '@/lib/tenants/tenantsQueries'
 import { formatDuration, formatNumber } from '@/lib/core/format'
 
 const router = useRouter()
@@ -44,6 +46,9 @@ const vitals = computed<any[]>(() => vitalsQuery.data.value?.vitals ?? [])
 // --- Infra world: uptime monitors ---
 const monitorsQuery = useMonitors()
 const monitors = computed<any[]>(() => monitorsQuery.data.value ?? [])
+
+const tenantsSummaryQuery = useTenantsSummary()
+const tenants = computed<TenantSummary[]>(() => tenantsSummaryQuery.data.value ?? [])
 
 // --- Headline-service timeseries feeds both trend charts (busiest service by request rate) ---
 const topService = computed<string>(() => {
@@ -179,6 +184,11 @@ function openService(service: string) {
 function onOpenExemplars({ service }: { service: string }) {
   openService(service)
 }
+
+// Real tenant-scope drill-down lands in Task 12; summary-mode tenants have their own UI to open.
+function openTenant(tenant: TenantSummary) {
+  if (tenant.mode === 'summary') window.open(tenant.ui_url ?? '#', '_blank')
+}
 </script>
 
 <template>
@@ -198,6 +208,16 @@ function onOpenExemplars({ service }: { service: string }) {
           @click="go(k.to)"
           @keydown.enter="go(k.to)"
         />
+      </section>
+
+      <!-- Tenants (federation board) -->
+      <section v-if="tenants.length" data-testid="home-tenants" class="flex flex-col gap-2">
+        <div class="flex items-center justify-between">
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Tenants</h3>
+        </div>
+        <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          <TenantCard v-for="t in tenants" :key="t.name" :tenant="t" @select="openTenant" />
+        </div>
       </section>
 
       <!-- Headline trend charts -->
