@@ -11,12 +11,13 @@ import { ArrowLeft } from 'lucide-vue-next'
 import AppShell from '@/components/common/AppShell.vue'
 import HostStatTiles from '@/components/infra/HostStatTiles.vue'
 import HostResourcePanels from '@/components/infra/HostResourcePanels.vue'
+import HostProcessesTable from '@/components/infra/HostProcessesTable.vue'
 import RelatedMenu from '@/components/common/RelatedMenu.vue'
 import { Spinner } from '@/components/ui/spinner'
-import { api } from '@/lib/core/api'
+import { api, type InfraProcess } from '@/lib/core/api'
 import { formatBytes } from '@/lib/core/format'
 import { startNs, endNs, setScope } from '@/lib/core/context'
-import { useInfraHost, useHostResourceSeries } from '@/lib/infra/infraQueries'
+import { useInfraHost, useHostResourceSeries, useInfraHostProcesses } from '@/lib/infra/infraQueries'
 
 const route = useRoute()
 
@@ -42,6 +43,11 @@ const endMs = computed(() => Number(endNs.value) / 1_000_000)
 const crumb = computed(() => 'Infrastructure › ' + host.value)
 const hasGpu = computed(() => (detail.value?.gpus?.length ?? 0) > 0)
 const res = useHostResourceSeries(host, startNs, endNs, hasGpu)
+
+// --- Processes: every supervised process on this host, ranked (default heaviest CPU first). ---
+const procQ = useInfraHostProcesses(host, startNs, endNs)
+const processes = computed<InfraProcess[]>(() => procQ.data.value?.processes ?? [])
+const procLoading = computed(() => procQ.isLoading.value)
 </script>
 
 <template>
@@ -72,6 +78,9 @@ const res = useHostResourceSeries(host, startNs, endNs, hasGpu)
         </header>
         <HostStatTiles :res="res" :total-ram-bytes="detail?.totalRamBytes ?? null" :has-gpu="hasGpu" />
         <HostResourcePanels :res="res" :start-ms="startMs" :end-ms="endMs" :has-gpu="hasGpu" :gpu-names="detail?.gpus ?? []" />
+
+        <!-- Processes: every supervised process on this host, ranked by resource usage. -->
+        <HostProcessesTable :processes="processes" :loading="procLoading" />
       </template>
     </main>
   </AppShell>

@@ -30,6 +30,7 @@ use crate::MetricsQueryEngine;
 
 // --- The exact OTel system-metric names / attributes this vertical curates (Global Constants). ---
 const HOST_ATTR: &str = "host.name";
+const SERVICE_ATTR: &str = "service.name";
 const OS_TYPE_ATTR: &str = "os.type";
 const GPU_NAME_ATTR: &str = "gpu.name";
 
@@ -44,6 +45,45 @@ const GPU_MEM_UTIL: &str = "system.gpu.memory.utilization";
 const GPU_TEMP: &str = "system.gpu.temperature";
 const GPU_POWER: &str = "system.gpu.power";
 const LOAD_1M: &str = "system.cpu.load_average.1m";
+
+// Per-process resource metrics. Each point carries `service.name` (= the supervised process /
+// worker name) AND `host.name` (= the node). A "process on host H" is one distinct `service.name`
+// among these metrics scoped to `host.name = H` — so two instances of the same service on one host
+// collapse into a single row and their gauges average together (OTel would key finer on
+// `process.pid`/`process.executable.name`; that identity is out of scope for this vertical).
+//
+// OTel process semantic-convention names are the PRIMARY contract; the original bespoke names are
+// kept as a FALLBACK so both OTel-Collector producers and pre-semconv producers work. A producer
+// uses one scheme consistently, so `infra_host_processes` picks the scheme from whichever CPU
+// metric enumerates processes and reads every other gauge in that same scheme.
+//
+// `process.cpu.utilization` (semconv) is a 0..1 fraction, surfaced as a percent (×100);
+// `process.cpu.percent` (bespoke) is already 0..100, surfaced as-is — so the CPU column reads the
+// same regardless of which producer supplied it.
+const PROC_CPU_SEMCONV: &str = "process.cpu.utilization";
+const PROC_CPU_BESPOKE: &str = "process.cpu.percent";
+const PROC_MEM_SEMCONV: &str = "process.memory.usage";
+const PROC_MEM_BESPOKE: &str = "process.memory.rss";
+const PROC_FDS_SEMCONV: &str = "process.unix.file_descriptor.count";
+const PROC_FDS_BESPOKE: &str = "process.open_fds";
+const PROC_THREADS_SEMCONV: &str = "process.thread.count";
+const PROC_THREADS_BESPOKE: &str = "process.threads";
+// `process.restarts` is a Photon-specific extension — OTel has no process-restart semconv metric.
+const PROC_RESTARTS: &str = "process.restarts";
+
+// Server-side cap on the per-host Processes table: the top N processes by window-avg CPU, matching
+// the repo's bounded-table convention (cf. `MAX_RED_GROUPS`). Comfortably above any real host's
+// worker count, but a guard against a pathological `service.name` cardinality blow-up.
+const PROC_ROW_CAP: usize = 200;
+
+/// How a per-process gauge folds over the window: `Avg` for instantaneous gauges (cpu/rss/fds/
+/// threads), `Max` for `process.restarts` — a cumulative counter whose max is its latest count
+/// (averaging it would render a nonsense fraction).
+#[derive(Clone, Copy)]
+enum ProcAgg {
+    Avg,
+    Max,
+}
 
 /// One host with its latest headline vitals over a window — the Infrastructure list row.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +129,29 @@ pub struct HostDetail {
 pub struct HostSeries {
     pub resource: String,
     pub series: Vec<crate::SeriesResult>,
+}
+
+/// One supervised process (keyed by `service.name`) running on a host, with its latest resource
+/// usage over a window — the per-host Processes table row. Every gauge is `Option` because a
+/// process may report the CPU metric (which enumerates it) without every other metric being present
+/// in the window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessSummary {
+    pub process: String,
+    /// Window-avg CPU as a percent (0..100). Sourced from `process.cpu.utilization` (semconv, a
+    /// 0..1 fraction surfaced ×100) or `process.cpu.percent` (bespoke, already a percent).
+    pub cpu_pct: Option<f64>,
+    /// Window-avg resident memory in bytes (`process.memory.usage` or `process.memory.rss`).
+    pub rss_bytes: Option<f64>,
+    /// Window-avg open file descriptors (`process.unix.file_descriptor.count` or `process.open_fds`).
+    pub fds: Option<f64>,
+    /// Window-avg thread count (`process.thread.count` or `process.threads`).
+    pub threads: Option<f64>,
+    /// Max `process.restarts` in the window — a cumulative counter, so max is the latest count
+    /// (averaging 0→1→3 would render a nonsense "1.3").
+    pub restarts: Option<f64>,
+    /// Newest sample timestamp seen for the process's CPU metric (epoch nanos); `0` if unknown.
+    pub last_seen_ns: i64,
 }
 
 /// The curated resource panels. `from_str` parses the API path segment; `primary` maps each
@@ -439,6 +502,209 @@ impl MetricsQueryEngine {
             gpus,
             last_seen_ns,
         })
+    }
+
+    /// Distinct supervised processes running on one host + their latest resource usage over
+    /// `[start_ns, end_ns]`, ranked-ready for the per-host Processes table (top `PROC_ROW_CAP` by
+    /// window-avg CPU). A row is ONE `service.name` on the host: two instances of the same service
+    /// on a host collapse into one row whose gauges average together (OTel would key finer on
+    /// `process.pid`/`process.executable.name` — out of scope for this PR).
+    ///
+    /// Processes are enumerated from the CPU metric — every process reports it — preferring the OTel
+    /// semconv name (`process.cpu.utilization`, a 0..1 fraction surfaced ×100) and falling back to
+    /// the bespoke name (`process.cpu.percent`, already 0..100). The scheme the CPU metric was found
+    /// under then selects the memory/fds/threads metric names, since a producer uses one scheme
+    /// throughout. Everything is grouped by the promoted `service.name` column and scoped to the
+    /// host both by `MetricRequest.host` (skip-index host-range pruning) and a `host.name = <host>`
+    /// row predicate — the same host scoping `infra_host_detail`'s per-host reads use. RSS/fds/
+    /// threads fold in per process with the window-avg fill `infra_hosts` uses; `restarts` folds in
+    /// with `max` (a cumulative counter — averaging 0→1→3 would render a nonsense "1.3"). A process
+    /// with no CPU points in the window does not appear.
+    pub async fn infra_host_processes(
+        &self,
+        host: &str,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Vec<ProcessSummary>, PhotonError> {
+        let mut out: BTreeMap<String, ProcessSummary> = BTreeMap::new();
+
+        // Enumerate from the semconv CPU metric first (0..1 fraction → ×100); if a producer emits
+        // none, fall back to the bespoke metric (already a 0..100 percent → ×1).
+        self.enumerate_processes_from_cpu(&mut out, PROC_CPU_SEMCONV, 100.0, host, start_ns, end_ns)
+            .await?;
+        let used_semconv = !out.is_empty();
+        if out.is_empty() {
+            self.enumerate_processes_from_cpu(
+                &mut out,
+                PROC_CPU_BESPOKE,
+                1.0,
+                host,
+                start_ns,
+                end_ns,
+            )
+            .await?;
+        }
+
+        // Read the remaining gauges in whichever scheme the CPU metric was found under.
+        let (mem, fds, threads) = if used_semconv {
+            (PROC_MEM_SEMCONV, PROC_FDS_SEMCONV, PROC_THREADS_SEMCONV)
+        } else {
+            (PROC_MEM_BESPOKE, PROC_FDS_BESPOKE, PROC_THREADS_BESPOKE)
+        };
+
+        // CPU/memory/fds/threads are gauges → window-avg. `restarts` is a cumulative counter → max.
+        self.fill_process_gauge(&mut out, mem, ProcAgg::Avg, host, start_ns, end_ns, |p, v| {
+            p.rss_bytes = Some(v)
+        })
+        .await?;
+        self.fill_process_gauge(&mut out, fds, ProcAgg::Avg, host, start_ns, end_ns, |p, v| {
+            p.fds = Some(v)
+        })
+        .await?;
+        self.fill_process_gauge(&mut out, threads, ProcAgg::Avg, host, start_ns, end_ns, |p, v| {
+            p.threads = Some(v)
+        })
+        .await?;
+        self.fill_process_gauge(
+            &mut out,
+            PROC_RESTARTS,
+            ProcAgg::Max,
+            host,
+            start_ns,
+            end_ns,
+            |p, v| p.restarts = Some(v),
+        )
+        .await?;
+
+        // Return CPU-desc (nulls last), stable by name — the heaviest process on top. The row cap
+        // is already enforced in-query by `enumerate_processes_from_cpu`.
+        let mut rows: Vec<ProcessSummary> = out.into_values().collect();
+        rows.sort_by(|a, b| {
+            b.cpu_pct
+                .partial_cmp(&a.cpu_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.process.cmp(&b.process))
+        });
+        Ok(rows)
+    }
+
+    /// Enumerate processes on `host` from a CPU metric, inserting a `ProcessSummary` per distinct
+    /// `service.name` (window-avg CPU × `scale` — `100.0` for the 0..1 semconv fraction, `1.0` for
+    /// the already-percent bespoke metric — plus the newest sample timestamp). Capped at the top
+    /// `PROC_ROW_CAP` by CPU in-query (cf. `red_metrics`). No-op when the metric has no surviving
+    /// files, so a caller can try semconv then bespoke and keep whichever populated `out`.
+    async fn enumerate_processes_from_cpu(
+        &self,
+        out: &mut BTreeMap<String, ProcessSummary>,
+        metric: &str,
+        scale: f64,
+        host: &str,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<(), PhotonError> {
+        let req = MetricRequest {
+            metric: metric.to_string(),
+            start_ts_nanos: start_ns,
+            end_ts_nanos: end_ns,
+            filter: None,
+            host: Some(host.to_string()),
+        };
+        let Some(df) = self.survivors_df(&req).await? else {
+            return Ok(());
+        };
+        let value = col_ref(metric_schema::VALUE);
+        let ts = col_ref(metric_schema::TIMESTAMP);
+        let batches = df
+            .filter(metric_base_predicate(&req).and(col_ref(HOST_ATTR).eq(lit(host.to_string()))))
+            .map_err(|e| PhotonError::Query(format!("infra_host_processes filter: {e}")))?
+            .aggregate(
+                vec![col_ref(SERVICE_ATTR).alias("process")],
+                vec![avg(value).alias("cpu"), max(ts).alias("last_seen")],
+            )
+            .map_err(|e| PhotonError::Query(format!("infra_host_processes aggregate: {e}")))?
+            .sort(vec![
+                col_ref("cpu").sort(false, false), // CPU desc, nulls last — keep the busiest
+                col_ref("process").sort(true, false), // stable tiebreak
+            ])
+            .map_err(|e| PhotonError::Query(format!("infra_host_processes sort: {e}")))?
+            .limit(0, Some(PROC_ROW_CAP))
+            .map_err(|e| PhotonError::Query(format!("infra_host_processes limit: {e}")))?
+            .collect()
+            .await
+            .map_err(|e| PhotonError::Query(format!("infra_host_processes collect: {e}")))?;
+        for b in &batches {
+            let process = str_col(b, 0)?;
+            let cpu = f64_col(b, 1);
+            let last = ts_col(b, 2);
+            for i in 0..b.num_rows() {
+                if process.is_valid(i) {
+                    let p = process.value(i).to_string();
+                    out.entry(p.clone()).or_insert(ProcessSummary {
+                        process: p,
+                        cpu_pct: cpu(i).map(|v| v * scale),
+                        rss_bytes: None,
+                        fds: None,
+                        threads: None,
+                        restarts: None,
+                        last_seen_ns: last(i).unwrap_or(0),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold a per-process gauge (grouped by `service.name`) onto the processes already discovered by
+    /// `infra_host_processes`, aggregating with `agg` (`Avg` for instantaneous gauges, `Max` for the
+    /// `process.restarts` cumulative counter). Host-scoped like `host_latest_scalar` (skip-index
+    /// prune + `host.name = <host>` predicate). Processes absent from `out` (no CPU signal) are
+    /// ignored — this only enriches known processes, mirroring `fill_latest_gauge`.
+    async fn fill_process_gauge(
+        &self,
+        out: &mut BTreeMap<String, ProcessSummary>,
+        metric: &str,
+        agg: ProcAgg,
+        host: &str,
+        start_ns: i64,
+        end_ns: i64,
+        set: impl Fn(&mut ProcessSummary, f64),
+    ) -> Result<(), PhotonError> {
+        let req = MetricRequest {
+            metric: metric.to_string(),
+            start_ts_nanos: start_ns,
+            end_ts_nanos: end_ns,
+            filter: None,
+            host: Some(host.to_string()),
+        };
+        let Some(df) = self.survivors_df(&req).await? else {
+            return Ok(());
+        };
+        let value = col_ref(metric_schema::VALUE);
+        let agg_expr = match agg {
+            ProcAgg::Avg => avg(value),
+            ProcAgg::Max => max(value),
+        }
+        .alias("v");
+        let batches = df
+            .filter(metric_base_predicate(&req).and(col_ref(HOST_ATTR).eq(lit(host.to_string()))))
+            .map_err(|e| PhotonError::Query(format!("infra fill_process_gauge filter: {e}")))?
+            .aggregate(vec![col_ref(SERVICE_ATTR).alias("process")], vec![agg_expr])
+            .map_err(|e| PhotonError::Query(format!("infra fill_process_gauge aggregate: {e}")))?
+            .collect()
+            .await
+            .map_err(|e| PhotonError::Query(format!("infra fill_process_gauge collect: {e}")))?;
+        for b in &batches {
+            let process = str_col(b, 0)?;
+            let v = f64_col(b, 1);
+            for i in 0..b.num_rows() {
+                if process.is_valid(i) {
+                    if let (Some(ps), Some(val)) = (out.get_mut(process.value(i)), v(i)) {
+                        set(ps, val);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Window-avg value + newest timestamp of a numeric metric for one host. `(None, 0)` when the
@@ -849,6 +1115,96 @@ mod tests_fixture {
         let engine = MetricsQueryEngine::new(hot, schema).unwrap();
         (dir, engine)
     }
+
+    /// A `mp`-style point that also sets a specific `service.name` (the process/worker name), so a
+    /// segment can carry several distinct processes on one host. Used by the processes fixture.
+    fn proc_mp(metric: &str, host: &str, process: &str, ts: i64, value: f64) -> MetricPoint {
+        let mut attributes = std::collections::BTreeMap::new();
+        attributes.insert("service.name".to_string(), process.to_string());
+        attributes.insert("host.name".to_string(), host.to_string());
+        MetricPoint {
+            metric_name: metric.to_string(),
+            metric_type: metric_type::GAUGE,
+            timestamp_nanos: ts,
+            value: Some(value),
+            attributes,
+            ..Default::default()
+        }
+    }
+
+    /// One host (`web-1`) running two supervised processes (`api`, `worker`) each reporting the full
+    /// per-process metric set with the BESPOKE names (so this also exercises the fallback path),
+    /// plus a second host (`web-2`) running `api` — so a host-scoped process query must return
+    /// exactly `web-1`'s two processes, never `web-2`'s. `api` reports a MULTI-POINT restart series
+    /// (0 → 1 → 3) so the `max` aggregation can be told apart from an `avg` (which would be 1.33).
+    pub(super) async fn host_with_processes() -> (tempfile::TempDir, MetricsQueryEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().to_path_buf();
+        let schema = schema();
+        compact(
+            &hot,
+            &schema,
+            vec![(
+                SegmentId(0),
+                vec![batch(
+                    &schema,
+                    &[
+                        // web-1 / api — the heaviest CPU process.
+                        proc_mp(PROC_CPU_BESPOKE, "web-1", "api", 10, 40.0),
+                        proc_mp(PROC_CPU_BESPOKE, "web-1", "api", 20, 60.0),
+                        proc_mp(PROC_MEM_BESPOKE, "web-1", "api", 20, 536_870_912.0),
+                        proc_mp(PROC_FDS_BESPOKE, "web-1", "api", 20, 128.0),
+                        proc_mp(PROC_THREADS_BESPOKE, "web-1", "api", 20, 12.0),
+                        // Cumulative restart counter, three points: max is 3, avg would be ~1.33.
+                        proc_mp(PROC_RESTARTS, "web-1", "api", 10, 0.0),
+                        proc_mp(PROC_RESTARTS, "web-1", "api", 15, 1.0),
+                        proc_mp(PROC_RESTARTS, "web-1", "api", 20, 3.0),
+                        // web-1 / worker — lighter.
+                        proc_mp(PROC_CPU_BESPOKE, "web-1", "worker", 20, 10.0),
+                        proc_mp(PROC_MEM_BESPOKE, "web-1", "worker", 20, 268_435_456.0),
+                        proc_mp(PROC_FDS_BESPOKE, "web-1", "worker", 20, 64.0),
+                        proc_mp(PROC_THREADS_BESPOKE, "web-1", "worker", 20, 8.0),
+                        proc_mp(PROC_RESTARTS, "web-1", "worker", 20, 3.0),
+                        // web-2 / api — a different host; must be excluded from web-1's result.
+                        proc_mp(PROC_CPU_BESPOKE, "web-2", "api", 20, 99.0),
+                    ],
+                )],
+            )],
+        )
+        .await;
+        let engine = MetricsQueryEngine::new(hot, schema).unwrap();
+        (dir, engine)
+    }
+
+    /// The same host but emitting OTel **semconv** process metrics — `process.cpu.utilization` as a
+    /// 0..1 fraction, `process.memory.usage`, `process.unix.file_descriptor.count`,
+    /// `process.thread.count` — so a test can prove `infra_host_processes` reads semconv as the
+    /// primary contract and scales utilization ×100 into a percent.
+    pub(super) async fn host_with_semconv_processes() -> (tempfile::TempDir, MetricsQueryEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().to_path_buf();
+        let schema = schema();
+        compact(
+            &hot,
+            &schema,
+            vec![(
+                SegmentId(0),
+                vec![batch(
+                    &schema,
+                    &[
+                        proc_mp(PROC_CPU_SEMCONV, "web-1", "api", 20, 0.5), // 0.5 fraction → 50%
+                        proc_mp(PROC_MEM_SEMCONV, "web-1", "api", 20, 536_870_912.0),
+                        proc_mp(PROC_FDS_SEMCONV, "web-1", "api", 20, 128.0),
+                        proc_mp(PROC_THREADS_SEMCONV, "web-1", "api", 20, 12.0),
+                        proc_mp(PROC_RESTARTS, "web-1", "api", 20, 2.0),
+                    ],
+                )],
+            )],
+        )
+        .await;
+        let engine = MetricsQueryEngine::new(hot, schema).unwrap();
+        (dir, engine)
+    }
 }
 
 #[cfg(test)]
@@ -937,6 +1293,50 @@ mod tests {
                 s.points.len()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn infra_host_processes_lists_host_workers_with_usage() {
+        let (_dir, engine) = super::tests_fixture::host_with_processes().await;
+        let procs = engine
+            .infra_host_processes("web-1", 0, i64::MAX)
+            .await
+            .unwrap();
+        // Only web-1's two processes — web-2's `api` must NOT leak in. Returned CPU-desc, so the
+        // heaviest (`api`, 50) is first.
+        let names: Vec<String> = procs.iter().map(|p| p.process.clone()).collect();
+        assert_eq!(names, vec!["api".to_string(), "worker".to_string()]);
+
+        let api = procs.iter().find(|p| p.process == "api").unwrap();
+        // window-avg CPU of 40 and 60 = 50 (bespoke `process.cpu.percent`, already a percent).
+        assert!((api.cpu_pct.unwrap() - 50.0).abs() < 1e-9, "got {:?}", api.cpu_pct);
+        assert_eq!(api.rss_bytes, Some(536_870_912.0));
+        assert_eq!(api.fds, Some(128.0));
+        assert_eq!(api.threads, Some(12.0));
+        // Restarts is a cumulative counter aggregated with MAX: the 0→1→3 series renders 3, not the
+        // ~1.33 an avg would give.
+        assert_eq!(api.restarts, Some(3.0), "restarts must be max(0,1,3)=3, not the avg");
+        assert!(api.last_seen_ns > 0);
+
+        let worker = procs.iter().find(|p| p.process == "worker").unwrap();
+        assert_eq!(worker.restarts, Some(3.0));
+    }
+
+    #[tokio::test]
+    async fn infra_host_processes_reads_semconv_names_and_scales_utilization() {
+        let (_dir, engine) = super::tests_fixture::host_with_semconv_processes().await;
+        let procs = engine
+            .infra_host_processes("web-1", 0, i64::MAX)
+            .await
+            .unwrap();
+        let api = procs.iter().find(|p| p.process == "api").unwrap();
+        // `process.cpu.utilization` 0.5 (a 0..1 fraction) is surfaced as 50%.
+        assert!((api.cpu_pct.unwrap() - 50.0).abs() < 1e-9, "got {:?}", api.cpu_pct);
+        // The remaining gauges are read from their semconv names, not the bespoke ones.
+        assert_eq!(api.rss_bytes, Some(536_870_912.0));
+        assert_eq!(api.fds, Some(128.0));
+        assert_eq!(api.threads, Some(12.0));
+        assert_eq!(api.restarts, Some(2.0));
     }
 
     #[test]

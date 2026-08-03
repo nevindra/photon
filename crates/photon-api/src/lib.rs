@@ -273,6 +273,7 @@ impl ApiServer {
             .route("/metrics/labels", get(metrics::labels))
             .route("/infra/hosts", get(infra::hosts))
             .route("/infra/hosts/:host", get(infra::host_detail))
+            .route("/infra/hosts/:host/processes", get(infra::processes))
             .route("/infra/hosts/:host/timeseries", get(infra::host_timeseries))
             .route("/rum/apps", get(rum::apps).post(rum::create_app))
             .route(

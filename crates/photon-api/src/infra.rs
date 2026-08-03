@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use photon_core::PhotonError;
-use photon_query::{HostDetail, HostSummary, InfraResource, SeriesResult};
+use photon_query::{HostDetail, HostSummary, InfraResource, ProcessSummary, SeriesResult};
 
 use crate::AppState;
 
@@ -42,6 +42,18 @@ fn host_detail_json(d: &HostDetail) -> Value {
         "totalRamBytes": d.total_ram_bytes,
         "gpus": d.gpus,
         "lastSeenNs": d.last_seen_ns.to_string(),
+    })
+}
+
+fn process_summary_json(p: &ProcessSummary) -> Value {
+    json!({
+        "process": p.process,
+        "cpuPct": p.cpu_pct,
+        "rssBytes": p.rss_bytes,
+        "fds": p.fds,
+        "threads": p.threads,
+        "restarts": p.restarts,
+        "lastSeenNs": p.last_seen_ns.to_string(),
     })
 }
 
@@ -85,6 +97,26 @@ pub(crate) async fn host_detail(
         .await
     {
         Ok(d) => Json(host_detail_json(&d)).into_response(),
+        Err(e) => err_500(e),
+    }
+}
+
+// ---------- GET /api/infra/hosts/:host/processes ----------
+
+pub(crate) async fn processes(
+    State(st): State<AppState>,
+    Path(host): Path<String>,
+    Query(p): Query<HostsParams>,
+) -> Response {
+    match st
+        .metrics_query
+        .infra_host_processes(&host, p.start, p.end)
+        .await
+    {
+        Ok(v) => {
+            let processes: Vec<Value> = v.iter().map(process_summary_json).collect();
+            Json(json!({ "processes": processes })).into_response()
+        }
         Err(e) => err_500(e),
     }
 }
@@ -168,6 +200,50 @@ mod tests {
         assert_eq!(v["lastSeenNs"], "42");
         assert_eq!(v["cores"], 8);
         assert_eq!(v["gpus"], serde_json::json!(["NVIDIA A100"]));
+    }
+
+    #[test]
+    fn process_summary_json_stringifies_last_seen_ns() {
+        let p = ProcessSummary {
+            process: "api".into(),
+            cpu_pct: Some(42.5),
+            rss_bytes: Some(536_870_912.0),
+            fds: Some(128.0),
+            threads: Some(12.0),
+            restarts: None,
+            last_seen_ns: 1_700_000_000_000_000_000,
+        };
+        let v = process_summary_json(&p);
+        assert_eq!(v["process"], "api");
+        assert_eq!(v["lastSeenNs"], "1700000000000000000");
+        assert_eq!(v["cpuPct"], 42.5);
+        assert_eq!(v["rssBytes"], 536_870_912.0);
+        assert_eq!(v["fds"], 128.0);
+        assert_eq!(v["threads"], 12.0);
+        assert_eq!(v["restarts"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn processes_over_empty_server_returns_empty_list() {
+        use tower::ServiceExt;
+        let router = crate::test_router();
+        let cookie = crate::session_cookie(&router).await;
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/infra/hosts/web-1/processes?start=0&end=1")
+                    .header(axum::http::header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, json!({ "processes": [] }));
     }
 
     #[tokio::test]

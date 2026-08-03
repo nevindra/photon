@@ -254,7 +254,8 @@ including RUM's `GET /api/rum/errors` (now with an optional `q` log-grammar filt
 (issue detail), and the RUM app-registry management routes `GET/POST /api/rum/apps`,
 `PATCH/DELETE /api/rum/apps/:name`, `POST /api/rum/apps/:name/rotate-key` (apps are UI-managed —
 there is no `[[rum.apps]]` config anymore) — plus the curated Infrastructure vertical
-`GET /api/infra/hosts`, `GET /api/infra/hosts/:host`, `GET /api/infra/hosts/:host/timeseries` (see
+`GET /api/infra/hosts`, `GET /api/infra/hosts/:host`, `GET /api/infra/hosts/:host/processes`,
+`GET /api/infra/hosts/:host/timeseries` (see
 [`docs/subsystems/infra.md`](docs/subsystems/infra.md)) and the cross-signal alert engine
 `GET/POST /api/alerts/rules`, `GET/PATCH/DELETE /api/alerts/rules/:id`,
 `POST /api/alerts/rules/:id/test`, `POST /api/alerts/preview`, `GET/POST /api/alerts/channels`,

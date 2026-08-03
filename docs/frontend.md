@@ -126,7 +126,10 @@ pushes to.
   `/infra/:host` glance stat-tile row — last-point derivation off a shared series bundle, 80%/90%
   warn/error tint), `HostResourcePanels.vue` (presentational per-resource trend cards — each chart in
   a titled `charts/ChartPanel`: CPU total/per-core toggle + load average, memory/network, disk
-  meters, a 4-card GPU section — reads the same series bundle rather than owning its own queries; see
+  meters, a 4-card GPU section — reads the same series bundle rather than owning its own queries),
+  `HostProcessesTable.vue` (the `/infra/:host` **Processes** table — one row per supervised process
+  (`service.name`) on the host, built on `ui/table` + `EmptyState`, click-to-sort columns defaulting
+  to CPU descending with nulls last; see
   [`subsystems/infra.md`](subsystems/infra.md)). `alerts/` (the webhook alert engine, cross-signal):
   `AlertStatBand`, `AlertRulesTable`/`AlertRuleRow` (its "Browse templates" button + empty-state link
   open the quick-setup picker), `AlertRuleDialog`/`ConditionBuilder` (the plain-English condition
