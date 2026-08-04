@@ -20,6 +20,30 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// jemalloc's *decay* is driven by allocation activity in each arena: an arena purges its dirty
+/// pages only when something allocates in it, and `background_thread` is **off** by default. So a
+/// process that goes quiet never returns what it freed — RSS parks at the high-water mark until
+/// traffic resumes. Compaction is exactly the wrong shape for that default: it allocates large
+/// Arrow/Parquet buffers in bursts, frees them, then idles.
+///
+/// Measured on a production node (14.5 days, ~68 spans/s, ~400 MB/day ingest): **734 MB RSS at 2%
+/// CPU**, 698 MB of it anonymous and spread over 863 mappings — freed-but-unpurged arena pages, not
+/// live working set. Turning the background thread on lets jemalloc purge while idle; the 1 s decay
+/// windows (default 10 s) return pages promptly after each compaction burst rather than holding a
+/// burst's peak until the next one.
+///
+/// Linux-only on purpose: `background_thread` is unsupported on macOS, where enabling it would warn
+/// at startup and do nothing. Dev builds there keep jemalloc's defaults; the deployment target
+/// (distroless Linux) is what this is sized for.
+///
+/// The symbol MUST be `_rjem_malloc_conf`, not `malloc_conf` — `tikv-jemallocator` builds jemalloc
+/// with the `_rjem_` symbol prefix, so an unprefixed name is silently ignored and every setting
+/// here is quietly lost.
+#[cfg(target_os = "linux")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 /// The alerts `ConditionSource` seam over the three query engines (wired into the scheduler in a
 /// later task). Kept as a module so it can carry its own tests without bloating `main`.
 mod alerts_source;

@@ -47,9 +47,17 @@ knob and no code change.
   saturation, i.e. it is compaction/ingest **backlog**, not a fixed baseline.
 - **Transient vs retained:** post-idle sits within ~3% of peak in every run (e.g. seg128: 7,015 vs
   7,236). Since the working memory is provably transient (segment-scaled, load-scaled, released when
-  the compaction finishes), the fact that RSS does **not** fall during 30s idle means glibc is
-  **holding freed pages in its arenas rather than returning them to the OS** — not a true leak. An
-  allocator change (jemalloc/mimalloc) or `MALLOC_ARENA_MAX` / periodic `malloc_trim` would reclaim it.
+  the compaction finishes), the fact that RSS does **not** fall during 30s idle means the allocator
+  is **holding freed pages in its arenas rather than returning them to the OS** — not a true leak.
+
+  **Follow-up (resolved).** Switching to jemalloc was necessary but *not sufficient*: a production
+  node running jemalloc still sat at **734 MB RSS at 2% CPU** after 4 days (698 MB anonymous across
+  863 mappings, 0 SSE clients, ~68 spans/s ingest). Stock jemalloc leaves `background_thread` off
+  and drives decay from allocation activity within each arena, so an idle process never purges —
+  the same post-idle ≈ peak signature, one allocator down. Fixed by exporting a `_rjem_malloc_conf`
+  static (`background_thread:true`, 1 s dirty/muzzy decay); see `docs/conventions.md` for the two
+  traps (`_rjem_` symbol prefix, Linux-only gate). `MALLOC_ARENA_MAX` is **not** applicable here —
+  it is a glibc tunable and glibc is no longer the allocator.
 
 ## Breakdown & verdict
 

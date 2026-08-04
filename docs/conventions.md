@@ -29,7 +29,19 @@ public API, adding a dependency, or touching the query/chart data path.
   debug build). Don't "simplify" this profile away.
 - **jemalloc** (`tikv-jemallocator`) is the global allocator in the server — it returns freed pages
   to the OS (glibc retained them) and speeds the allocation-heavy ingest path. Measured, not
-  incidental.
+  incidental. It is **tuned, not stock**: `main.rs` exports a `_rjem_malloc_conf` static setting
+  `background_thread:true` plus 1 s dirty/muzzy decay. Stock jemalloc drives decay from allocation
+  activity *within each arena* and leaves `background_thread` off, so an idle process never purges
+  what it freed — a production node sat at **734 MB RSS at 2% CPU**, 698 MB of it freed-but-unpurged
+  arena pages. Two traps if you touch this:
+  - The symbol MUST be `_rjem_malloc_conf`. `tikv-jemallocator` builds jemalloc with the `_rjem_`
+    prefix (it only drops it under the `unprefixed_malloc_on_supported_platforms` feature, which we
+    do not enable), so a plain `malloc_conf` is silently ignored and every setting is lost. The env
+    var is likewise `_RJEM_MALLOC_CONF`, not `MALLOC_CONF` — which makes it the way to test a
+    setting against a *running* deployment with no rebuild.
+  - It is `#[cfg(target_os = "linux")]` on purpose. macOS does not support `background_thread` and
+    prints `option background_thread currently supports pthread only` on every run; the deployment
+    target is distroless Linux, and dev builds keep jemalloc's defaults.
 - **Prometheus remote-write type inference:** RW 1.0 samples carry no type tag, so
   `promrw_mapping::classify` infers it from the metric-name suffix — `_total`/`_bucket`/`_count`/
   `_sum` → cumulative monotonic `SUM`, else `GAUGE`. This mirrors the OTel Collector's Prometheus

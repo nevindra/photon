@@ -109,6 +109,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An idle server no longer holds hundreds of MB of freed heap.** jemalloc has been the global
+  allocator for a while, but on **stock settings**: `background_thread` is off by default and decay
+  is driven by allocation activity *within each arena*, so a process that stops allocating never
+  runs the purge that would return its dirty pages to the OS. A production node showed exactly
+  that — **734 MB RSS at 2% CPU** after 4 days, 698 MB of it anonymous across 863 mappings, with no
+  SSE clients and ~68 spans/s of ingest: peak compaction/ingest buffers, freed but never handed
+  back. `photon-server` now exports a `_rjem_malloc_conf` static setting `background_thread:true`
+  with 1 s `dirty_decay_ms`/`muzzy_decay_ms`, so a dedicated jemalloc thread purges on a timer and
+  RSS tracks the live working set instead of the high-water mark. Two traps worth knowing (both
+  written up in `docs/conventions.md`): the symbol **must** be `_rjem_malloc_conf` — `tikv-jemallocator`
+  builds jemalloc with the `_rjem_` prefix, so a plain `malloc_conf` is silently ignored and every
+  setting is lost, and the matching env var is `_RJEM_MALLOC_CONF` (which makes it the way to try a
+  setting against a *running* deployment with no rebuild); and it is `#[cfg(target_os = "linux")]`
+  on purpose, since macOS does not support `background_thread` and warns on every run. Note
+  `MALLOC_ARENA_MAX` does nothing here — it is a glibc tunable and glibc is not the allocator.
 - **Small-file merging no longer stalls, so the Parquet file population stays bounded.**
   `merge_once` partitioned on a 10,000-row `MERGE_ROW_THRESHOLD` used as an *input classifier*,
   with no notion of a target output size — which gave merging a **fixed point barely above the
