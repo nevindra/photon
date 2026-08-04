@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-04
+
+A **performance release driven by production measurement**, not by benchmarks: every change below
+was found on a live 15-day deployment (95M records, 6.1 GB of spans across 7,012 files, on a
+rotational disk) and verified against its own data. Small-file merging had silently stalled at a
+fixed point, skip-index pruning paid full seek latency one file at a time, an idle server held
+~700 MB of freed heap, and compacted Parquet was taking library-default column encodings that were
+wrong for its two largest column shapes. Two of the fixes cost nothing (the encoding change and the
+prune fan-out are the same or faster), and one long-standing config recommendation turned out to be
+backwards. Failed searches also stop disguising themselves as empty results. Infrastructure
+monitoring gains a per-host Processes table. Fully backward compatible — no migration, no format
+change; existing Parquet files stay readable and are re-encoded opportunistically as merging
+rewrites them.
+
 ### Added
 
 - **Per-host Processes table on `/infra/:host`, behind `GET /api/infra/hosts/:host/processes`.**
@@ -468,6 +482,9 @@ operator-facing knobs. Fully backward compatible — no config or API breaking c
 - **Cached metric probe metadata** per engine (manifest-pointer invalidated), dropping a
   redundant prune + Parquet open per chart panel.
 
+[1.5.0]: https://github.com/nevindra/photon/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/nevindra/photon/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/nevindra/photon/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/nevindra/photon/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/nevindra/photon/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/nevindra/photon/releases/tag/v1.0.0
