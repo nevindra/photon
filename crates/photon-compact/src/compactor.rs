@@ -38,7 +38,9 @@ use photon_index::SkipIndex;
 use photon_storage::{Replicator, Storage};
 use photon_wal::Wal;
 
-use crate::stream::{fsync_manifest, hot_local_path, write_parquet_streamed, DEFAULT_ZSTD_LEVEL};
+use crate::stream::{
+    fsync_manifest, hot_local_path, write_parquet_streamed, TimeEncoding, DEFAULT_ZSTD_LEVEL,
+};
 
 /// Promoted attribute that is the primary sort key. Must match `SkipIndex`'s notion of the
 /// service column and the schema promoted by `Config::validate`.
@@ -455,7 +457,7 @@ fn compact_segment(
     let sorted = sort_by_service_and_timestamp(&concatenated)?;
     drop(concatenated); // free the pre-sort copy before encoding (doc-04 F2)
 
-    write_parquet_streamed(&parquet_file, &sorted, zstd_level)?;
+    write_parquet_streamed(&parquet_file, &sorted, zstd_level, TimeEncoding::Delta)?;
     // Capture the exact on-disk Parquet size now, on this blocking thread, straight after the
     // write — this is what `storage_stats` used to `stat()` per entry every tick. A metadata error
     // degrades to `0`, which makes `storage_stats` fall back to a `stat()` for this entry.

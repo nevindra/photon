@@ -38,9 +38,13 @@ hot_dir = "/var/lib/photon/hot"
 # Shared control-plane SQLite database: UI user accounts and uptime monitors.
 # Always used — required for login and by the always-on uptime subsystem.
 db_path = "/var/lib/photon/photon.db"
-# zstd compression level for compacted Parquet files. Range 1-19. Higher = smaller files
-# (roughly 10-30% smaller at level 3) but more CPU per compaction pass. Optional; defaults to 1
-# (fastest/lowest-ratio — byte-identical to the level Photon used before this was configurable).
+# zstd compression level for compacted Parquet files. Range 1-19. Optional; defaults to 1.
+# Higher is NOT reliably smaller: measured on a production corpus (logs/spans/metrics), level 3
+# came out ~3% LARGER than level 1, because zstd changes strategy in a way that hurts these
+# small, already well-encoded pages. If you raise it, skip straight to 6 or 9 (~-9pp on spans for
+# ~2.7x the compaction CPU) and measure your own data. 19 costs ~20x the CPU and is rarely worth
+# it. Compaction CPU is off the ingest ack path, but on a rotational disk the extra rewrite I/O
+# competes with queries.
 # zstd_level = 1
 
 # `[storage.durable]` is OPTIONAL. Omit the whole section to run hot-tier only (no

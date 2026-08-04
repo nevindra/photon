@@ -193,10 +193,26 @@ Two `object_store` backends with strict role separation:
   hot-query path.
 - **`[storage] zstd_level`** (optional, default `1`, validated range `1..=19`) tunes the zstd
   compression level all three compactors pass to `write_parquet_streamed` (`photon-compact/src/
-  stream.rs`) when streaming a compacted/merged Parquet file to disk. Higher shrinks files further
-  (roughly 10-30% smaller at level 3) for more CPU per compaction pass. The default is
-  byte-identical to the level Photon hardcoded before this became configurable
-  (`ZstdLevel::try_new(1) == ZstdLevel::default()` in parquet 53).
+  stream.rs`) when streaming a compacted/merged Parquet file to disk. **Higher is not reliably
+  smaller** — measured on a production corpus, level 3 came out ~3% *larger* than level 1; the
+  next level that actually pays is 6 (~−9 pp on spans, ~2.7× the compaction CPU), and 19 costs
+  ~20× the CPU. Raise it only with a measurement on your own data.
+- **Per-column Parquet encodings** are chosen in `writer_properties` (`photon-compact/src/
+  stream.rs`) from the Arrow type, not configured. parquet-rs defaults every column to
+  dictionary-first, which is right for the low-cardinality string/enum columns and wrong for two
+  shapes that dominate these files: the `Timestamp`/`Int64` time columns (all-distinct, so the
+  dictionary spills to a flat 8 bytes/row that zstd barely dents) and the random hex ids
+  (`trace_id`/`span_id`/`parent_span_id`, where the dictionary is as large as the data it
+  indexes). Those get `DELTA_BINARY_PACKED` / `DELTA_BYTE_ARRAY` with the dictionary off — on a
+  production corpus, −18% on logs and −11.5% on spans at equal or lower encode CPU. The time-column
+  half is **signal-scoped** via `TimeEncoding`: logs and spans sort time last within a service run
+  so it climbs monotonically, but metrics sorts it last of *four* keys and one scrape stamps many
+  rows with the identical instant — a repetitive column where the dictionary is already optimal and
+  forcing delta measured 2.4% *larger*. `Int32` (the `severity_number`/`kind`/`status_code`/
+  `metric_type`/`temporality` enums) stays on the dictionary path deliberately. This is a
+  write-side choice recorded per column in each file's own metadata, so old and new files read back
+  identically and no migration is needed — existing files keep their old encoding until retention
+  ages them out or a merge pass rewrites them.
 
 | Failure | Recovered by |
 |---|---|

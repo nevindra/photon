@@ -32,6 +32,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Compacted Parquet picks its per-column encodings instead of taking parquet-rs's defaults —
+  logs 18% smaller, spans 11.5% smaller, at equal or lower CPU.** parquet-rs defaults every column
+  to dictionary-first, which is right for the low-cardinality string and enum columns and wrong for
+  the two shapes that dominate these files. On a 15-day production corpus (6.1 GB of spans), the
+  `Timestamp`/`Int64` time columns were **30% of a spans file at a compression ratio of 1.2×** —
+  every value distinct, so the dictionary spills and the column falls back to PLAIN, a flat 8
+  bytes/row zstd barely dents — and the random hex ids (`trace_id`/`span_id`/`parent_span_id`) were
+  another **33%**, paying for a dictionary as large as the data it indexes. `writer_properties`
+  (`photon-compact/src/stream.rs`) now assigns `DELTA_BINARY_PACKED` / `DELTA_BYTE_ARRAY` with the
+  dictionary off for those, deriving the choice from the Arrow type rather than a per-signal column
+  list. This is not a size/CPU trade: encoding the same batch measured **the same or faster** than
+  before. Three boundaries are deliberate and each is pinned by a test:
+  - **`Int32` keeps its dictionary.** It carries only small enums (`severity_number`, `kind`,
+    `status_code`, `metric_type`, `temporality`) where a handful of distinct values RLE-compress to
+    nearly nothing; restricting delta to `Timestamp`/`Int64` measured 0.4 pp *better* on logs than
+    the broader "all integers" rule, so the narrower one costs nothing.
+  - **Metrics opts out of the time-column rule** (`TimeEncoding::Dictionary`). Its sort key is
+    `(metric_name, service.name, host.name, timestamp)` — timestamp is last of four, so it restarts
+    per series rather than climbing, and one scrape stamps many rows with the *identical* instant.
+    That is the dictionary's best case: forcing delta there measured **2.4% larger**, so metrics
+    output is unchanged.
+  - **The hex-id rule stays global**, since it describes the content being random, which no sort
+    key changes.
+  Write-side only. Parquet records each column's encoding in its own metadata, so files written
+  either way read back identically and there is no migration: existing files keep their old
+  encoding until retention ages them out, or until a `merge_once` pass rewrites them — merge shares
+  the same `compact_segment` path, so consolidation re-encodes as it goes.
+- **`zstd_level`'s guidance was wrong and is now corrected.** `photon.example.toml` and
+  `docs/architecture.md` both claimed "roughly 10-30% smaller at level 3". Measured on the same
+  production corpus, **level 3 is ~3% _larger_ than level 1** — zstd changes strategy in a way that
+  hurts these small, already well-encoded pages. The default (1) is unchanged; the docs now say to
+  skip to 6 or 9 (~−9 pp on spans for ~2.7× the compaction CPU) and to measure first, and note that
+  on a rotational disk the extra rewrite I/O competes with queries even though compaction CPU is
+  off the ingest ack path.
 - **The traces grain now names what each number counts.** Filtering `kind:server` listed traces
   rooted at a service with no server span. That is correct — a query matches **spans**, and the
   traces grain returns the whole trace around each match (`trace_list` finds trace ids with ≥1

@@ -26,7 +26,9 @@ use photon_index::SkipIndex;
 use photon_storage::{Replicator, Storage};
 use photon_wal::Wal;
 
-use crate::stream::{fsync_manifest, hot_local_path, write_parquet_streamed, DEFAULT_ZSTD_LEVEL};
+use crate::stream::{
+    fsync_manifest, hot_local_path, write_parquet_streamed, TimeEncoding, DEFAULT_ZSTD_LEVEL,
+};
 
 const SERVICE_NAME_COLUMN: &str = "service.name";
 const HOST_NAME_COLUMN: &str = "host.name";
@@ -401,7 +403,7 @@ fn compact_segment(
     let sorted = sort_metrics(&concatenated)?;
     drop(concatenated);
 
-    write_parquet_streamed(&parquet_file, &sorted, zstd_level)?;
+    write_parquet_streamed(&parquet_file, &sorted, zstd_level, TimeEncoding::Dictionary)?;
     // Capture the exact on-disk Parquet size now, on this blocking thread, straight after the
     // write — this is what `storage_stats` used to `stat()` per entry every tick. A metadata error
     // degrades to `0`, which makes `storage_stats` fall back to a `stat()` for this entry.

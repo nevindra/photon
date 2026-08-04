@@ -42,6 +42,25 @@ public API, adding a dependency, or touching the query/chart data path.
   - It is `#[cfg(target_os = "linux")]` on purpose. macOS does not support `background_thread` and
     prints `option background_thread currently supports pthread only` on every run; the deployment
     target is distroless Linux, and dev builds keep jemalloc's defaults.
+- **Parquet per-column encodings are chosen, not defaulted** (`photon-compact/src/stream.rs`,
+  `writer_properties`). parquet-rs defaults every column to dictionary-first; Photon overrides two
+  shapes where that is actively wrong — the `Timestamp`/`Int64` time columns (all-distinct, so the
+  dictionary spills to a flat 8 bytes/row) and the random hex ids (`trace_id`/`span_id`/
+  `parent_span_id`, where the dictionary is as big as the data it indexes). Three rules that look
+  like they could be "simplified", and each is load-bearing:
+  - **`Int32` stays on the dictionary path.** In all three schemas it is only ever a small enum
+    (`severity_number`, `kind`, `status_code`, `metric_type`, `temporality`). Widening the delta
+    rule to "all integers" regresses exactly these.
+  - **The time-column rule is signal-scoped** (`TimeEncoding`), because it is a property of the
+    sort key. Logs/spans sort time last within a service run so it climbs; metrics sorts it last of
+    *four* keys and one scrape stamps many rows with the identical instant, so the column is
+    repetitive — the dictionary's best case. Forcing delta on metrics measured **2.4% larger**.
+  - **The hex-id rule is not signal-scoped**, because it is about content being random, which no
+    sort key changes.
+  Measured on a production corpus: −18.3% (logs), −11.5% (spans), 0% (metrics), at equal or lower
+  encode CPU. Write-side only — the encoding is recorded per column in each file's own metadata, so
+  old files stay readable and need no migration. Related trap: **`zstd_level` is not monotonic.**
+  Level 3 measured ~3% *larger* than level 1 on this data; the next level that pays is 6.
 - **Prometheus remote-write type inference:** RW 1.0 samples carry no type tag, so
   `promrw_mapping::classify` infers it from the metric-name suffix — `_total`/`_bucket`/`_count`/
   `_sum` → cumulative monotonic `SUM`, else `GAUGE`. This mirrors the OTel Collector's Prometheus
