@@ -24,6 +24,7 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 # SSE live-tail: `async-stream` drives the coalescing select-loop stream body.
 async-stream = "0.3"
 # CORS layer scoped to the public `POST /api/rum` beacon route (RUM); `compression-*` add the

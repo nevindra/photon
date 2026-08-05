@@ -38,7 +38,11 @@ pub(crate) fn resolve_bearer(
     let Some(token) = header_value.and_then(|v| v.strip_prefix("Bearer ")) else {
         return Auth::Denied;
     };
-    match tenants.read().ok().and_then(|m| m.get(token).cloned()) {
+    // `into_inner` on poison: a panic elsewhere while holding the lock must not permanently
+    // turn every tenant token into `Denied` — the map itself is never left half-written
+    // (the registry replaces the whole HashMap under the write lock).
+    let map = tenants.read().unwrap_or_else(|e| e.into_inner());
+    match map.get(token).cloned() {
         Some(tenant) => Auth::Tenant(tenant),
         None => Auth::Denied,
     }

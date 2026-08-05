@@ -117,6 +117,9 @@ pub fn spawn_summary_pusher(
             }
         };
         let mut tick = tokio::time::interval(Duration::from_secs(cfg.interval_secs.max(1)));
+        // Default Burst would fire every tick missed while a push outran the interval (request
+        // timeout 10s vs interval_secs min 5) back-to-back the moment central recovers.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             let snapshot = deps.snapshot().await;
@@ -154,9 +157,12 @@ pub fn spawn_summary_pusher(
 const FORWARD_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 
 /// Spawn the tenant-side `full`-mode forwarder: drain the ingest tee and re-POST each raw OTLP
-/// payload to `{endpoint}/v1/{logs|traces|metrics}` with the tenant bearer token. Failures are
-/// retried up to three times with 250ms/1s backoff and then dropped; the loop itself never
-/// exits, so a central that comes back is served again on the next payload.
+/// payload to `{endpoint}/v1/{logs|traces|metrics}` with the tenant bearer token. HTTP-status
+/// failures (central reachable but erroring) are retried up to three times with 250ms/1s backoff
+/// and then dropped. Connection-level failures (connect refused / timeout) drop the payload after
+/// the FIRST attempt — retrying an unreachable central serializes ~30s of timeouts per payload and
+/// head-of-line-blocks the whole queue into overflow; the single attempt per payload doubles as
+/// the recovery probe. The loop itself never exits.
 pub fn spawn_forwarder(
     cfg: FederationConfig,
     mut rx: tokio::sync::mpsc::Receiver<(photon_ingest::TeeSignal, bytes::Bytes)>,
@@ -176,6 +182,7 @@ pub fn spawn_forwarder(
         while let Some((signal, payload)) = rx.recv().await {
             stats.queued.store(rx.len() as u64, Ordering::Relaxed);
             let url = format!("{}/v1/{}", cfg.endpoint, signal.path());
+            let mut delivered = false;
             for attempt in 0..=FORWARD_BACKOFF.len() {
                 let res = client
                     .post(&url)
@@ -187,7 +194,7 @@ pub fn spawn_forwarder(
                 match res {
                     Ok(r) if r.status().is_success() => {
                         *stats.last_error.lock().unwrap() = None;
-                        break;
+                        delivered = true;
                     }
                     Ok(r) => {
                         *stats.last_error.lock().unwrap() = Some(format!(
@@ -196,14 +203,22 @@ pub fn spawn_forwarder(
                             signal.path()
                         ))
                     }
-                    Err(e) => *stats.last_error.lock().unwrap() = Some(e.to_string()),
-                }
-                match FORWARD_BACKOFF.get(attempt) {
-                    Some(backoff) => tokio::time::sleep(*backoff).await,
-                    None => {
-                        stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    Err(e) => {
+                        *stats.last_error.lock().unwrap() = Some(e.to_string());
+                        // Central unreachable — give up on this payload immediately (see the
+                        // doc comment); the next payload is the probe.
+                        break;
                     }
                 }
+                if delivered {
+                    break;
+                }
+                if let Some(backoff) = FORWARD_BACKOFF.get(attempt) {
+                    tokio::time::sleep(*backoff).await;
+                }
+            }
+            if !delivered {
+                stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
     })
@@ -304,6 +319,35 @@ mod forwarder_tests {
         assert_eq!(got.1, "Bearer tk_tenant_x");
         assert_eq!(got.2, b"span-payload");
         assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    /// An unreachable central (connect refused) costs each payload a single attempt, not three
+    /// timeout-bound retries — the queue must not head-of-line block while central is down.
+    #[tokio::test]
+    async fn connection_failure_drops_immediately_without_retries() {
+        // Bind then drop a listener: a port that actively refuses connections.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let stats = Arc::new(FederationStats::default());
+        spawn_forwarder(cfg(addr), rx, stats.clone());
+
+        let started = std::time::Instant::now();
+        tx.send((TeeSignal::Logs, Bytes::from_static(b"a")))
+            .await
+            .unwrap();
+        tx.send((TeeSignal::Logs, Bytes::from_static(b"b")))
+            .await
+            .unwrap();
+        eventually(|| stats.dropped.load(Ordering::Relaxed) == 2).await;
+        // With the old retry path this takes >= 2 * (250ms + 1s) of backoff alone.
+        assert!(
+            started.elapsed() < Duration::from_millis(1250),
+            "connect failures must not burn the backoff schedule: {:?}",
+            started.elapsed()
+        );
     }
 
     /// A central that keeps 500ing costs the payload after three attempts — but never the loop:

@@ -51,6 +51,15 @@ describe('context time math', () => {
     clearTenant()
     expect(tenantQueryTerm()).toBeNull()
   })
+
+  it('tenantQueryTerm ignores values outside the tenant-name shape (URL-injected)', () => {
+    // `?tenant=a b` would otherwise leak ` b` into the query as a body-substring term.
+    setTenant('a b')
+    expect(tenantQueryTerm()).toBeNull()
+    setTenant('a"quoted')
+    expect(tenantQueryTerm()).toBeNull()
+    clearTenant()
+  })
 })
 
 describe('context URL', () => {

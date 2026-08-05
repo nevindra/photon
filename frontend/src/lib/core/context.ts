@@ -55,9 +55,13 @@ export function clearTenant(): void {
 }
 
 // The grammar term the active tenant contributes to backend queries (logs/traces/metrics
-// composables append it to the `q`/`filter` string they send).
+// composables append it to the `q`/`filter` string they send). The value arrives from the free
+// `?tenant=` URL param — anything outside the server's `[a-z0-9-]{1,64}` tenant-name shape can't
+// be a real tenant AND would inject stray grammar terms (`?tenant=a b` → ` b` body-substring),
+// so it contributes nothing.
 export function tenantQueryTerm(): string | null {
-  return tenant.value ? `tenant:${tenant.value}` : null
+  const t = tenant.value
+  return t && /^[a-z0-9-]{1,64}$/.test(t) ? `tenant:${t}` : null
 }
 
 // --- URL sync ---

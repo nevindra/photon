@@ -205,8 +205,9 @@ function onOpenExemplars({ service }: { service: string }) {
 }
 
 // Full-mode tenants mirror raw telemetry, so their data is queryable here via the tenant
-// context dimension — drill into Logs pre-filtered. Summary-mode tenants only ever push synthetic
-// health metrics, so there's nothing to browse locally; they link out to the tenant's own UI.
+// context dimension — drill into the first signal they actually mirror (`full:traces` mirrors no
+// logs, so /logs would be empty). Summary-mode tenants only ever push synthetic health metrics,
+// so there's nothing to browse locally; they link out to the tenant's own UI.
 function openTenant(tenant: TenantSummary) {
   if (tenant.mode === 'summary') {
     // No ui_url registered → nothing to open; a '#' tab would just be a blank page.
@@ -214,7 +215,10 @@ function openTenant(tenant: TenantSummary) {
     return
   }
   setTenant(tenant.name)
-  router.push(correlate({ path: '/logs' }))
+  // mode is `full` (all three) or `full:<csv>` — e.g. `full:traces,metrics`.
+  const signals = tenant.mode?.includes(':') ? tenant.mode.slice(tenant.mode.indexOf(':') + 1).split(',') : null
+  const path = !signals || signals.includes('logs') ? '/logs' : signals.includes('traces') ? '/traces' : '/metrics'
+  router.push(correlate({ path }))
 }
 </script>
 

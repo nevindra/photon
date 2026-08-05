@@ -80,7 +80,7 @@ async function rotate() {
 function fedSnippet(token: string): string {
   const lines = [
     '[federation]',
-    `endpoint = "http://${location.hostname}:4318"   # central's OTLP ingest URL, not the UI origin`,
+    `endpoint = "${location.protocol}//${location.hostname}:4318"   # central's OTLP ingest URL, not the UI origin`,
     `token = "${token}"`,
   ]
   if (mode.value === 'summary') {

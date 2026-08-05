@@ -46,6 +46,11 @@ pub fn validate_tenant_name(name: &str) -> Result<(), String> {
     {
         return Err("name must match [a-z0-9-]{1,64}".into());
     }
+    // `/api/tenants/summary` (GET) shadows `/api/tenants/:name` in the router, so a tenant
+    // literally named `summary` could never be PATCHed or DELETEd.
+    if name == "summary" {
+        return Err("\"summary\" is a reserved name".into());
+    }
     Ok(())
 }
 
@@ -208,7 +213,7 @@ impl TenantApi {
     async fn load_tokens(&self) -> Result<(), PhotonError> {
         let list = self.store.list().await?;
         let map = list.into_iter().map(|t| (t.token, t.name)).collect();
-        *self.tokens.write().unwrap() = map;
+        *self.tokens.write().unwrap_or_else(|e| e.into_inner()) = map;
         Ok(())
     }
 
@@ -666,10 +671,13 @@ pub(crate) async fn summary(State(st): State<AppState>) -> Response {
     };
     let promoted = st.metrics_query.promoted_attributes().to_vec();
     let now = now_ms();
-    let mut out = Vec::with_capacity(list.len());
-    for t in &list {
-        out.push(build_tenant_summary(&st.metrics_query, t, &promoted, now).await);
-    }
+    // 4 engine queries per tenant — run tenants concurrently instead of 4N serial awaits.
+    // ponytail: still 4 queries/tenant; fold into one group_by=["tenant"] pass if N grows.
+    let out = futures::future::join_all(
+        list.iter()
+            .map(|t| build_tenant_summary(&st.metrics_query, t, &promoted, now)),
+    )
+    .await;
     Json(out).into_response()
 }
 
@@ -800,6 +808,10 @@ mod tests {
         assert!(validate_tenant_name("Acme").is_err(), "uppercase");
         assert!(validate_tenant_name("ac me").is_err(), "spaces");
         assert!(validate_tenant_name(&"a".repeat(65)).is_err(), "too long");
+        assert!(
+            validate_tenant_name("summary").is_err(),
+            "reserved: shadowed by GET /api/tenants/summary"
+        );
     }
 
     #[test]

@@ -83,8 +83,8 @@ When `[federation].mode = "full"`:
 1. **Tenant-side tee** (in `photon-ingest`): after successful auth and decode, each OTLP batch is offered to a bounded MPSC channel (capacity = `[federation].queue_batches`). If the channel is full, the batch is dropped + a counter increments; the local ingest ack is NOT delayed (tee is non-blocking, never blocks ingest).
 
 2. **Tenant-side forwarder** (in `photon-server`): a background task drains the tee channel and POSTs each batch to central's `/v1/{logs|traces|metrics}` endpoint with the tenant bearer token. On failure:
-   - Up to 3 attempts with backoff between them (250ms, 1s — `FORWARD_BACKOFF`)
-   - If still failing, drop the batch + increment `dropped` counter
+   - HTTP-status failures (central reachable but erroring): up to 3 attempts with backoff between them (250ms, 1s — `FORWARD_BACKOFF`), then drop + increment `dropped`
+   - Connection-level failures (connect refused / timeout): drop after the **first** attempt — retrying an unreachable central would serialize ~30s of timeouts per payload and head-of-line-block the queue into overflow; the single attempt per payload doubles as the recovery probe
    - Never block or fail the loop — it continues forever
 
 3. **Central ingest**: receives the forwarded batch (marked by bearer token → tenant name), stamps it, writes it normally.

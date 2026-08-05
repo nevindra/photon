@@ -38,6 +38,7 @@ const router = createRouter({
     { path: '/rum/:appId', component: { template: '<div/>' } },
     { path: '/uptime', component: { template: '<div/>' } },
     { path: '/logs', component: { template: '<div/>' } },
+    { path: '/traces', component: { template: '<div/>' } },
     { path: '/login', component: { template: '<div/>' } },
   ],
 })
@@ -132,5 +133,29 @@ describe('HomeView', () => {
 
     expect(tenant.value).toBe('globex')
     expect(router.currentRoute.value.path).toBe('/logs')
+  })
+
+  // A subset-mirroring tenant (`full:traces`) deliberately ships no logs — drilling into /logs
+  // would land on an empty view, so the card routes to the first signal it actually mirrors.
+  it('clicking a full:traces tenant card drills into Traces, not Logs', async () => {
+    clearTenant()
+    ;(api.tenantsSummary as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { name: 'divtik', mode: 'full:traces', status: 'up', last_seen_ms: Date.now(), ingest_rows_per_sec: 3, open_incidents: 0, hot_bytes: 0, ui_url: null, spark: [] },
+    ])
+    router.push('/home')
+    await router.isReady()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+    const w = mount(
+      { components: { HomeView, TooltipProvider }, template: '<TooltipProvider><HomeView/></TooltipProvider>' },
+      { global: { plugins: [router, [VueQueryPlugin, { queryClient }]] }, attachTo: document.body },
+    )
+    await flushPromises()
+
+    await w.get('[data-tenant="divtik"]').trigger('click')
+    await flushPromises()
+
+    expect(tenant.value).toBe('divtik')
+    expect(router.currentRoute.value.path).toBe('/traces')
+    clearTenant()
   })
 })
