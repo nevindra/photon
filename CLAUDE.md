@@ -179,8 +179,8 @@ photon-api      axum REST + session auth (argon2, signed cookies) + embedded Vue
                 seams RumSink/RumAppStore/UserStore/UsageStore/ReplicationStatus/DataAdmin (photon-api
                 can't dep photon-wal).
 photon-server   the binary: config load, wiring, background-task supervision (3 compactor loops, the
-                alert-engine scheduler, etc.). Optional `federation/` module spawns summary pusher
-                (tenant-side) and full-mode forwarder (both sides share the module; central runs forwarder only).
+                alert-engine scheduler, etc.). Optional `federation/` module spawns the summary pusher
+                and full-mode forwarder — both tenant-side; central runs nothing from this module.
 photon-loadgen  dev-only OTLP/HTTP logs+traces+metrics load generator (its own binary).
 photon-agent    standalone host/GPU resource-metrics agent (its own binary, like photon-loadgen):
                 samples host (sysinfo) + NVIDIA GPU (nvml-wrapper, default-on `gpu` feature), POSTs

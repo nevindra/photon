@@ -51,6 +51,12 @@ describe('TenantCard', () => {
     expect(healthy.text()).not.toContain('Unreachable')
   })
 
+  it('shows "Never" for a tenant that has not reported yet (last_seen_ms 0)', () => {
+    const w = mountCard({ tenant: makeTenant({ last_seen_ms: 0 }) })
+    expect(w.text()).toContain('Never')
+    expect(w.text()).not.toMatch(/ago/)
+  })
+
   it('shows an Open UI link whenever a ui_url exists, regardless of mode', () => {
     const summary = mountCard({ tenant: makeTenant() })
     expect(summary.find('a[href="https://acme.example.com"]').exists()).toBe(true)

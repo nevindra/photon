@@ -209,7 +209,8 @@ function onOpenExemplars({ service }: { service: string }) {
 // health metrics, so there's nothing to browse locally; they link out to the tenant's own UI.
 function openTenant(tenant: TenantSummary) {
   if (tenant.mode === 'summary') {
-    window.open(tenant.ui_url ?? '#', '_blank')
+    // No ui_url registered → nothing to open; a '#' tab would just be a blank page.
+    if (tenant.ui_url) window.open(tenant.ui_url, '_blank')
     return
   }
   setTenant(tenant.name)

@@ -281,6 +281,17 @@ fn err_500(e: PhotonError) -> Response {
         .into_response()
 }
 
+/// `ui_url` renders as a raw `href`/`window.open` target in the UI (Vue does not sanitize bound
+/// `:href`), so a stored `javascript:` URL would execute in the admin's session — only http(s)
+/// passes. Empty/whitespace normalizes to `None` (clears the link).
+fn normalize_ui_url(raw: Option<&str>) -> Result<Option<String>, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => Ok(Some(u.to_string())),
+        Some(_) => Err("ui_url must start with http:// or https://".to_string()),
+    }
+}
+
 /// `"…abcd"` — the last 4 characters of a secret token, for listing without exposing it.
 fn redact_token(token: &str) -> String {
     let tail = if token.len() > 4 {
@@ -344,10 +355,14 @@ pub(crate) async fn create_tenant(
     if let Err(e) = validate_tenant_name(&name) {
         return bad_request(e);
     }
+    let ui_url = match normalize_ui_url(body.ui_url.as_deref()) {
+        Ok(u) => u,
+        Err(e) => return bad_request(e),
+    };
     let tenant = Tenant {
         name,
         token: mint_tenant_token(),
-        ui_url: body.ui_url,
+        ui_url,
         created_at: now_ms(),
     };
     match api.create(&tenant).await {
@@ -382,7 +397,11 @@ pub(crate) async fn update_tenant(
     let Some(api) = st.tenants.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match api.update(&name, body.ui_url.as_deref()).await {
+    let ui_url = match normalize_ui_url(body.ui_url.as_deref()) {
+        Ok(u) => u,
+        Err(e) => return bad_request(e),
+    };
+    match api.update(&name, ui_url.as_deref()).await {
         Ok(true) => match api.list().await {
             Ok(list) => match list.into_iter().find(|t| t.name == name) {
                 Some(t) => (StatusCode::OK, Json(tenant_json_redacted(&t))).into_response(),
@@ -507,13 +526,16 @@ async fn latest_value(
         .unwrap_or(0.0)
 }
 
-/// Headline rows/sec (last-minus-first of the cumulative sum, divided by the fixed window,
-/// clamped at 0 so a counter reset never reads as negative throughput) + a sparkline of the
-/// bucket-to-bucket rate.
+/// Headline rows/sec (last-minus-first of the cumulative sum, divided by the ACTUAL elapsed
+/// time between those points — a tenant registered 2 minutes ago must not be diluted by the full
+/// 15-minute window — clamped at 0 so a counter reset never reads as negative throughput) + a
+/// sparkline of the bucket-to-bucket rate.
 fn rate_and_spark(points: &[SeriesPoint]) -> (f64, Vec<(i64, f64)>) {
     let present: Vec<&SeriesPoint> = points.iter().filter(|p| p.v.is_some()).collect();
     let ingest_rows_per_sec = match (present.first(), present.last()) {
-        (Some(a), Some(b)) => ((b.v.unwrap() - a.v.unwrap()) / SUMMARY_WINDOW_SECS as f64).max(0.0),
+        (Some(a), Some(b)) if b.t > a.t => {
+            ((b.v.unwrap() - a.v.unwrap()) / ((b.t - a.t) as f64 / 1e9)).max(0.0)
+        }
         _ => 0.0,
     };
     let spark = present
@@ -662,6 +684,35 @@ mod tests {
             ui_url: None,
             created_at: 0,
         }
+    }
+
+    #[test]
+    fn rate_uses_actual_elapsed_time_not_the_fixed_window() {
+        // 1200 rows over 120s = 10/s; dividing by the fixed 900s window would report 1.33/s.
+        let points = vec![
+            SeriesPoint {
+                t: 0,
+                v: Some(100.0),
+            },
+            SeriesPoint {
+                t: 120_000_000_000,
+                v: Some(1300.0),
+            },
+        ];
+        let (rate, _) = rate_and_spark(&points);
+        assert!((rate - 10.0).abs() < 1e-9, "got {rate}");
+    }
+
+    #[test]
+    fn ui_url_only_accepts_http_schemes() {
+        assert_eq!(
+            normalize_ui_url(Some("https://t.example")).unwrap().as_deref(),
+            Some("https://t.example")
+        );
+        assert_eq!(normalize_ui_url(Some("   ")).unwrap(), None);
+        assert_eq!(normalize_ui_url(None).unwrap(), None);
+        assert!(normalize_ui_url(Some("javascript:alert(1)")).is_err());
+        assert!(normalize_ui_url(Some("ftp://x")).is_err());
     }
 
     #[tokio::test]

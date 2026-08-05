@@ -7,7 +7,7 @@ One central Photon monitors many customer Photon installs (tenants) that push te
 ## Two modes: summary (default) and full
 
 - **Summary mode** (default): the tenant-side Photon periodically computes a lightweight health summary (ingest counters, incident count, disk usage) and POSTs it as OTLP metrics back to central. Central stamps these with a `tenant` resource attribute and stores them normally — no data duplication.
-- **Full mode** (opt-in): the tenant-side Photon **also** forwards raw OTLP batches (logs/traces/metrics) to central in real time. This is a best-effort tee (non-blocking; full queue drops oldest) that rides alongside local ingest. Central stamps each forwarded batch with the same `tenant` attribute.
+- **Full mode** (opt-in): the tenant-side Photon **also** forwards raw OTLP batches (logs/traces/metrics) to central in real time. This is a best-effort tee (non-blocking; a full queue drops the incoming batch — drop-newest) that rides alongside local ingest. Central stamps each forwarded batch with the same `tenant` attribute.
 
 Both modes use per-tenant bearer tokens and server-side stamping — client-supplied `tenant` attributes are always overwritten. Summary mode is the default and runs alone; full mode enables the tee and ALSO runs the summary pusher (so central sees both the high-volume raw mirror and the low-volume summary).
 
@@ -38,7 +38,7 @@ queue_batches = 1024                             # optional: full-mode tee queue
 
 1. **OTLP ingest (tenant-side only)**: shared service bearer token (`[ingest].token`), same as before — no change.
 2. **Tenant registry (central)**: per-tenant minted bearer tokens (`tk_tenant_…`), rotateable, stored in SQLite control-plane DB (`tenants` table). UI-managed only, no config surface.
-3. **Tenant identity stamping (central ingest, trust boundary)**: when central's OTLP receiver resolves the `Authorization` header against its tenant token map, it stamps the tenant's name as a **promoted `tenant` resource attribute** on every resulting record (logs/spans/metrics). Client-supplied `tenant` attributes are overwritten — this is the security boundary.
+3. **Tenant identity stamping (central ingest, trust boundary)**: when central's OTLP receiver resolves the `Authorization` header against its tenant token map, it stamps the tenant's name as a **`tenant` resource attribute** on every resulting record (logs/spans/metrics). Client-supplied `tenant` attributes are overwritten — this is the security boundary. `tenant` is **not** in the default `promoted_attributes` — it lives in the long-tail attributes map, so `tenant:<id>` filters work but scan every file in the time window (no skip-index pruning on it). On a central with many tenants and real full-mode volume, add `"tenant"` to `[schema].promoted_attributes` to make it a first-class pruned column (the query engines handle either location).
 
 ### Stamping implementation
 
@@ -83,14 +83,14 @@ When `[federation].mode = "full"`:
 1. **Tenant-side tee** (in `photon-ingest`): after successful auth and decode, each OTLP batch is offered to a bounded MPSC channel (capacity = `[federation].queue_batches`). If the channel is full, the batch is dropped + a counter increments; the local ingest ack is NOT delayed (tee is non-blocking, never blocks ingest).
 
 2. **Tenant-side forwarder** (in `photon-server`): a background task drains the tee channel and POSTs each batch to central's `/v1/{logs|traces|metrics}` endpoint with the tenant bearer token. On failure:
-   - Up to 3 retry attempts with exponential backoff (250ms, 1s, 4s)
+   - Up to 3 attempts with backoff between them (250ms, 1s — `FORWARD_BACKOFF`)
    - If still failing, drop the batch + increment `dropped` counter
    - Never block or fail the loop — it continues forever
 
 3. **Central ingest**: receives the forwarded batch (marked by bearer token → tenant name), stamps it, writes it normally.
 
 **Key properties:**
-- Dropped batches when the queue is full are **not a sync problem** — they're approximately drop-oldest (bounded queue, `try_send` on full means drop-newest). A spike of ingest + active forwarding can lose full-mode visibility; this is documented and acceptable (no guaranteed delivery).
+- Dropped batches when the queue is full are **not a sync problem** — the bounded queue drops the incoming batch (`try_send` on full = drop-newest). A spike of ingest + active forwarding can lose full-mode visibility; this is documented and acceptable (no guaranteed delivery).
 - The tee is a separate concern from the summary pusher — both features coexist on the tenant without conflict.
 - `stats.queued` reflects current channel depth; `stats.dropped` increments on queue-full; `stats.pushed` increments on successful batch POST.
 
@@ -139,7 +139,7 @@ Returns one card per tenant with aggregated health:
 }
 ```
 
-Implementation: for each tenant, query the four `photon.federation.*` metrics over the last 15 minutes with filter `tenant="{name}"` (the promoted stamped attribute), bucketed into ~30 points. Staleness determination uses hardcoded thresholds: `up` ≤ 120s, `stale` ≤ 600s, else `down`.
+Implementation: for each tenant, query the four `photon.federation.*` metrics over the last 15 minutes with filter `tenant="{name}"` (the stamped attribute), bucketed into ~30 points. Staleness determination uses hardcoded thresholds: `up` ≤ 120s, `stale` ≤ 600s, else `down`.
 
 ## Federation status (tenant-side UI visibility)
 

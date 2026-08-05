@@ -30,6 +30,12 @@ const modeTip = computed(() => {
   return `Mirrors the tenant's raw ${what} here (plus the health summary) — click the card to explore.`
 })
 
+// Backend sends `last_seen_ms: 0` for "never reported" — rendering that through relative()
+// would show the distance from the epoch ("488000h ago").
+const lastSeen = computed(() =>
+  props.tenant.last_seen_ms > 0 ? relative(BigInt(props.tenant.last_seen_ms) * 1_000_000n) : 'Never',
+)
+
 const unreachable = computed(() => props.tenant.status !== 'up')
 const borderClass = computed(() => (unreachable.value ? 'border-sev-error/40' : ''))
 const spark = computed(() => props.tenant.spark.map((p) => p[1]))
@@ -80,7 +86,7 @@ function select(): void {
       >
         Open UI ↗
       </a>
-      {{ relative(BigInt(tenant.last_seen_ms) * 1_000_000n) }}
+      {{ lastSeen }}
     </span>
   </Card>
 
@@ -140,7 +146,7 @@ function select(): void {
     </a>
 
     <div class="mt-auto border-t border-border pt-2 text-xs text-muted-foreground">
-      {{ relative(BigInt(tenant.last_seen_ms) * 1_000_000n) }}
+      {{ lastSeen }}
     </div>
   </Card>
 </template>

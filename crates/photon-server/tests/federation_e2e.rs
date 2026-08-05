@@ -22,7 +22,9 @@ use opentelemetry_proto::tonic::metrics::v1::{
     metric::Data, number_data_point::Value as NumVal, AggregationTemporality, Gauge, Metric,
     NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
 };
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message as _;
 
 use photon_api::tenants::{SqliteTenantStore, TenantApi, TenantStore};
@@ -79,6 +81,8 @@ struct CentralServer {
     hot_dir: PathBuf,
     logs_wal: Arc<BroadcastingWal<DiskWal>>,
     log_schema: LogSchema,
+    spans_wal: Arc<BroadcastingWal<DiskWal>>,
+    span_schema: SpanSchema,
     metrics_wal: Arc<BroadcastingWal<DiskWal>>,
     metric_schema: MetricSchema,
     _tmp: tempfile::TempDir,
@@ -183,13 +187,14 @@ async fn spawn_central() -> CentralServer {
     });
 
     let logs_wal_for_compaction = logs_wal.clone();
+    let spans_wal_for_compaction = spans_wal.clone();
     let mut ingest = IngestServer::new(
         logs_wal,
         spans_wal,
         metrics_wal,
         LOCAL_TOKEN.to_string(),
         log_schema.clone(),
-        span_schema,
+        span_schema.clone(),
         metric_schema.clone(),
         256,
         16 * 1024 * 1024,
@@ -212,6 +217,8 @@ async fn spawn_central() -> CentralServer {
         hot_dir: hot,
         logs_wal: logs_wal_for_compaction,
         log_schema,
+        spans_wal: spans_wal_for_compaction,
+        span_schema,
         metrics_wal: metrics_wal_for_compaction,
         metric_schema,
         _tmp: tmp,
@@ -261,6 +268,29 @@ async fn compact_logs(server: &CentralServer) {
         compacted += 1;
     }
     assert!(compacted >= 1, "expected the logs compactor to run");
+}
+
+/// Drain every closed WAL segment for `server`'s spans WAL into hot-store Parquet.
+async fn compact_spans(server: &CentralServer) {
+    let storage = Storage::from_config(&photon_core::config::StorageConfig {
+        hot_dir: server.hot_dir.clone(),
+        db_path: String::new(),
+        durable: None,
+        zstd_level: 1,
+    })
+    .unwrap();
+    let replicator = Arc::new(Replicator::new(storage.clone()));
+    let compactor = photon_compact::SpanCompactor::new(
+        server.spans_wal.clone(),
+        storage,
+        replicator,
+        server.span_schema.clone(),
+    );
+    let mut compacted = 0;
+    while compactor.run_once().await.unwrap().is_some() {
+        compacted += 1;
+    }
+    assert!(compacted >= 1, "expected the spans compactor to run");
 }
 
 /// Drain every closed WAL segment for `server`'s metrics WAL into hot-store Parquet.
@@ -321,6 +351,34 @@ fn spoofed_log_request(now_nanos: i64) -> ExportLogsServiceRequest {
                     flags: 0,
                     trace_id: vec![],
                     span_id: vec![],
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// A single-span OTLP trace export, `service.name = "cpin-app"`, with the same spoofed `tenant`
+/// resource attribute — exercises the span path of stamping AND the promoted-`tenant` RED
+/// grouping (this stack promotes `tenant`, so `/api/red` must read the promoted column, not the
+/// attributes map).
+fn spoofed_trace_request(now_nanos: i64) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "cpin-app"), kv("tenant", "cpin")],
+                dropped_attributes_count: 0,
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![Span {
+                    trace_id: vec![1u8; 16],
+                    span_id: vec![2u8; 8],
+                    name: "GET /checkout".to_string(),
+                    start_time_unix_nano: now_nanos as u64,
+                    end_time_unix_nano: now_nanos as u64 + 1_000_000,
+                    ..Default::default()
                 }],
                 schema_url: String::new(),
             }],
@@ -474,6 +532,43 @@ async fn federation_stamping_summary_and_rotation() {
     assert!(
         rows.iter().all(|r| r["attributes"]["tenant"] != "cpin"),
         "the client-spoofed tenant must never survive: {rows:?}"
+    );
+
+    // 3b. Same over the span path: POST /v1/traces, compact, then `/api/red?group=service` must
+    // label the row with the STAMPED tenant — this stack promotes `tenant`, so a regression to a
+    // map-only lookup in `red_over` reads NULL here.
+    let trace_status = client
+        .post(format!("{}/v1/traces", server.ingest_http_base))
+        .header("content-type", "application/x-protobuf")
+        .header("authorization", format!("Bearer {tenant_token}"))
+        .body(spoofed_trace_request(now_nanos).encode_to_vec())
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(trace_status, reqwest::StatusCode::OK);
+    compact_spans(&server).await;
+
+    let red_resp = client
+        .get(server.url(&format!(
+            "/api/red?start={}&end={}&group=service",
+            now_nanos - 3_600_000_000_000i64,
+            now_nanos + 3_600_000_000_000i64
+        )))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(red_resp.status().is_success());
+    let red_body: serde_json::Value = red_resp.json().await.unwrap();
+    let red_rows = red_body.as_array().unwrap();
+    let cpin_app = red_rows
+        .iter()
+        .find(|r| r["service"] == "cpin-app")
+        .unwrap_or_else(|| panic!("expected a cpin-app RED row: {red_body}"));
+    assert_eq!(
+        cpin_app["tenant"], "divtik",
+        "RED rows must carry the stamped tenant (promoted-column path): {cpin_app}"
     );
 
     // 4. POST /v1/metrics with the tenant token: photon.federation.up + ingest.rows.

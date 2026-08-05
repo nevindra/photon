@@ -76,10 +76,19 @@ impl SpanQueryEngine {
         thresholds: &HashMap<String, u32>,
         default_ms: u32,
     ) -> Result<Vec<RedRow>, PhotonError> {
+        let tenant_promoted = self.promoted_attributes().iter().any(|p| p == "tenant");
         match self.span_survivors_df(&req).await? {
             None => Ok(Vec::new()),
             Some(df) => {
-                red_over(df, span_base_predicate(&req), group, thresholds, default_ms).await
+                red_over(
+                    df,
+                    span_base_predicate(&req),
+                    group,
+                    thresholds,
+                    default_ms,
+                    tenant_promoted,
+                )
+                .await
             }
         }
     }
@@ -110,6 +119,7 @@ async fn red_over(
     group: RedGroup,
     thresholds: &HashMap<String, u32>,
     default_ms: u32,
+    tenant_promoted: bool,
 ) -> Result<Vec<RedRow>, PhotonError> {
     // 0/1 error flag per span (ERROR == OTEL status_code 2), summed per group below.
     let error_flag = when(col_ref(span_schema::STATUS_CODE).eq(lit(2_i32)), lit(1_i64))
@@ -138,10 +148,19 @@ async fn red_over(
             col_ref("service.name").alias("service"),
             col_ref(span_schema::NAME).alias("operation"),
         ],
-        RedGroup::Service => vec![
-            col_ref("service.name").alias("service"),
-            get_field(col_ref(span_schema::ATTRIBUTES), "tenant").alias("tenant"),
-        ],
+        RedGroup::Service => {
+            // `span_record` routes promoted keys OUT of the attributes map into their own column,
+            // so a map lookup on a promoted `tenant` reads NULL — pick the lookup by schema.
+            let tenant_expr = if tenant_promoted {
+                col_ref("tenant")
+            } else {
+                get_field(col_ref(span_schema::ATTRIBUTES), "tenant")
+            };
+            vec![
+                col_ref("service.name").alias("service"),
+                tenant_expr.alias("tenant"),
+            ]
+        }
     };
 
     let batches = df
@@ -347,6 +366,7 @@ mod tests {
             RedGroup::Operation,
             &std::collections::HashMap::new(),
             500,
+            false,
         )
         .await
         .unwrap();
@@ -380,6 +400,7 @@ mod tests {
             RedGroup::Service,
             &std::collections::HashMap::new(),
             500,
+            false,
         )
         .await
         .unwrap();
@@ -402,11 +423,48 @@ mod tests {
             RedGroup::Service,
             &std::collections::HashMap::new(),
             500,
+            false,
         )
         .await
         .unwrap();
 
         assert_eq!(rows.len(), 2); // same service name, split by tenant
+        let tenanted = rows.iter().find(|r| r.tenant.is_some()).unwrap();
+        assert_eq!(tenanted.tenant.as_deref(), Some("divtik"));
+        assert!(rows.iter().any(|r| r.tenant.is_none()));
+    }
+
+    #[tokio::test]
+    async fn service_group_labels_tenant_when_promoted() {
+        // Same data as the map-path test above, but `tenant` is a promoted column — the
+        // configuration `federation_e2e.rs` runs central with.
+        let schema = SpanSchema::new(&["service.name".into(), "tenant".into()]);
+        let mut a = span("api", "op", Some(10_000_000), Some(1));
+        a.attributes.insert("tenant".into(), "divtik".into());
+        let local = span("api", "op", Some(20_000_000), Some(1));
+        let mut b = SpanBatchBuilder::new(&schema);
+        b.append(&a);
+        b.append(&local);
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "spans",
+            Arc::new(
+                MemTable::try_new(schema.arrow.clone(), vec![vec![b.finish().unwrap()]]).unwrap(),
+            ),
+        )
+        .unwrap();
+        let rows = red_over(
+            ctx.table("spans").await.unwrap(),
+            span_base_predicate(&req()),
+            RedGroup::Service,
+            &std::collections::HashMap::new(),
+            500,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
         let tenanted = rows.iter().find(|r| r.tenant.is_some()).unwrap();
         assert_eq!(tenanted.tenant.as_deref(), Some("divtik"));
         assert!(rows.iter().any(|r| r.tenant.is_none()));
@@ -424,6 +482,7 @@ mod tests {
             RedGroup::Operation,
             &std::collections::HashMap::new(),
             500,
+            false,
         )
         .await
         .unwrap();
@@ -453,6 +512,7 @@ mod tests {
             RedGroup::Service,
             &thresholds,
             500,
+            false,
         )
         .await
         .unwrap();
