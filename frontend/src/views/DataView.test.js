@@ -37,23 +37,17 @@ describe('DataView', () => {
   // The Overview/Storage/Retention/Delete switch is now a query-driven sub-nav folded into the
   // ContextBar (each tab is a NavTabItem RouterLink writing `?tab=`), not a Reka <TabsList>, so the
   // selectors moved from `[role="tab"]` to the tabs' data-testids + their aria-current active state.
-  it('renders five tab links: Overview, Storage, Retention, Tenants, Delete', async () => {
+  it('renders four tab links: Overview, Storage, Retention, Delete', async () => {
     const w = await mountDataView()
     await flushPromises()
-    const joined = ['overview', 'storage', 'retention', 'tenants', 'delete']
+    const joined = ['overview', 'storage', 'retention', 'delete']
       .map((t) => w.get(`[data-testid="data-tab-${t}"]`).text())
       .join(' ')
     expect(joined).toMatch(/Overview/)
     expect(joined).toMatch(/Storage/)
     expect(joined).toMatch(/Retention/)
-    expect(joined).toMatch(/Tenants/)
     expect(joined).toMatch(/Delete/)
-  })
-
-  it('renders the tenants tab body on ?tab=tenants', async () => {
-    const w = await mountDataView('/data?tab=tenants')
-    await flushPromises()
-    expect(w.get('[data-testid="data-tab-tenants"]').attributes('aria-current')).toBe('page')
+    expect(w.find('[data-testid="data-tab-tenants"]').exists()).toBe(false)
   })
 
   it('syncs the active tab from the ?tab= query param', async () => {

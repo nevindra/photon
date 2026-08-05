@@ -2,8 +2,14 @@
 // rows, a sparkline, and a relative last-seen footer. Real rendered behavior, mirrors HostCard.test.ts.
 import { describe, it, expect } from 'vitest'
 import { mount } from '@vue/test-utils'
+import { h } from 'vue'
+import { TooltipProvider } from '@/components/ui/tooltip'
 import TenantCard from './TenantCard.vue'
 import type { TenantSummary } from '@/lib/core/api'
+
+// The mode badge sits in a Tooltip, which needs a TooltipProvider ancestor.
+const mountCard = (props: InstanceType<typeof TenantCard>['$props']) =>
+  mount(() => h(TooltipProvider, null, () => h(TenantCard, props)))
 
 function makeTenant(overrides: Partial<TenantSummary> = {}): TenantSummary {
   return {
@@ -22,7 +28,7 @@ function makeTenant(overrides: Partial<TenantSummary> = {}): TenantSummary {
 
 describe('TenantCard', () => {
   it('renders the tenant name, mode badge and stat rows from a fixture', () => {
-    const w = mount(TenantCard, { props: { tenant: makeTenant() } })
+    const w = mountCard({ tenant: makeTenant() })
     expect(w.text()).toContain('acme')
     expect(w.text()).toContain('summary')
     expect(w.text()).toContain('42')
@@ -31,25 +37,28 @@ describe('TenantCard', () => {
 
   it('emits select with the tenant on click', async () => {
     const tenant = makeTenant()
-    const w = mount(TenantCard, { props: { tenant } })
-    await w.trigger('click')
-    expect(w.emitted('select')?.[0]).toEqual([tenant])
+    const w = mountCard({ tenant })
+    await w.get('[data-testid="tenant-card"]').trigger('click')
+    expect(w.findComponent(TenantCard).emitted('select')?.[0]).toEqual([tenant])
   })
 
   it('shows an unreachable treatment when status is not up', () => {
-    const w = mount(TenantCard, { props: { tenant: makeTenant({ status: 'down' }) } })
+    const w = mountCard({ tenant: makeTenant({ status: 'down' }) })
     expect(w.text()).toContain('Unreachable')
     expect(w.html()).toMatch(/sev-error/)
 
-    const healthy = mount(TenantCard, { props: { tenant: makeTenant() } })
+    const healthy = mountCard({ tenant: makeTenant() })
     expect(healthy.text()).not.toContain('Unreachable')
   })
 
-  it('shows an Open UI link for summary-mode tenants with a ui_url, not for full-mode', () => {
-    const summary = mount(TenantCard, { props: { tenant: makeTenant() } })
+  it('shows an Open UI link whenever a ui_url exists, regardless of mode', () => {
+    const summary = mountCard({ tenant: makeTenant() })
     expect(summary.find('a[href="https://acme.example.com"]').exists()).toBe(true)
 
-    const full = mount(TenantCard, { props: { tenant: makeTenant({ mode: 'full' }) } })
-    expect(full.find('a').exists()).toBe(false)
+    const full = mountCard({ tenant: makeTenant({ mode: 'full' }) })
+    expect(full.find('a[href="https://acme.example.com"]').exists()).toBe(true)
+
+    const noUrl = mountCard({ tenant: makeTenant({ ui_url: null }) })
+    expect(noUrl.find('a').exists()).toBe(false)
   })
 })

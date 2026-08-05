@@ -4,7 +4,7 @@
 //! Turned on iff `Config.federation` is `Some` — a non-federated node runs none of this.
 mod otlp;
 
-pub use otlp::build_summary;
+pub use otlp::{build_summary, mode_label};
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -120,7 +120,7 @@ pub fn spawn_summary_pusher(
         loop {
             tick.tick().await;
             let snapshot = deps.snapshot().await;
-            let body = build_summary(&snapshot, cfg.mode).encode_to_vec();
+            let body = build_summary(&snapshot, &mode_label(&cfg)).encode_to_vec();
             let res = client
                 .post(format!("{}/v1/metrics", cfg.endpoint))
                 .bearer_auth(&cfg.token)
@@ -270,6 +270,7 @@ mod forwarder_tests {
             endpoint: format!("http://{addr}"),
             token: "tk_tenant_x".to_string(),
             mode: FederationMode::Full,
+            signals: None,
             interval_secs: 30,
             queue_batches: 16,
         }

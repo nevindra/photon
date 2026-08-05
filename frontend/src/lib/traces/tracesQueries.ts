@@ -7,7 +7,7 @@ import { computed, toValue } from 'vue'
 import type { MaybeRefOrGetter } from 'vue'
 import { useQuery, useInfiniteQuery, keepPreviousData } from '@tanstack/vue-query'
 import { api } from '@/lib/core/api'
-import { scopeQueryTerm } from '@/lib/core/context'
+import { tenantQueryTerm } from '@/lib/core/context'
 import type {
   FieldInfo,
   FacetResult,
@@ -27,11 +27,10 @@ import type {
 // `any` is a targeted escape hatch for this spread only, callers still get typed params/returns.
 type ExtraQueryOptions = Record<string, any>
 
-// Appends the active scope's grammar term (currently only `tenant`) to a query string. Only
-// `useSearchTraces`/`useSearchSpans` use this — the pinned facet/histogram/latency/RED composables
-// below are shared with the Services vertical (ServicesListView/ServiceDetailView), which isn't
-// tenant-scoped in v1 (see the plan's self-review "known deliberate gaps").
-const withScope = (q: string): string => [q, scopeQueryTerm()].filter(Boolean).join(' ')
+// Appends the active tenant's grammar term to a query string. `useSearchTraces`/`useSearchSpans`
+// and `useRed` use this; the pinned facet/histogram/latency composables stay unwrapped — their
+// callers (TracesExplorer, ServicesListView) pass an already-tenant-scoped query string instead.
+const withTenant = (q: string): string => [q, tenantQueryTerm()].filter(Boolean).join(' ')
 
 // Trace field catalog for a time window.
 export function useTracesFields(startNs: MaybeRefOrGetter<string>, endNs: MaybeRefOrGetter<string>) {
@@ -60,10 +59,10 @@ export function useSearchTraces(
   options: ExtraQueryOptions = {},
 ) {
   return useInfiniteQuery({
-    queryKey: computed(() => ['search-traces', toValue(searchKey), scopeQueryTerm()]),
+    queryKey: computed(() => ['search-traces', toValue(searchKey), tenantQueryTerm()]),
     queryFn: ({ pageParam, signal }): Promise<TraceSearchResult> => {
       const req = buildRequest(pageParam)
-      return api.searchTraces({ ...req, query: withScope(req.query) }, { signal })
+      return api.searchTraces({ ...req, query: withTenant(req.query) }, { signal })
     },
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last: TraceSearchResult) => last.next_cursor ?? undefined,
@@ -80,10 +79,10 @@ export function useSearchSpans(
   options: ExtraQueryOptions = {},
 ) {
   return useInfiniteQuery({
-    queryKey: computed(() => ['spans-search', toValue(searchKey), scopeQueryTerm()]),
+    queryKey: computed(() => ['spans-search', toValue(searchKey), tenantQueryTerm()]),
     queryFn: ({ pageParam, signal }): Promise<SpanSearchResult> => {
       const req = buildRequest(pageParam)
-      return api.searchSpans({ ...req, query: withScope(req.query) }, { signal })
+      return api.searchSpans({ ...req, query: withTenant(req.query) }, { signal })
     },
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last: SpanSearchResult) => last.next_cursor ?? undefined,
@@ -189,8 +188,9 @@ export function useRed(
       String(toValue(startNs)),
       String(toValue(endNs)),
       toValue(group),
+      tenantQueryTerm(),
     ]),
     queryFn: ({ signal }): Promise<RedRow[]> =>
-      api.red(toValue(query), toValue(startNs), toValue(endNs), toValue(group), { signal }),
+      api.red(withTenant(toValue(query)), toValue(startNs), toValue(endNs), toValue(group), { signal }),
   })
 }

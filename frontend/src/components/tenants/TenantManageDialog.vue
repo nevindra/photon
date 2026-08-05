@@ -1,82 +1,98 @@
 <script setup lang="ts">
-// Manage federation tenants (register / edit UI URL / rotate token / delete) — the tenant-registry
-// twin of RumManageAppsDialog.vue: same list-with-rotate/delete-icon-buttons + create-form +
-// minted-secret-panel-shown-once shape, except the minted value is a bearer TOKEN (not a public
-// key) so the panel renders a copy-ready `[federation]` TOML snippet instead of an install one-
-// liner. Mutations go through the tenantsQueries composables (Task 10), which already invalidate
-// the tenants list + toast on the `{ ok, error }` result shape, so this component doesn't track its
-// own error state and just fires the mutation.
-import { ref, watch } from 'vue'
+// Add/edit dialog for one federation tenant. `tenant` prop null → add mode (name + UI URL, minted
+// token shown once on success); non-null → edit mode (UI URL + rotate token, rotated token shown
+// once the same way). Row-level delete lives in the table (DataTenants), not here. Mutations go
+// through the tenantsQueries composables, which invalidate the tenants list + toast on the
+// `{ ok, error }` result shape, so this component doesn't track its own error state.
+import { ref, computed, watch } from 'vue'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { FormField } from '@/components/ui/form-field'
-import { Trash2, KeyRound, Plus } from 'lucide-vue-next'
+import { Segmented, SegmentedItem } from '@/components/ui/segmented'
+import { KeyRound, Plus, Copy } from 'lucide-vue-next'
 import type { Tenant } from '@/lib/core/api'
-import { useCreateTenant, useUpdateTenant, useRotateTenantToken, useDeleteTenant } from '@/lib/tenants/tenantsQueries'
+import { useCreateTenant, useUpdateTenant, useRotateTenantToken } from '@/lib/tenants/tenantsQueries'
+import { useCopy } from '@/lib/core/useCopy'
 
-const props = defineProps<{ open: boolean; tenants: Tenant[] }>()
+const props = defineProps<{ open: boolean; tenant: Tenant | null }>()
 const emit = defineEmits<{ 'update:open': [boolean] }>()
 
 const createMut = useCreateTenant()
 const updateMut = useUpdateTenant()
 const rotateMut = useRotateTenantToken()
-const deleteMut = useDeleteTenant()
 
-// Create form
-const newName = ref('')
-const newUiUrl = ref('')
+const isEdit = computed(() => props.tenant !== null)
+const { copy } = useCopy()
+
+const name = ref('')
+const uiUrl = ref('')
+// Mode is the TENANT's own choice (`[federation] mode` in its config file — central is push-only
+// and can't set it remotely). This picker exists for discoverability: it drives the generated
+// snippet below so users learn both modes exist.
+const mode = ref<'summary' | 'full' | 'full-traces'>('summary')
 const mintedToken = ref<string | null>(null)
 const mintedFor = ref('')
 
-async function submitCreate() {
-  const name = newName.value.trim()
-  if (!name) return
-  const uiUrl = newUiUrl.value.trim()
-  const res = await createMut.mutateAsync({ name, uiUrl: uiUrl || null })
-  if (res.ok && res.token) {
-    mintedToken.value = res.token
-    mintedFor.value = name
-    newName.value = ''
-    newUiUrl.value = ''
-  }
-}
-
-function editUiUrl(tenant: Tenant, value: string) {
-  updateMut.mutate({ name: tenant.name, uiUrl: value.trim() || null })
-}
-async function rotate(tenant: Tenant) {
-  const res = await rotateMut.mutateAsync(tenant.name)
-  if (res.ok && res.token) {
-    mintedToken.value = res.token
-    mintedFor.value = tenant.name
-  }
-}
-function remove(tenant: Tenant) {
-  deleteMut.mutate(tenant.name)
-}
-
-// A copy-pasteable `[federation]` TOML snippet for the tenant just registered/rotated — the
-// endpoint defaults to this photon's own origin, since that's the address a tenant reaches this
-// (central) install at.
-function fedSnippet(token: string): string {
-  return `[federation]
-endpoint = "${location.origin}"
-token = "${token}"
-mode = "summary"   # set to "full" to mirror raw telemetry`
-}
-
-// Clear the minted-token panel when the dialog closes, so reopening it doesn't show a stale
-// "Token for X" panel from a previous session.
+// Re-seed the form each open: edit mode from the tenant row, add mode blank. Also clears any
+// minted-token panel from a previous open so a stale secret never re-renders.
 watch(
   () => props.open,
   (isOpen) => {
-    if (!isOpen) {
+    if (isOpen) {
+      name.value = props.tenant?.name ?? ''
+      uiUrl.value = props.tenant?.ui_url ?? ''
+      mode.value = 'summary'
+    } else {
       mintedToken.value = null
       mintedFor.value = ''
     }
   },
 )
+
+async function submit() {
+  if (isEdit.value) {
+    const res = await updateMut.mutateAsync({ name: props.tenant!.name, uiUrl: uiUrl.value.trim() || null })
+    if (res.ok && !mintedToken.value) emit('update:open', false)
+    return
+  }
+  const trimmed = name.value.trim()
+  if (!trimmed) return
+  const res = await createMut.mutateAsync({ name: trimmed, uiUrl: uiUrl.value.trim() || null })
+  if (res.ok && res.token) {
+    mintedToken.value = res.token
+    mintedFor.value = trimmed
+  }
+}
+
+async function rotate() {
+  if (!props.tenant) return
+  const res = await rotateMut.mutateAsync(props.tenant.name)
+  if (res.ok && res.token) {
+    mintedToken.value = res.token
+    mintedFor.value = props.tenant.name
+  }
+}
+
+// A copy-pasteable `[federation]` TOML snippet for the token just minted. The endpoint must be
+// central's OTLP *ingest* base URL (`:4318` by default) — NOT this UI's origin, which serves the
+// SPA and would swallow pushes with a 200 — so emit a placeholder host + the default ingest port.
+function fedSnippet(token: string): string {
+  const lines = [
+    '[federation]',
+    `endpoint = "http://${location.hostname}:4318"   # central's OTLP ingest URL, not the UI origin`,
+    `token = "${token}"`,
+  ]
+  if (mode.value === 'summary') {
+    lines.push('mode = "summary"   # health summary only; set to "full" to mirror raw telemetry')
+  } else if (mode.value === 'full') {
+    lines.push('mode = "full"   # mirrors raw logs/traces/metrics to central (plus the health summary)')
+  } else {
+    lines.push('mode = "full"')
+    lines.push('signals = ["traces"]   # mirrors traces only — services/APM without logs')
+  }
+  return lines.join('\n')
+}
 </script>
 
 <template>
@@ -86,91 +102,93 @@ watch(
          wider than the viewport (DialogContent is a fixed-width CSS grid). -->
     <DialogContent class="max-h-[85vh] max-w-2xl overflow-y-auto [&>*]:min-w-0">
       <DialogHeader>
-        <DialogTitle>Manage tenants</DialogTitle>
+        <DialogTitle>{{ isEdit ? `Edit ${tenant!.name}` : 'Add tenant' }}</DialogTitle>
         <DialogDescription>
-          Register the Photon installs allowed to push federated telemetry here. The token is a secret — shown once.
+          {{ isEdit
+            ? 'Update this tenant, or rotate its push token. A rotated token is a secret — shown once.'
+            : 'Register a Photon install allowed to push federated telemetry here. The token is a secret — shown once.' }}
         </DialogDescription>
       </DialogHeader>
 
-      <!-- Existing tenants -->
-      <p v-if="!tenants.length" class="py-4 text-center text-sm text-muted-foreground">No tenants registered yet.</p>
-      <ul v-else class="flex max-h-72 flex-col divide-y divide-border overflow-y-auto rounded-md border border-border">
-        <li v-for="tenant in tenants" :key="tenant.name" class="flex flex-col gap-2 p-3">
-          <div class="flex items-start justify-between gap-2">
-            <div class="min-w-0">
-              <p class="text-sm font-medium text-foreground">{{ tenant.name }}</p>
-              <p class="truncate font-mono text-xs text-muted-foreground" :title="tenant.token">{{ tenant.token }}</p>
-            </div>
-            <div class="flex shrink-0 gap-1">
-              <Button
-                variant="ghost"
-                size="icon"
-                class="size-7 text-muted-foreground hover:text-foreground"
-                aria-label="Rotate token"
-                title="Rotate token"
-                @click="rotate(tenant)"
-              >
-                <KeyRound class="size-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                class="size-7 text-muted-foreground hover:text-sev-error"
-                aria-label="Delete tenant"
-                title="Delete tenant"
-                @click="remove(tenant)"
-              >
-                <Trash2 class="size-4" />
-              </Button>
-            </div>
-          </div>
-          <div class="space-y-1">
-            <label class="text-[11px] uppercase tracking-wide text-muted-foreground">UI URL (optional)</label>
-            <input
-              type="text"
-              :data-testid="`tenant-ui-url-${tenant.name}`"
-              :value="tenant.ui_url ?? ''"
-              placeholder="https://tenant.example.com"
-              class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1.5 font-mono text-xs shadow-sink transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              @change="editUiUrl(tenant, ($event.target as HTMLInputElement).value)"
-            />
-          </div>
-        </li>
-      </ul>
-
-      <!-- Create -->
-      <form data-testid="new-tenant-form" class="flex flex-col gap-3 border-t border-border pt-4" @submit.prevent="submitCreate">
-        <p class="text-sm font-medium text-foreground">Add tenant</p>
-        <FormField label="Name" for="new-tenant-name" hint="Lowercase alphanumeric/hyphen — identifies the tenant everywhere.">
+      <form data-testid="tenant-form" class="flex flex-col gap-3" @submit.prevent="submit">
+        <FormField v-if="!isEdit" label="Name" for="tenant-name" hint="Lowercase alphanumeric/hyphen — identifies the tenant everywhere.">
           <Input
-            id="new-tenant-name"
-            v-model="newName"
-            data-testid="new-tenant-name"
+            id="tenant-name"
+            v-model="name"
+            data-testid="tenant-name"
             type="text"
-            placeholder="divtik"
+            placeholder="acme-corp"
             autocomplete="off"
           />
         </FormField>
-        <FormField label="UI URL" for="new-tenant-ui-url" hint="Optional — where this tenant's own Photon UI lives.">
+        <FormField label="UI URL" for="tenant-ui-url" hint="Optional — where this tenant's own Photon UI lives.">
           <Input
-            id="new-tenant-ui-url"
-            v-model="newUiUrl"
-            data-testid="new-tenant-ui-url"
+            id="tenant-ui-url"
+            v-model="uiUrl"
+            data-testid="tenant-ui-url"
             type="text"
             placeholder="https://tenant.example.com"
             autocomplete="off"
           />
         </FormField>
-        <Button type="submit" :disabled="createMut.isPending.value">
-          <Plus class="size-4" /> {{ createMut.isPending.value ? 'Adding…' : 'Add tenant' }}
-        </Button>
+        <FormField
+          label="Mode"
+          for="tenant-mode"
+          hint="Set in the tenant's own config file — this choice only pre-fills the snippet below. Summary pushes health metrics only; full mirrors the tenant's raw telemetry here; traces-only mirrors just spans (services/APM without logs)."
+        >
+          <Segmented id="tenant-mode" v-model="mode" data-testid="tenant-mode">
+            <SegmentedItem value="summary">Summary</SegmentedItem>
+            <SegmentedItem value="full">Full</SegmentedItem>
+            <SegmentedItem value="full-traces">Traces only</SegmentedItem>
+          </Segmented>
+        </FormField>
+        <div class="flex items-center gap-2">
+          <Button type="submit" :disabled="createMut.isPending.value || updateMut.isPending.value">
+            <template v-if="isEdit">{{ updateMut.isPending.value ? 'Saving…' : 'Save' }}</template>
+            <template v-else><Plus class="size-4" /> {{ createMut.isPending.value ? 'Adding…' : 'Add tenant' }}</template>
+          </Button>
+          <Button
+            v-if="isEdit"
+            type="button"
+            variant="outline"
+            data-testid="tenant-rotate"
+            :disabled="rotateMut.isPending.value"
+            @click="rotate"
+          >
+            <KeyRound class="size-4" /> {{ rotateMut.isPending.value ? 'Rotating…' : 'Rotate token' }}
+          </Button>
+        </div>
       </form>
 
       <!-- Minted token + install snippet -->
       <div v-if="mintedToken" class="rounded-lg border border-brand/40 bg-brand/5 p-3">
-        <p class="text-xs font-medium text-foreground">
-          Token for <span class="font-mono">{{ mintedFor }}</span> (shown once — copy it now):
-        </p>
+        <div class="flex items-center justify-between gap-2">
+          <p class="text-xs font-medium text-foreground">
+            Token for <span class="font-mono">{{ mintedFor }}</span> (shown once — copy it now):
+          </p>
+          <div class="flex shrink-0 gap-1">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              class="h-7 px-2 text-xs"
+              data-testid="tenant-copy-token"
+              @click="copy(mintedToken, 'token')"
+            >
+              <Copy class="size-3.5" /> Token
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              class="h-7 px-2 text-xs"
+              data-testid="tenant-copy-snippet"
+              @click="copy(fedSnippet(mintedToken), 'config snippet')"
+            >
+              <Copy class="size-3.5" /> Snippet
+            </Button>
+          </div>
+        </div>
         <pre class="mt-2 whitespace-pre-wrap break-all rounded bg-surface-2 p-2 font-mono text-xs">{{ fedSnippet(mintedToken) }}</pre>
       </div>
     </DialogContent>

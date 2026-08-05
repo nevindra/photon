@@ -75,7 +75,7 @@ use photon_core::metric_schema::MetricSchema;
 use photon_core::schema::LogSchema;
 use photon_core::span_schema::SpanSchema;
 use photon_core::TenantTokenMap;
-use photon_ingest::{FederationTee, IngestServer};
+use photon_ingest::{FederationTee, IngestServer, TeeSignal};
 use photon_query::{MetricsQueryEngine, QueryEngine, SpanQueryEngine};
 use photon_storage::{Replicator, Storage};
 use photon_wal::{BroadcastingWal, DiskWal, Wal};
@@ -452,7 +452,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .filter(|f| f.mode == FederationMode::Full)
     {
-        let (tee, rx) = FederationTee::channel(fed.queue_batches);
+        // `[federation].signals` narrows what full mode mirrors; absent → all three.
+        let tee_signals: Vec<TeeSignal> = match fed.signals.as_deref() {
+            None => vec![TeeSignal::Logs, TeeSignal::Traces, TeeSignal::Metrics],
+            Some(sigs) => sigs
+                .iter()
+                .map(|s| match s {
+                    photon_core::config::FederationSignal::Logs => TeeSignal::Logs,
+                    photon_core::config::FederationSignal::Traces => TeeSignal::Traces,
+                    photon_core::config::FederationSignal::Metrics => TeeSignal::Metrics,
+                })
+                .collect(),
+        };
+        let (tee, rx) = FederationTee::channel_for(fed.queue_batches, &tee_signals);
         // The tee's own drop counter IS the stats counter, so `/api/federation/status` reports
         // queue-full drops and forwarder give-ups as one number.
         federation_stats_dropped = Some(tee.dropped.clone());

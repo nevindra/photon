@@ -20,6 +20,7 @@ Optional `[federation]` config block (omit = disabled):
 endpoint = "https://central.example.com:8080"    # required: central's OTLP/HTTP endpoint
 token = "tk_tenant_…"                            # required: per-tenant bearer token (minted by central, never generate locally)
 mode = "summary"                                 # optional: "summary" (default) or "full"
+signals = ["traces"]                             # optional, full mode only: subset of ["logs","traces","metrics"] to mirror
 interval_secs = 30                               # optional: how often to push summary metrics (default 30, min 5)
 queue_batches = 1024                             # optional: full-mode tee queue capacity (default 1024, min 16); dropped on overflow
 ```
@@ -75,6 +76,8 @@ All federation metrics carry a resource attribute `service.name = "photon"` + th
 
 ## Full-mode tee & forwarder (best-effort)
 
+`[federation].signals` (full mode only) narrows what the tee mirrors — e.g. `signals = ["traces"]` mirrors spans only, giving central the Services/APM + Traces views for the tenant without shipping logs (usually the heaviest signal). Omitted → all three. `signals` under `mode = "summary"` is a **config error** (fail-fast at startup): summary mirrors nothing, so a signal list there would be silently ignored — the config refuses the contradiction instead. The summary `mode` attribute reports the subset (`full:traces`), so the central card badge and its tooltip stay honest. Env override: `PHOTON_FEDERATION_SIGNALS=traces,metrics`.
+
 When `[federation].mode = "full"`:
 
 1. **Tenant-side tee** (in `photon-ingest`): after successful auth and decode, each OTLP batch is offered to a bounded MPSC channel (capacity = `[federation].queue_batches`). If the channel is full, the batch is dropped + a counter increments; the local ingest ack is NOT delayed (tee is non-blocking, never blocks ingest).
@@ -99,7 +102,7 @@ Central maintains a `tenants` SQLite table (one row per tenant, schema at `crate
 |---|---|---|
 | `name` | TEXT PRIMARY KEY | tenant identifier, `[a-z0-9-]{1,64}` |
 | `token` | TEXT UNIQUE | server-minted bearer token `tk_tenant_…` |
-| `ui_url` | TEXT NULL | optional link-back to tenant UI (shown in central's Home board for summary-mode tenants) |
+| `ui_url` | TEXT NULL | optional link-back to tenant UI (shown on the Home board card whenever set) |
 | `created_at` | INTEGER | unix milliseconds |
 
 ### Tenant management API
@@ -170,15 +173,18 @@ Actually, the task says "Home gains a conditional tenant board" — that's on ce
 - Sparkline of rows/sec over the last 15 min
 - Footer: "last seen X ago"
 - Down-tenant: destructive tint + "Unreachable — no heartbeat"
-- Summary-mode card: "Open UI ↗" link to `ui_url`
+- "Open UI ↗" link to `ui_url` whenever set (any mode)
 
 Clicking a tenant card:
-- Full-mode: navigate to the logs/traces/metrics views with a `tenant:` filter applied (fifth ScopeType)
+- Full-mode: sets the tenant context dimension and navigates to Logs with a `tenant:` filter applied
 - Summary-mode: open `ui_url` in a new tab
 
-## Tenant scope (fifth ScopeType)
 
-Central's UI gains a fifth `ScopeType: 'tenant'` alongside the existing `service`, `rumApp`, `host`, `monitor`. When a tenant scope is set via the Home board (full-mode card) or the /data Tenants tab, the query composables append `tenant:<name>` to the existing `q` grammar filter, scoping Logs/Traces/Metrics to that tenant's stamped records.
+With a tenant filter active, the board narrows to the active tenant's card (a health header for the tenant being inspected) and notes how many cards the filter hides; clearing the filter restores the full fleet board.
+
+## Tenant context dimension
+
+Central's UI gains `tenant` as its own global context dimension in `lib/core/context.ts`, alongside the time window. It is set via the Home board (full-mode card) or the ContextBar's tenant picker (a dropdown that only renders when the tenant registry is non-empty), synced to the `tenant` URL key, and carried by `correlate()`. The query composables append `tenantQueryTerm()` (`tenant:<name>`) to the existing `q` grammar filter, scoping Logs/Traces/Metrics, the Services (APM) vertical (`/api/red`, `/api/services/:service/{timeseries,dependencies}` take an optional `q` grammar param), and the Infrastructure vertical (`/api/infra/*` likewise) to that tenant's stamped records. `GET /api/red?group=service` additionally groups by the `tenant` attribute and returns it per row (null for local spans), so the Home/Services tables label federated rows with a tenant badge.
 
 The field catalogs (`logs/fields.ts`, `traces/spanFields.ts`, `metrics/metricFields.ts`) each gain a `tenant` entry for autocomplete.
 
@@ -202,12 +208,13 @@ The field catalogs (`logs/fields.ts`, `traces/spanFields.ts`, `metrics/metricFie
 **Frontend (central):**
 - `frontend/src/lib/tenants/tenantsQueries.ts` — API client + TanStack Query composables
 - `frontend/src/components/tenants/TenantCard.vue` — card for Home board
-- `frontend/src/components/tenants/TenantManageDialog.vue` — create/rotate/delete dialog for /data tab
-- `frontend/src/components/data/DataTenants.vue` — /data Tenants tab
+- `frontend/src/components/tenants/TenantManageDialog.vue` — add/edit dialog (rotate token inside edit; minted/rotated token snippet shown once)
+- `frontend/src/views/TenantsView.vue` — the `/tenants` page (NavRail Manage group)
+- `frontend/src/components/data/DataTenants.vue` — the registry table (per-row edit/delete actions, "Add tenant" button) rendered by TenantsView
 - `frontend/src/components/data/DataOverview.vue` — federation status strip (tenant-side only, shown when `enabled: true`)
 - `frontend/src/views/HomeView.vue` — tenant board section
-- `frontend/src/views/DataView.vue` — tenants tab integration
-- `frontend/src/lib/core/context.ts` — `ScopeType` extended to include `'tenant'`, `scopeQueryTerm()` helper
+- `frontend/src/lib/core/context.ts` — `tenant` context dimension (`tenant` ref, `setTenant`/`clearTenant`, `tenantQueryTerm()`, `tenant` URL key)
+- `frontend/src/components/common/ContextBar.vue` — tenant picker dropdown (renders only when the registry is non-empty)
 
 **Config:**
 - `crates/photon-core/src/config.rs` — `Config.federation: Option<FederationConfig>`, env overrides
@@ -217,5 +224,6 @@ The field catalogs (`logs/fields.ts`, `traces/spanFields.ts`, `metrics/metricFie
 
 - **No per-tenant retention** — central retention applies uniformly to all data, regardless of source or tenant. If different tenants need different retention, that's a future enhancement (separate retention groups per tenant).
 - **No central-controlled mode** — mode is set by the tenant in their config; central doesn't dictate it. Tenants can unilaterally upgrade from summary to full or downgrade.
-- **Summary only in v1** — full-mode RUM vitals and errors are federated as-is; Services APM (RED metrics) are federated but the `/services` view is not tenant-filtered in v1 (only Logs/Traces/Metrics are). Filtering the Services view is a follow-up.
+- **RUM and uptime are NOT federated (known v1 gap, deliberate)** — the full-mode tee sits in `photon-ingest`'s OTLP receivers, but RUM enters through a different front door entirely: the browser beacon (`POST /api/rum`, `photon-api`'s `RumSink`) writes straight to the WALs and never passes the tee, so a full-mode tenant's vitals/errors are never mirrored to central. Uptime is likewise a local SQLite vertical (only its open-incident count rides the summary metrics). Central's `/rum` would stay empty for tenants even if the data were mirrored — the app registry (`rum_apps`) is per-install SQLite, so central doesn't know tenant apps exist. The chosen posture: tenant RUM/uptime is monitored on the tenant's own UI (the Home tenant card links out via `ui_url`). Closing the gap would need both a `RumSink`-level tee (synthesizing OTLP from vitals/errors) and tenant app-registry sync — a follow-up if demand appears.
+- **Tenant filter coverage** — the tenant context dimension filters Logs, Traces, Metrics, Services (APM), and Infrastructure. Home's cross-signal tiles (RUM vitals, uptime) are not tenant-filtered — see the gap above.
 - **No Prometheus remote-write federation** — tenant tokens are rejected on `/api/v1/write` to avoid ambiguity in stamping (no rich resource attributes in the protocol).

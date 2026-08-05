@@ -4,7 +4,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { api } from '@/lib/core/api'
 import { useSearchTraces, useSearchSpans } from '@/lib/traces/tracesQueries'
-import { setScope, clearScope } from '@/lib/core/context'
+import { setTenant, clearTenant } from '@/lib/core/context'
 
 // Neither `useSearchTraces` nor `useSearchSpans` had a dedicated test file before this one —
 // like `metricsQueries.test.js`/`dataQueries.test.js`, `useQuery`/`useInfiniteQuery` require an
@@ -126,18 +126,18 @@ describe('tracesQueries', () => {
     })
   })
 
-  // Task 12: `tenant` is the first ScopeType that actually filters. useSearchTraces/useSearchSpans
-  // are the only tracesQueries.ts composables scope-wrapped — the pinned facet/histogram/latency
+  // Task 12: `tenant` is the context dimension that actually filters. useSearchTraces/useSearchSpans
+  // are the only tracesQueries.ts composables tenant-wrapped — the pinned facet/histogram/latency
   // composables below stay unwrapped since they're shared with the (not tenant-scoped) Services
   // vertical.
-  describe('tenant scope', () => {
-    afterEach(() => clearScope())
+  describe('tenant filter', () => {
+    afterEach(() => { clearTenant() })
 
-    it('useSearchSpans appends the tenant term to the request query and re-keys on scope', async () => {
+    it('useSearchSpans appends the tenant term to the request query and re-keys on it', async () => {
       const spy = vi
         .spyOn(api, 'searchSpans')
         .mockResolvedValue({ rows: [], matched_count: 0, elapsed_ms: 0, next_cursor: null })
-      setScope({ type: 'tenant', id: 'divtik', label: 'divtik' })
+      setTenant('divtik')
       const buildRequest = (cursor) => ({ query: 'status:error', start: '0', end: '10', cursor })
 
       const { queryClient } = mountHarness(() => useSearchSpans(ref('descriptor'), buildRequest))
@@ -151,7 +151,7 @@ describe('tracesQueries', () => {
       expect(keys).toContainEqual(['spans-search', 'descriptor', 'tenant:divtik'])
     })
 
-    it('useSearchTraces adds no term without a tenant scope', async () => {
+    it('useSearchTraces adds no term without a tenant', async () => {
       const spy = vi
         .spyOn(api, 'searchTraces')
         .mockResolvedValue({ traces: [], matched_count: 0, elapsed_ms: 0, next_cursor: null })

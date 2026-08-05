@@ -8,7 +8,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
-import { startNs, endNs, customRange, clearScope, setTimeRange } from '@/lib/core/context'
+import { startNs, endNs, customRange, setTimeRange } from '@/lib/core/context'
 import RumAppsView from './RumAppsView.vue'
 
 const t = ([goodMax, poorMin]: [number, number]) => ({ good_max: goodMax, poor_min: poorMin })
@@ -87,7 +87,6 @@ describe('RumAppsView (executive summary)', () => {
   beforeEach(() => {
     window.history.replaceState(null, '', '/')
     customRange.value = null
-    clearScope()
     setTimeRange('30m')
   })
 

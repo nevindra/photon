@@ -3,7 +3,7 @@
 // returned Core Web Vital, and a dimension-switchable breakdown table. Clone of ServiceDetailView's
 // route-param + time-range plumbing. Zero-sample vitals are OMITTED by the API, so we render only
 // what comes back (never assume all five).
-import { ref, computed, watch } from 'vue'
+import { ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppShell from '@/components/common/AppShell.vue'
 import { NavTabs, NavTabItem } from '@/components/ui/nav-tabs'
@@ -13,7 +13,7 @@ import RumBreakdownTable from '@/components/rum/RumBreakdownTable.vue'
 import { Spinner } from '@/components/ui/spinner'
 import { EmptyState } from '@/components/ui/empty-state'
 import { api } from '@/lib/core/api'
-import { startNs, endNs, setScope } from '@/lib/core/context'
+import { startNs, endNs } from '@/lib/core/context'
 import { useRumVitals, useRumBreakdown } from '@/lib/rum/rumQueries'
 
 const route = useRoute()
@@ -25,10 +25,7 @@ const app = computed(() => {
   return ((Array.isArray(a) ? a[0] : a) ?? '').trim()
 })
 const appBase = computed(() => '/rum/' + encodeURIComponent(app.value))
-// Breadcrumb: this app is the active entity scope. `immediate` seeds it on mount; the watch also
-// keeps it current if Vue reuses this instance across an `:appId` change (same route record).
 const crumb = computed(() => 'Frontend › ' + app.value)
-watch(app, (a) => setScope({ type: 'rumApp', id: a, label: a }), { immediate: true })
 
 // Time window is global (lib/context via ContextBar); this view just reads startNs/endNs.
 

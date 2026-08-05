@@ -7,7 +7,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
-import { customRange, clearScope, setTimeRange } from '@/lib/core/context'
+import { customRange, setTimeRange } from '@/lib/core/context'
 import InfraHostsView from './InfraHostsView.vue'
 
 vi.mock('@/lib/core/api', () => ({
@@ -53,7 +53,6 @@ describe('InfraHostsView', () => {
   beforeEach(() => {
     window.history.replaceState(null, '', '/')
     customRange.value = null
-    clearScope()
     setTimeRange('30m')
   })
 

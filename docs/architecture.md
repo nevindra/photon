@@ -253,7 +253,7 @@ backend can't be silently replaced with demo data.
 - **Live tail (SSE):** `GET /api/stream/logs`, `GET /api/stream/spans`.
 - **Traces / spans:** `GET /api/traces/:trace_id`, `POST /api/traces/search`, `POST /api/spans/search`,
   `GET /api/traces/fields|facet|histogram|latency`.
-- **Services (APM):** `GET /api/red`, `GET /api/services/:service/timeseries|dependencies|settings`.
+- **Services (APM):** `GET /api/red`, `GET /api/services/:service/timeseries|dependencies|settings` (`timeseries`/`dependencies` take an optional `q` grammar param AND-ed with the service term — the UI's tenant filter).
 - **Metrics:** `POST /api/metrics/query`, `GET /api/metrics/catalog|metadata/:name|labels`.
 - **Infrastructure (host/GPU resource monitoring):** `GET /api/infra/hosts`,
   `GET /api/infra/hosts/:host`, `GET /api/infra/hosts/:host/processes`,

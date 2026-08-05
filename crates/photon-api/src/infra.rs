@@ -9,9 +9,11 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use photon_core::query::MetricResolvedQuery;
 use photon_core::PhotonError;
 use photon_query::{HostDetail, HostSummary, InfraResource, ProcessSummary, SeriesResult};
 
+use crate::metrics::resolve_metric_filter;
 use crate::AppState;
 
 fn err_500(e: PhotonError) -> Response {
@@ -76,10 +78,28 @@ fn infra_series_json(s: &SeriesResult) -> Value {
 pub(crate) struct HostsParams {
     start: i64,
     end: i64,
+    #[serde(default)]
+    q: String,
+}
+
+/// Compile the optional `q` grammar filter (e.g. the UI's tenant scope) or 400 like `/api/metrics`.
+fn compile_q(
+    st: &AppState,
+    q: &str,
+) -> Result<Option<MetricResolvedQuery>, crate::query_params::QueryParamError> {
+    resolve_metric_filter(q, st.metrics_query.promoted_attributes())
 }
 
 pub(crate) async fn hosts(State(st): State<AppState>, Query(p): Query<HostsParams>) -> Response {
-    match st.metrics_query.infra_hosts(p.start, p.end).await {
+    let filter = match compile_q(&st, &p.q) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
+    match st
+        .metrics_query
+        .infra_hosts(p.start, p.end, filter.as_ref())
+        .await
+    {
         Ok(v) => {
             let hosts: Vec<Value> = v.iter().map(host_summary_json).collect();
             Json(json!({ "hosts": hosts })).into_response()
@@ -95,9 +115,13 @@ pub(crate) async fn host_detail(
     Path(host): Path<String>,
     Query(p): Query<HostsParams>,
 ) -> Response {
+    let filter = match compile_q(&st, &p.q) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
     match st
         .metrics_query
-        .infra_host_detail(&host, p.start, p.end)
+        .infra_host_detail(&host, p.start, p.end, filter.as_ref())
         .await
     {
         Ok(d) => Json(host_detail_json(&d)).into_response(),
@@ -112,9 +136,13 @@ pub(crate) async fn processes(
     Path(host): Path<String>,
     Query(p): Query<HostsParams>,
 ) -> Response {
+    let filter = match compile_q(&st, &p.q) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
     match st
         .metrics_query
-        .infra_host_processes(&host, p.start, p.end)
+        .infra_host_processes(&host, p.start, p.end, filter.as_ref())
         .await
     {
         Ok(v) => {
@@ -134,6 +162,8 @@ pub(crate) struct TimeseriesParams {
     end: i64,
     #[serde(default)]
     buckets: Option<usize>,
+    #[serde(default)]
+    q: String,
 }
 
 pub(crate) async fn host_timeseries(
@@ -148,10 +178,14 @@ pub(crate) async fn host_timeseries(
         )
             .into_response();
     };
+    let filter = match compile_q(&st, &p.q) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
     let buckets = p.buckets.unwrap_or(48).clamp(1, 500);
     match st
         .metrics_query
-        .infra_host_series(&host, resource, p.start, p.end, buckets)
+        .infra_host_series(&host, resource, p.start, p.end, buckets, filter.as_ref())
         .await
     {
         Ok(r) => {

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrame;
+use datafusion::functions::core::expr_fn::get_field;
 use datafusion::functions_aggregate::expr_fn::{approx_percentile_cont, count, sum};
 use datafusion::prelude::{col, lit, when, Expr};
 
@@ -39,6 +40,9 @@ pub enum RedGroup {
 pub struct RedRow {
     /// `service.name`.
     pub service: String,
+    /// The `tenant` attribute stamped by federation ingest; `None` for local (untenanted) spans.
+    /// Only populated for `RedGroup::Service` (the tables that label rows by tenant).
+    pub tenant: Option<String>,
     /// Operation `name`; `Some` only for `RedGroup::Operation`, `None` for `RedGroup::Service`.
     pub operation: Option<String>,
     /// Spans matched in the group (the rate numerator).
@@ -134,7 +138,10 @@ async fn red_over(
             col_ref("service.name").alias("service"),
             col_ref(span_schema::NAME).alias("operation"),
         ],
-        RedGroup::Service => vec![col_ref("service.name").alias("service")],
+        RedGroup::Service => vec![
+            col_ref("service.name").alias("service"),
+            get_field(col_ref(span_schema::ATTRIBUTES), "tenant").alias("tenant"),
+        ],
     };
 
     let batches = df
@@ -172,6 +179,10 @@ async fn red_over(
             RedGroup::Operation => Some(str_col(b, "operation")?),
             RedGroup::Service => None,
         };
+        let tenant = match group {
+            RedGroup::Service => Some(str_col(b, "tenant")?),
+            RedGroup::Operation => None,
+        };
         let n = i64_col(b, "n")?;
         let errors = i64_col(b, "errors")?;
         let p50 = i64_col(b, "p50")?;
@@ -186,6 +197,13 @@ async fn red_over(
             }
             rows.push(RedRow {
                 service: service.value(i).to_string(),
+                tenant: tenant.and_then(|t| {
+                    if t.is_null(i) {
+                        None
+                    } else {
+                        Some(t.value(i).to_string())
+                    }
+                }),
                 operation: operation.and_then(|o| {
                     if o.is_null(i) {
                         None
@@ -371,6 +389,27 @@ mod tests {
         assert_eq!(checkout.count, 2);
         assert_eq!(checkout.error_count, 1);
         assert_eq!(rows.len(), 2); // checkout + web, no per-operation split
+    }
+
+    #[tokio::test]
+    async fn service_group_splits_and_labels_rows_by_tenant_attr() {
+        let mut a = span("api", "op", Some(10_000_000), Some(1));
+        a.attributes.insert("tenant".into(), "divtik".into());
+        let local = span("api", "op", Some(20_000_000), Some(1));
+        let rows = red_over(
+            df_of(&[a, local]).await,
+            span_base_predicate(&req()),
+            RedGroup::Service,
+            &std::collections::HashMap::new(),
+            500,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2); // same service name, split by tenant
+        let tenanted = rows.iter().find(|r| r.tenant.is_some()).unwrap();
+        assert_eq!(tenanted.tenant.as_deref(), Some("divtik"));
+        assert!(rows.iter().any(|r| r.tenant.is_none()));
     }
 
     #[tokio::test]

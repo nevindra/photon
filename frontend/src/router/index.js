@@ -64,6 +64,12 @@ const routes = [
   { path: "/infra", name: "infra", component: InfraHostsView },
   { path: "/infra/:host", name: "infra-host", component: InfraHostDetailView },
   { path: "/data", name: "data", component: DataView },
+  // Tenants (federation tenant registry, Manage group): lazy — only federated installs visit it.
+  {
+    path: "/tenants",
+    name: "tenants",
+    component: () => import("../views/TenantsView.vue"),
+  },
   // Alerts (webhook-alert engine, Manage group): lazy-loaded since it's not on the critical
   // first-paint path and its own subtree (rule builder, condition builder, channel dialogs) is
   // sizeable — mirrors the split-chunk treatment other heavier views get from Vite's default

@@ -10,6 +10,7 @@ import {
   Waypoints,
   BarChart3,
   Database,
+  Building2,
   Bell,
   Settings,
   LogOut,
@@ -79,6 +80,7 @@ const NAV_GROUPS = [
     items: [
       { key: 'data', label: 'Data', icon: Database, route: '/data' },
       { key: 'alerts', label: 'Alerts', icon: Bell, route: '/alerts' },
+      { key: 'tenants', label: 'Tenants', icon: Building2, route: '/tenants' },
     ],
   },
 ]

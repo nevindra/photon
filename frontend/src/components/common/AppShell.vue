@@ -36,6 +36,7 @@ const ROUTE_GROUP = {
   uptime: 'infrastructure',
   data: 'data',
   alerts: 'alerts',
+  tenants: 'tenants',
 }
 const LANDING = {
   home: '/home',
@@ -48,6 +49,7 @@ const LANDING = {
   metrics: '/metrics',
   data: '/data',
   alerts: '/alerts',
+  tenants: '/tenants',
 }
 
 // The first path segment is the route section: '/logs' → 'logs', '/traces/abc' → 'traces',

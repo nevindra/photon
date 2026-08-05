@@ -10,7 +10,7 @@ import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import HomeView from './HomeView.vue'
 import { api } from '@/lib/core/api'
-import { scope, clearScope } from '@/lib/core/context'
+import { tenant, setTenant, clearTenant } from '@/lib/core/context'
 
 vi.mock('@/lib/core/api', () => ({
   api: {
@@ -88,11 +88,33 @@ describe('HomeView', () => {
     expect(board.text()).toContain('Unreachable')
   })
 
-  // Task 12: clicking a full-mode tenant card sets the `tenant` scope and drills into Logs (the
-  // scope then narrows the log search via `scopeQueryTerm()`); a summary-mode card has no local
-  // data to browse, so it links out to the tenant's own UI instead (unchanged from Task 11).
-  it('clicking a full-mode tenant card scopes to that tenant and opens Logs', async () => {
-    clearScope()
+  it('narrows the board to the active tenant card when the tenant filter is set', async () => {
+    setTenant('globex')
+    ;(api.tenantsSummary as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { name: 'globex', mode: 'full', status: 'up', last_seen_ms: Date.now(), ingest_rows_per_sec: 3, open_incidents: 0, hot_bytes: 0, ui_url: null, spark: [] },
+      { name: 'initech', mode: 'summary', status: 'up', last_seen_ms: Date.now(), ingest_rows_per_sec: 1, open_incidents: 0, hot_bytes: 0, ui_url: null, spark: [] },
+    ])
+    router.push('/home')
+    await router.isReady()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+    const w = mount(
+      { components: { HomeView, TooltipProvider }, template: '<TooltipProvider><HomeView/></TooltipProvider>' },
+      { global: { plugins: [router, [VueQueryPlugin, { queryClient }]] }, attachTo: document.body },
+    )
+    await flushPromises()
+
+    const cards = w.findAll('[data-testid="tenant-card"]')
+    expect(cards.length).toBe(1)
+    expect(cards[0].attributes('data-tenant')).toBe('globex')
+    expect(w.text()).toContain('1 more hidden by the tenant filter')
+    clearTenant()
+  })
+
+  // Clicking a full-mode tenant card sets the tenant context dimension and drills into Logs (the
+  // tenant then narrows the log search via `tenantQueryTerm()`); a summary-mode card has no local
+  // data to browse, so it links out to the tenant's own UI instead.
+  it('clicking a full-mode tenant card sets the tenant context and opens Logs', async () => {
+    clearTenant()
     ;(api.tenantsSummary as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
       { name: 'globex', mode: 'full', status: 'up', last_seen_ms: Date.now(), ingest_rows_per_sec: 3, open_incidents: 0, hot_bytes: 0, ui_url: null, spark: [] },
     ])
@@ -108,7 +130,7 @@ describe('HomeView', () => {
     await w.get('[data-tenant="globex"]').trigger('click')
     await flushPromises()
 
-    expect(scope.value).toEqual({ type: 'tenant', id: 'globex', label: 'globex' })
+    expect(tenant.value).toBe('globex')
     expect(router.currentRoute.value.path).toBe('/logs')
   })
 })

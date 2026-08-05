@@ -139,5 +139,7 @@ default_apdex_threshold_ms = 500
 # endpoint = "https://central.example.com:8080"    # required: central's public OTLP/HTTP endpoint
 # token = "tk_tenant_…"                            # required: per-tenant token (minted by central, never generated locally)
 # mode = "summary"                                 # optional: "summary" (default) or "full"
+# signals = ["traces"]                             # optional, full mode only: which signals to mirror
+#                                                  # (default all three; e.g. ["traces"] = services/APM without logs)
 # interval_secs = 30                               # optional: summary push interval in seconds (default 30, min 5)
 # queue_batches = 1024                             # optional: full-mode tee queue size (default 1024, min 16); dropped on overflow

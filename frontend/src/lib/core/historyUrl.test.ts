@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { createRouter, createWebHistory } from 'vue-router'
 import { replaceSearch } from './historyUrl'
-import { syncContextToUrl, setTimeRange, setScope, customRange } from './context'
+import { syncContextToUrl, setTimeRange, customRange } from './context'
 import { isListEntry } from './useBackTo'
 
 describe('replaceSearch', () => {
@@ -86,7 +86,6 @@ describe('drill-in → back preserves the list entry (regression)', () => {
     window.history.replaceState(null, '', '/')
     customRange.value = null
     setTimeRange('30m')
-    setScope({ type: 'rumApp', id: 'local-lenz', label: 'local-lenz' })
 
     const router = createRouter({
       history: createWebHistory(),

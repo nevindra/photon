@@ -62,15 +62,31 @@ impl TeeSignal {
 #[derive(Clone)]
 pub struct FederationTee {
     tx: mpsc::Sender<(TeeSignal, Bytes)>,
+    /// Signals this tee mirrors, indexed by `TeeSignal as usize`. A disabled signal is skipped
+    /// silently in `offer` — deliberate config, not backpressure, so `dropped` doesn't count it.
+    enabled: [bool; 3],
     pub dropped: Arc<AtomicU64>,
 }
 
 impl FederationTee {
     pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<(TeeSignal, Bytes)>) {
+        Self::channel_for(capacity, &[TeeSignal::Logs, TeeSignal::Traces, TeeSignal::Metrics])
+    }
+
+    /// A tee that mirrors only `signals` (the `[federation].signals` subset).
+    pub fn channel_for(
+        capacity: usize,
+        signals: &[TeeSignal],
+    ) -> (Self, mpsc::Receiver<(TeeSignal, Bytes)>) {
         let (tx, rx) = mpsc::channel(capacity.max(1));
+        let mut enabled = [false; 3];
+        for s in signals {
+            enabled[*s as usize] = true;
+        }
         (
             FederationTee {
                 tx,
+                enabled,
                 dropped: Arc::new(AtomicU64::new(0)),
             },
             rx,
@@ -78,6 +94,9 @@ impl FederationTee {
     }
 
     pub fn offer(&self, signal: TeeSignal, payload: Bytes) {
+        if !self.enabled[signal as usize] {
+            return;
+        }
         if self.tx.try_send((signal, payload)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -364,6 +383,18 @@ mod tee_tests {
         .await
         .expect("offer must never await, even on a full queue");
         assert_eq!(tee.dropped.load(Ordering::Relaxed), 8);
+    }
+
+    #[tokio::test]
+    async fn disabled_signal_is_skipped_silently() {
+        let (tee, mut rx) = FederationTee::channel_for(4, &[TeeSignal::Traces]);
+        tee.offer(TeeSignal::Logs, Bytes::from_static(b"log"));
+        tee.offer(TeeSignal::Metrics, Bytes::from_static(b"metric"));
+        tee.offer(TeeSignal::Traces, Bytes::from_static(b"span"));
+        let (signal, _) = rx.recv().await.expect("only the enabled signal arrives");
+        assert_eq!(signal, TeeSignal::Traces);
+        assert!(rx.try_recv().is_err()); // logs/metrics never queued...
+        assert_eq!(tee.dropped.load(Ordering::Relaxed), 0); // ...and not counted as drops
     }
 
     #[tokio::test]

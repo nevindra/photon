@@ -11,7 +11,7 @@ vi.mock('@tanstack/vue-query', async (orig) => ({
 import { useFacet, useHistogram, useSearchLogs } from '@/lib/logs/logsQueries'
 import { keepPreviousData } from '@tanstack/vue-query'
 import { api } from '@/lib/core/api'
-import { setScope, clearScope } from '@/lib/core/context'
+import { setTenant, clearTenant } from '@/lib/core/context'
 
 describe('logsQueries caching options', () => {
   beforeEach(() => useQueryMock.mockClear())
@@ -27,19 +27,19 @@ describe('logsQueries caching options', () => {
   })
 })
 
-// Task 12: `tenant` is the first ScopeType that actually filters — every composable here appends
-// the active scope's grammar term to its request (and re-keys on it), so a tenant scope narrows
-// logs without the caller (LogsView) having to know about scope at all.
-describe('logsQueries tenant scope', () => {
+// Task 12: `tenant` is the context dimension that actually filters — every composable here appends
+// the active tenant's grammar term to its request (and re-keys on it), so a tenant pick narrows
+// logs without the caller (LogsView) having to know about tenant at all.
+describe('logsQueries tenant filter', () => {
   beforeEach(() => {
     useQueryMock.mockClear()
-    clearScope()
+    clearTenant()
   })
-  afterEach(() => clearScope())
+  afterEach(() => { clearTenant() })
 
   it('useSearchLogs appends the tenant term to the request query and the cache key', async () => {
     const spy = vi.spyOn(api, 'search').mockResolvedValue({ rows: [], matched_count: 0, elapsed_ms: 0 })
-    setScope({ type: 'tenant', id: 'divtik', label: 'divtik' })
+    setTenant('divtik')
     useSearchLogs('key', () => ({ start_ts_nanos: '0', end_ts_nanos: '1', query: 'level:error', limit: 10 }))
     const opts = useQueryMock.mock.calls.at(-1)[0]
 
@@ -51,12 +51,8 @@ describe('logsQueries tenant scope', () => {
     )
   })
 
-  it('adds no term when scope is absent or non-tenant', () => {
+  it('adds no term when no tenant is set', () => {
     useSearchLogs('key', () => ({ start_ts_nanos: '0', end_ts_nanos: '1', query: 'level:error', limit: 10 }))
-    expect(useQueryMock.mock.calls.at(-1)[0].queryKey.value.at(-1)).toBeNull()
-
-    setScope({ type: 'service', id: 'checkout', label: 'checkout' })
-    useSearchLogs('key', () => ({ start_ts_nanos: '0', end_ts_nanos: '1', query: '', limit: 10 }))
     expect(useQueryMock.mock.calls.at(-1)[0].queryKey.value.at(-1)).toBeNull()
   })
 })

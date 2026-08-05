@@ -278,6 +278,7 @@ export interface LatencyResult {
 export type RedGroup = 'operation' | 'service'
 export interface RedRow {
   service: string
+  tenant?: string | null
   operation: string | null
   count: number
   rate: number
@@ -436,6 +437,7 @@ export interface ServiceTimeseriesRange {
   start?: string
   end?: string
   buckets?: number
+  q?: string
 }
 export interface ServiceTimeseriesBucket {
   ts: number
@@ -1347,11 +1349,11 @@ export const api = {
     }
   },
 
-  async serviceTimeseries(service: string, { start, end, buckets }: ServiceTimeseriesRange = {}, opts: RequestOpts = {}): Promise<ServiceTimeseriesBucket[]> {
+  async serviceTimeseries(service: string, { start, end, buckets, q }: ServiceTimeseriesRange = {}, opts: RequestOpts = {}): Promise<ServiceTimeseriesBucket[]> {
     try {
       return await http
         .get(`services/${encodeURIComponent(service)}/timeseries`, {
-          searchParams: { start, end, buckets }, signal: opts.signal,
+          searchParams: { start, end, buckets, ...(q ? { q } : {}) }, signal: opts.signal,
         })
         .json<ServiceTimeseriesBucket[]>()
     } catch {
@@ -1360,11 +1362,11 @@ export const api = {
     }
   },
 
-  async serviceDependencies(service: string, { start, end }: { start?: string; end?: string } = {}, opts: RequestOpts = {}): Promise<ServiceDependencies> {
+  async serviceDependencies(service: string, { start, end, q }: { start?: string; end?: string; q?: string } = {}, opts: RequestOpts = {}): Promise<ServiceDependencies> {
     try {
       return await http
         .get(`services/${encodeURIComponent(service)}/dependencies`, {
-          searchParams: { start, end }, signal: opts.signal,
+          searchParams: { start, end, ...(q ? { q } : {}) }, signal: opts.signal,
         })
         .json<ServiceDependencies>()
     } catch {
@@ -1635,10 +1637,10 @@ export const api = {
 
   // --- Infrastructure (host/GPU resource monitoring) ---
 
-  async infraHosts(startNs: string, endNs: string, opts: RequestOpts = {}): Promise<InfraHostsResult> {
+  async infraHosts(startNs: string, endNs: string, q?: string, opts: RequestOpts = {}): Promise<InfraHostsResult> {
     try {
       return await http
-        .get('infra/hosts', { searchParams: { start: startNs, end: endNs }, signal: opts.signal })
+        .get('infra/hosts', { searchParams: { start: startNs, end: endNs, ...(q ? { q } : {}) }, signal: opts.signal })
         .json<InfraHostsResult>()
     } catch (e: any) {
       if (e.status === 400) throw e
@@ -1647,10 +1649,10 @@ export const api = {
     }
   },
 
-  async infraHost(host: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<InfraHostDetail> {
+  async infraHost(host: string, startNs: string, endNs: string, q?: string, opts: RequestOpts = {}): Promise<InfraHostDetail> {
     try {
       return await http
-        .get(`infra/hosts/${encodeURIComponent(host)}`, { searchParams: { start: startNs, end: endNs }, signal: opts.signal })
+        .get(`infra/hosts/${encodeURIComponent(host)}`, { searchParams: { start: startNs, end: endNs, ...(q ? { q } : {}) }, signal: opts.signal })
         .json<InfraHostDetail>()
     } catch (e: any) {
       if (e.status === 400) throw e
@@ -1659,10 +1661,10 @@ export const api = {
     }
   },
 
-  async infraHostProcesses(host: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<InfraProcessesResult> {
+  async infraHostProcesses(host: string, startNs: string, endNs: string, q?: string, opts: RequestOpts = {}): Promise<InfraProcessesResult> {
     try {
       return await http
-        .get(`infra/hosts/${encodeURIComponent(host)}/processes`, { searchParams: { start: startNs, end: endNs }, signal: opts.signal })
+        .get(`infra/hosts/${encodeURIComponent(host)}/processes`, { searchParams: { start: startNs, end: endNs, ...(q ? { q } : {}) }, signal: opts.signal })
         .json<InfraProcessesResult>()
     } catch (e: any) {
       if (e.status === 400) throw e
@@ -1676,12 +1678,13 @@ export const api = {
     resource: string,
     startNs: string,
     endNs: string,
+    q?: string,
     opts: RequestOpts = {},
   ): Promise<InfraSeriesResult> {
     try {
       return await http
         .get(`infra/hosts/${encodeURIComponent(host)}/timeseries`, {
-          searchParams: { resource, start: startNs, end: endNs },
+          searchParams: { resource, start: startNs, end: endNs, ...(q ? { q } : {}) },
           signal: opts.signal,
         })
         .json<InfraSeriesResult>()

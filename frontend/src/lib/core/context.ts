@@ -1,4 +1,4 @@
-// App-wide observability context: the selected time window + the active entity scope.
+// App-wide observability context: the selected time window + the active federation tenant.
 // The auth.js / theme.js module-singleton pattern (NOT Pinia). One source of truth for the
 // time math that every view used to duplicate. URL sync lives in this file too (Task 2).
 import { ref, computed, watch, type Ref, type ComputedRef } from 'vue'
@@ -15,18 +15,10 @@ export interface CustomRange {
   endMs: number
 }
 
-export type ScopeType = 'service' | 'rumApp' | 'host' | 'monitor' | 'tenant'
-
-export interface Scope {
-  type: ScopeType
-  id: string
-  label: string
-}
-
 // --- state (module singletons) ---
 export const timeRange: Ref<string> = ref('30m')                    // preset key into RANGE_MS
 export const customRange: Ref<CustomRange | null> = ref(null)        // absolute; wins over preset
-export const scope: Ref<Scope | null> = ref(null)
+export const tenant: Ref<string | null> = ref(null)
 export const nowTick: Ref<number> = ref(Date.now())                  // advanced on range change / by the live control
 
 // --- derived window ---
@@ -55,31 +47,28 @@ export function setTimeRange(r: string): void {
 export function setCustomRange(r: CustomRange | null): void {
   customRange.value = r
 }
-export function setScope(s: Scope): void {
-  scope.value = s
+export function setTenant(id: string): void {
+  tenant.value = id
 }
-export function clearScope(): void {
-  scope.value = null
+export function clearTenant(): void {
+  tenant.value = null
 }
 
-// The first scope type that actually filters: the grammar term the active scope contributes to
-// backend queries (logs/traces/metrics composables append it to the `q`/`filter` string they
-// send). Other scope types (service/rumApp/host/monitor) stay decorative — chip + URL only — this
-// only fires for `tenant`.
-export function scopeQueryTerm(): string | null {
-  const s = scope.value
-  return s?.type === 'tenant' ? `tenant:${s.id}` : null
+// The grammar term the active tenant contributes to backend queries (logs/traces/metrics
+// composables append it to the `q`/`filter` string they send).
+export function tenantQueryTerm(): string | null {
+  return tenant.value ? `tenant:${tenant.value}` : null
 }
 
 // --- URL sync ---
-// Context owns the `range` / `from` / `to` / `scope` URL keys. Reads/writes are merge-preserve:
+// Context owns the `range` / `from` / `to` / `tenant` URL keys. Reads/writes are merge-preserve:
 // only these keys are touched, everything else in location.search (q/svc/sev/...) is left alone.
-const CONTEXT_KEYS = ['range', 'from', 'to', 'scope']
+const CONTEXT_KEYS = ['range', 'from', 'to', 'tenant']
 
 export interface ParsedContext {
   timeRange: string | null
   customRange: CustomRange | null
-  scope: Scope | null
+  tenant: string | null
 }
 
 export function parseContext(search: string): ParsedContext {
@@ -87,20 +76,10 @@ export function parseContext(search: string): ParsedContext {
   const from = Number(p.get('from'))
   const to = Number(p.get('to'))
   const hasCustom = p.has('from') && p.has('to') && Number.isFinite(from) && Number.isFinite(to)
-  const rawScope = p.get('scope')
-  let parsedScope: Scope | null = null
-  if (rawScope) {
-    const i = rawScope.indexOf(':')
-    if (i > 0) {
-      const type = rawScope.slice(0, i) as ScopeType
-      const id = rawScope.slice(i + 1)
-      parsedScope = { type, id, label: id }
-    }
-  }
   return {
     timeRange: p.get('range') || null,
     customRange: hasCustom ? { startMs: from, endMs: to } : null,
-    scope: parsedScope,
+    tenant: p.get('tenant') || null,
   }
 }
 
@@ -109,12 +88,12 @@ export function seedContextFromUrl(): void {
   const c = parseContext(window.location.search)
   if (c.timeRange) timeRange.value = c.timeRange
   customRange.value = c.customRange
-  scope.value = c.scope
+  tenant.value = c.tenant
 }
 
 // Merge-write ONLY the context keys into the live URL, preserving everything else (q/svc/sev/...).
 // Exported so the router can re-run it after a bare navigation (router/index.js afterEach) —
-// the watch below only fires on ref changes, so a route push with unchanged range/scope needs
+// the watch below only fires on ref changes, so a route push with unchanged range/tenant needs
 // this called explicitly to carry those keys onto the new path.
 export function syncContextToUrl(): void {
   if (typeof window === 'undefined') return
@@ -126,7 +105,7 @@ export function syncContextToUrl(): void {
   } else if (timeRange.value) {
     p.set('range', timeRange.value)
   }
-  if (scope.value) p.set('scope', `${scope.value.type}:${scope.value.id}`)
+  if (tenant.value) p.set('tenant', tenant.value)
   replaceSearch(p)
 }
 
@@ -134,5 +113,5 @@ let syncStarted = false
 export function startContextUrlSync(): void {
   if (syncStarted || typeof window === 'undefined') return
   syncStarted = true
-  watch([timeRange, customRange, scope], syncContextToUrl, { deep: true })
+  watch([timeRange, customRange, tenant], syncContextToUrl, { deep: true })
 }

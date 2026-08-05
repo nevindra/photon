@@ -38,6 +38,8 @@ pub(crate) struct TimeseriesParams {
     end: String,
     #[serde(default = "default_buckets")]
     buckets: usize,
+    #[serde(default)]
+    q: String,
 }
 
 fn default_buckets() -> usize {
@@ -53,7 +55,7 @@ pub(crate) async fn timeseries(
     Query(p): Query<TimeseriesParams>,
 ) -> Response {
     let req = match build_span_query_request(
-        &service_query(&service),
+        &service_query(&service, &p.q),
         &p.start,
         &p.end,
         "recent",
@@ -109,6 +111,8 @@ pub(crate) async fn timeseries(
 pub(crate) struct DependenciesParams {
     start: String,
     end: String,
+    #[serde(default)]
+    q: String,
 }
 
 /// `GET /api/services/:service/dependencies?start&end` — one service's downstream database and
@@ -120,7 +124,7 @@ pub(crate) async fn dependencies(
     Query(p): Query<DependenciesParams>,
 ) -> Response {
     let req = match build_span_query_request(
-        &service_query(&service),
+        &service_query(&service, &p.q),
         &p.start,
         &p.end,
         "recent",
@@ -251,9 +255,16 @@ pub(crate) async fn delete_settings(
 }
 
 /// The bare, unquoted `service.name:<service>` grammar term (see the module-level doc comment for
-/// why quoting would be wrong here).
-fn service_query(service: &str) -> String {
-    format!("service.name:{service}")
+/// why quoting would be wrong here), AND-ed with any extra caller-supplied grammar terms (`q` —
+/// e.g. the UI's `tenant:<id>` context filter).
+fn service_query(service: &str, extra_q: &str) -> String {
+    let base = format!("service.name:{service}");
+    let extra = extra_q.trim();
+    if extra.is_empty() {
+        base
+    } else {
+        format!("{base} {extra}")
+    }
 }
 
 /// Resolve the effective Apdex threshold (milliseconds) for `service`: a per-service override
@@ -521,6 +532,16 @@ mod tests {
         assert_eq!(
             v.as_array().unwrap().len(),
             crate::query_params::MAX_BUCKETS
+        );
+    }
+
+    #[test]
+    fn service_query_appends_extra_grammar_terms() {
+        assert_eq!(super::service_query("web", ""), "service.name:web");
+        assert_eq!(super::service_query("web", "  "), "service.name:web");
+        assert_eq!(
+            super::service_query("web", "tenant:divtik"),
+            "service.name:web tenant:divtik"
         );
     }
 

@@ -85,8 +85,10 @@ on `:8080` for `/api`).
 The frontend (`frontend/`) is **Vue 3 + Vite + Tailwind** with **Reka UI** headless components (the
 shadcn-vue equivalent) and Lucide icons; package manager is **bun** (never npm — `bun.lock` is the
 lockfile). It is deliberately lean — **Vue Router for top-level routes, but no Pinia** (server state
-lives in **TanStack Query**, a request cache). Time range + entity scope are **global**,
-module-singleton state in `lib/core/context.ts`, surfaced by one `ContextBar` mounted once in `AppShell`
+lives in **TanStack Query**, a request cache). Time range + federation tenant are **global**,
+module-singleton state in `lib/core/context.ts` (`tenantQueryTerm()` feeds the logs/traces/metrics
+composables' `q`; there is no entity-scope dimension anymore — it was removed as decorative-only),
+surfaced by one `ContextBar` mounted once in `AppShell`
 (not per-view, and no longer on `TopBar`); within-view filters (`svc`/`sev`/`q`, plus per-view extras like traces'
 `sort`/`mode`) live in URL params via `lib/core/useUrlState.ts`, which merge-preserves the context
 keys — and a detail view's back button pops to the list's own history entry
@@ -98,7 +100,8 @@ sub-routes: `/rum/:appId` vitals, `/pages[/:route]`, `/errors` (search bar + fix
 resource monitoring), `/data`, `/alerts` (the cross-signal webhook alert engine — rules over
 metrics/logs/traces/RUM, incidents, notification channels (channels are typed presets: Generic
 Webhook, Discord, Telegram), plus a "Browse templates" quick-setup on-ramp: target-first
-Apply/Customize over a frontend-only, 23-template seed catalog), plus `/login`
+Apply/Customize over a frontend-only, 23-template seed catalog), `/tenants` (the federation
+tenant registry, central-side), plus `/login`
 and `/onboarding`, behind a `beforeEach` auth guard
 (`router/index.js`) gated on reactive flags (`lib/core/auth.ts`). The `@photon/rum` browser SDK
 (`sdk/rum/`) behind `/rum` auto-detects SPA client-side navigation (History API —
@@ -108,10 +111,10 @@ true`, its own backend trace per route; the exported `trackView(route?)` is a ma
 for routers that prefer to drive the boundary themselves. `NavRail` groups these into ownership
 **worlds** (Home; Frontend → `/rum`, Backend → `/services`, Infrastructure — headed "Infra", since
 rail headings have ~10 characters of room — → **Hosts** `/infra` +
-**Ops** `/uptime`), an **Explore** section (Logs/Traces/Metrics), and **Manage** (Data, Alerts), with
+**Ops** `/uptime`), an **Explore** section (Logs/Traces/Metrics), and **Manage** (Data, Alerts, Tenants), with
 `AppShell` deriving the highlighted group from the route. Cross-view correlation (log→trace, span/trace→logs,
 and a "Related ▾" menu) flows through `router.push` via `lib/core/useCorrelate.ts`'s `correlate()`, which
-always carries the active time+scope. Components are grouped by signal under `src/components/`
+always carries the active time+tenant. Components are grouped by signal under `src/components/`
 (`logs/`, `traces/`, `services/`, `metrics/`, `rum/`, `uptime/`, `data/`, `alerts/`, `charts/`,
 `common/`, `ui/`). Data flows through one **Ky** client (`lib/core/api.ts` — keeps a mock-fallback: tries `/api`,
 falls back to in-browser mocks on a network failure while surfacing real 400/404s) wrapped by

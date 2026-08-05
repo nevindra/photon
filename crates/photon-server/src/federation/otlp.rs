@@ -40,11 +40,11 @@ fn gauge_metric(name: &str, value: f64, attrs: Vec<KeyValue>, now: u64) -> Metri
 
 /// One monotonic sum metric with one datapoint per `(signal, value)` pair — used for the two
 /// cumulative `ingest.rows`/`ingest.bytes` counters (central differences them across pushes).
-fn sum_metric(name: &str, per_signal: &[(String, u64)], mode: FederationMode, now: u64) -> Metric {
+fn sum_metric(name: &str, per_signal: &[(String, u64)], mode: &str, now: u64) -> Metric {
     let data_points = per_signal
         .iter()
         .map(|(signal, v)| NumberDataPoint {
-            attributes: vec![kv("signal", signal), kv("mode", mode_str(mode))],
+            attributes: vec![kv("signal", signal), kv("mode", mode)],
             start_time_unix_nano: 0,
             time_unix_nano: now,
             exemplars: vec![],
@@ -72,20 +72,23 @@ fn metric(name: &str, data: Data) -> Metric {
     }
 }
 
-fn mode_str(mode: FederationMode) -> &'static str {
-    match mode {
-        FederationMode::Summary => "summary",
-        FederationMode::Full => "full",
+/// The `mode` attribute value pushed with every summary metric: `summary`, `full`, or
+/// `full:traces,metrics` when full mode mirrors a subset — central's card badge shows it verbatim.
+pub fn mode_label(cfg: &photon_core::config::FederationConfig) -> String {
+    match (cfg.mode, cfg.signals.as_deref()) {
+        (FederationMode::Summary, _) => "summary".to_string(),
+        (FederationMode::Full, None) => "full".to_string(),
+        (FederationMode::Full, Some(signals)) => format!(
+            "full:{}",
+            signals.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
+        ),
     }
 }
 
 /// Pure builder: a `SummarySnapshot` -> the OTLP `ExportMetricsServiceRequest` pushed to
 /// `{endpoint}/v1/metrics`. Resource attr `service.name = "photon"`; every datapoint carries
 /// `mode`.
-pub fn build_summary(
-    snapshot: &SummarySnapshot,
-    mode: FederationMode,
-) -> ExportMetricsServiceRequest {
+pub fn build_summary(snapshot: &SummarySnapshot, mode: &str) -> ExportMetricsServiceRequest {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -94,7 +97,7 @@ pub fn build_summary(
     let mut metrics = vec![gauge_metric(
         "photon.federation.up",
         1.0,
-        vec![kv("mode", mode_str(mode))],
+        vec![kv("mode", mode)],
         now,
     )];
     metrics.push(sum_metric(
@@ -112,14 +115,14 @@ pub fn build_summary(
     metrics.push(gauge_metric(
         "photon.federation.incidents.open",
         snapshot.open_incidents as f64,
-        vec![kv("mode", mode_str(mode))],
+        vec![kv("mode", mode)],
         now,
     ));
     let hot_bytes_points = snapshot
         .hot_bytes
         .iter()
         .map(|(signal, v)| NumberDataPoint {
-            attributes: vec![kv("signal", signal), kv("mode", mode_str(mode))],
+            attributes: vec![kv("signal", signal), kv("mode", mode)],
             start_time_unix_nano: 0,
             time_unix_nano: now,
             exemplars: vec![],
@@ -185,7 +188,7 @@ mod tests {
 
     #[test]
     fn emits_all_five_metrics() {
-        let req = build_summary(&snapshot(), FederationMode::Summary);
+        let req = build_summary(&snapshot(), "summary");
         assert_eq!(
             metric_names(&req),
             vec![
@@ -199,8 +202,33 @@ mod tests {
     }
 
     #[test]
+    fn mode_label_encodes_signal_subset() {
+        use photon_core::config::{FederationConfig, FederationSignal};
+        let base = FederationConfig {
+            endpoint: "https://c".into(),
+            token: "tk".into(),
+            mode: FederationMode::Full,
+            signals: None,
+            interval_secs: 30,
+            queue_batches: 1024,
+        };
+        assert_eq!(mode_label(&base), "full");
+        let subset = FederationConfig {
+            signals: Some(vec![FederationSignal::Traces, FederationSignal::Metrics]),
+            ..base.clone()
+        };
+        assert_eq!(mode_label(&subset), "full:traces,metrics");
+        let summary = FederationConfig {
+            mode: FederationMode::Summary,
+            signals: None,
+            ..base
+        };
+        assert_eq!(mode_label(&summary), "summary");
+    }
+
+    #[test]
     fn up_gauge_is_one_with_mode_attribute() {
-        let req = build_summary(&snapshot(), FederationMode::Full);
+        let req = build_summary(&snapshot(), "full");
         let up = &req.resource_metrics[0].scope_metrics[0].metrics[0];
         let Some(Data::Gauge(g)) = &up.data else {
             panic!("up must be a Gauge")
@@ -213,7 +241,7 @@ mod tests {
 
     #[test]
     fn ingest_rows_has_one_datapoint_per_signal() {
-        let req = build_summary(&snapshot(), FederationMode::Summary);
+        let req = build_summary(&snapshot(), "summary");
         let rows = &req.resource_metrics[0].scope_metrics[0].metrics[1];
         let Some(Data::Sum(s)) = &rows.data else {
             panic!("ingest.rows must be a Sum")

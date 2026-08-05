@@ -1,5 +1,6 @@
 <script setup>
 import { computed, ref } from 'vue'
+import { Badge } from '@/components/ui/badge'
 import { ArrowUp, ArrowDown } from 'lucide-vue-next'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { EmptyState } from '@/components/ui/empty-state'
@@ -119,7 +120,7 @@ const COLUMNS = [
       <TableBody>
         <TableRow
           v-for="row in sortedRows"
-          :key="row.service"
+          :key="row.service + '::' + (row.tenant ?? '')"
           data-testid="service-row"
           :data-service="row.service"
           role="button"
@@ -132,7 +133,14 @@ const COLUMNS = [
           <TableCell class="py-1.5" :title="serviceHealth(row).reasons.join(' · ')">
             <HealthPill :status="serviceHealth(row).status" />
           </TableCell>
-          <TableCell class="py-1.5 text-foreground">{{ row.service }}</TableCell>
+          <TableCell class="py-1.5 text-foreground">
+            <span class="inline-flex items-center gap-1.5">
+              {{ row.service }}
+              <Badge v-if="row.tenant" data-testid="service-tenant-badge" class="rounded-full border-brand/35 bg-brand-soft px-1.5 py-0 text-[10px] text-brand">
+                {{ row.tenant }}
+              </Badge>
+            </span>
+          </TableCell>
           <TableCell class="py-1.5 text-right tabular-nums text-muted-foreground">{{ formatNumber(row.count ?? 0) }}</TableCell>
           <TableCell class="py-1.5">
             <div class="flex items-center gap-2">

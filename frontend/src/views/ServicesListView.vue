@@ -30,6 +30,7 @@ import {
   prevStartNs,
   prevEndNs,
   setCustomRange,
+  tenantQueryTerm,
 } from '@/lib/core/context'
 
 // Services (APM) list — Task 11. Adapted from `REDMetricsView.vue`'s "by service" RED table, but
@@ -43,6 +44,9 @@ const router = useRouter()
 // Time is now global (lib/context.js, driven by the ContextBar in AppShell — Task 8) — only the
 // search text is owned locally.
 const text = ref('')
+// Tenant-scoped variant for the two shared span-chart children (mirrors TracesExplorer.scopedText);
+// `text` itself stays the literal SearchBar value.
+const scopedText = computed(() => [text.value.trim(), tenantQueryTerm()].filter(Boolean).join(' '))
 
 // --- URL persistence: text only now (timeRange/customRange are synced by context.js itself). ---
 useUrlState({ text })
@@ -198,10 +202,10 @@ function onOpenService(service) {
       <!-- exploratory charts, now secondary (below the table) -->
       <div class="grid grid-cols-1 gap-4 px-5 pb-5 pt-6 lg:grid-cols-2">
         <ChartPanel title="Request volume &amp; errors" subtitle="Stacked by status · drag to zoom the time range">
-          <SpanVolumeHistogram :query="text.trim()" :start-ms="startMs" :end-ms="endMs" @zoom="setCustomRange" />
+          <SpanVolumeHistogram :query="scopedText" :start-ms="startMs" :end-ms="endMs" @zoom="setCustomRange" />
         </ChartPanel>
         <ChartPanel title="Latency distribution" subtitle="Span durations · drag to filter by duration">
-          <LatencyHistogram :query="text.trim()" :start-ms="startMs" :end-ms="endMs" @brush="onLatencyBrush" />
+          <LatencyHistogram :query="scopedText" :start-ms="startMs" :end-ms="endMs" @brush="onLatencyBrush" />
         </ChartPanel>
       </div>
     </main>

@@ -267,6 +267,10 @@ pub struct FederationConfig {
     pub token: String,
     #[serde(default)]
     pub mode: FederationMode,
+    /// Which signals full mode mirrors. `None` → all three. Only valid with `mode = "full"` —
+    /// summary mirrors nothing, so `signals` under summary is a config error, not a silent no-op.
+    #[serde(default)]
+    pub signals: Option<Vec<FederationSignal>>,
     #[serde(default = "FederationConfig::default_interval_secs")]
     pub interval_secs: u64,
     #[serde(default = "FederationConfig::default_queue_batches")]
@@ -279,6 +283,29 @@ impl FederationConfig {
     }
     fn default_queue_batches() -> usize {
         1024
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FederationSignal {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl FederationSignal {
+    pub const ALL: [FederationSignal; 3] = [
+        FederationSignal::Logs,
+        FederationSignal::Traces,
+        FederationSignal::Metrics,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FederationSignal::Logs => "logs",
+            FederationSignal::Traces => "traces",
+            FederationSignal::Metrics => "metrics",
+        }
     }
 }
 
@@ -430,10 +457,28 @@ impl Config {
                     .map(|f| f.queue_batches)
                     .unwrap_or_else(FederationConfig::default_queue_batches),
             };
+            // Comma-separated, e.g. `PHOTON_FEDERATION_SIGNALS=traces,metrics`. Validity
+            // (mode = full, non-empty, no dups) is checked in validate() with the file path.
+            let signals = match get("PHOTON_FEDERATION_SIGNALS") {
+                Some(v) => Some(
+                    v.split(',')
+                        .map(|s| match s.trim() {
+                            "logs" => Ok(FederationSignal::Logs),
+                            "traces" => Ok(FederationSignal::Traces),
+                            "metrics" => Ok(FederationSignal::Metrics),
+                            other => Err(PhotonError::Config(format!(
+                                "invalid value in PHOTON_FEDERATION_SIGNALS: {other:?}"
+                            ))),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+                None => existing.and_then(|f| f.signals.clone()),
+            };
             self.federation = Some(FederationConfig {
                 endpoint,
                 token,
                 mode,
+                signals,
                 interval_secs,
                 queue_batches,
             });
@@ -478,6 +523,31 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), PhotonError> {
+        if let Some(fed) = &self.federation {
+            if let Some(signals) = &fed.signals {
+                if fed.mode != FederationMode::Full {
+                    return Err(PhotonError::Config(
+                        "federation.signals requires mode = `full` — summary mirrors nothing, so a signal list under summary would be silently ignored"
+                            .into(),
+                    ));
+                }
+                if signals.is_empty() {
+                    return Err(PhotonError::Config(
+                        "federation.signals must not be empty — omit it to mirror all signals, or use mode = `summary` to mirror nothing"
+                            .into(),
+                    ));
+                }
+                let mut seen = HashSet::new();
+                for s in signals {
+                    if !seen.insert(*s) {
+                        return Err(PhotonError::Config(format!(
+                            "duplicate federation signal: {:?}",
+                            s.as_str()
+                        )));
+                    }
+                }
+            }
+        }
         if self.retention.days == 0 {
             return Err(PhotonError::Config("retention.days must be > 0".into()));
         }
@@ -933,6 +1003,52 @@ session_secret = "a-long-random-session-signing-secret"
             format!("{VALID}\n[federation]\nendpoint = \"\"\ntoken = \"t\"\n");
         let err = Config::from_toml_str(&with_federation).unwrap_err();
         assert!(err.to_string().contains("federation"));
+    }
+
+    #[test]
+    fn federation_signals_subset_parses_under_full() {
+        let toml = format!(
+            "{VALID}\n[federation]\nendpoint = \"https://c\"\ntoken = \"tk\"\nmode = \"full\"\nsignals = [\"traces\"]\n"
+        );
+        let f = Config::from_toml_str(&toml).unwrap().federation.unwrap();
+        assert_eq!(f.signals, Some(vec![FederationSignal::Traces]));
+    }
+
+    #[test]
+    fn federation_signals_under_summary_is_a_config_error() {
+        let toml = format!(
+            "{VALID}\n[federation]\nendpoint = \"https://c\"\ntoken = \"tk\"\nsignals = [\"traces\"]\n"
+        );
+        let err = Config::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("requires mode"));
+    }
+
+    #[test]
+    fn federation_signals_empty_or_duplicated_rejected() {
+        let empty = format!(
+            "{VALID}\n[federation]\nendpoint = \"https://c\"\ntoken = \"tk\"\nmode = \"full\"\nsignals = []\n"
+        );
+        assert!(Config::from_toml_str(&empty).unwrap_err().to_string().contains("must not be empty"));
+        let dup = format!(
+            "{VALID}\n[federation]\nendpoint = \"https://c\"\ntoken = \"tk\"\nmode = \"full\"\nsignals = [\"traces\", \"traces\"]\n"
+        );
+        assert!(Config::from_toml_str(&dup).unwrap_err().to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn federation_signals_env_override_parses_csv() {
+        let mut cfg = Config::parse_unvalidated(include_str!("default.toml")).unwrap();
+        let env = env_of(&[
+            ("PHOTON_FEDERATION_ENDPOINT", "https://c"),
+            ("PHOTON_FEDERATION_TOKEN", "tk"),
+            ("PHOTON_FEDERATION_MODE", "full"),
+            ("PHOTON_FEDERATION_SIGNALS", "traces, metrics"),
+        ]);
+        cfg.apply_env_overrides(&env).unwrap();
+        assert_eq!(
+            cfg.federation.unwrap().signals,
+            Some(vec![FederationSignal::Traces, FederationSignal::Metrics])
+        );
     }
 
     #[test]

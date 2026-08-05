@@ -4,7 +4,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { api } from '@/lib/core/api'
 import { useMetricCatalog, useMetricMetadata, useMetricLabels, useMetricSeries } from '@/lib/metrics/metricsQueries'
-import { setScope, clearScope } from '@/lib/core/context'
+import { setTenant, clearTenant } from '@/lib/core/context'
 
 // `tracesQueries.js` (the sibling module this file mirrors) has no dedicated test file of its
 // own in this codebase — every query composable here is only ever exercised inside a mounted
@@ -58,11 +58,11 @@ describe('metricsQueries', () => {
     expect(JSON.stringify(keys)).not.toContain('"10"')
   })
 
-  // Task 12: `tenant` is the first ScopeType that actually filters — appended to every query
+  // `tenant` context dimension filters metrics — appended to every query
   // spec's `filter` string (each MetricQuerySpec, not just the first) and to the cache key.
-  it('useMetricSeries appends the tenant term to each query spec filter under a tenant scope', async () => {
+  it('useMetricSeries appends the tenant term to each query spec filter when a tenant is set', async () => {
     const spy = vi.spyOn(api, 'metricQuery').mockResolvedValue({ results: [], step: '1', capped: false, elapsed_ms: 0 })
-    setScope({ type: 'tenant', id: 'divtik', label: 'divtik' })
+    setTenant('divtik')
     try {
       const buildRequest = () => ({
         queries: [{ id: 'a', metric: 'm', group_by: [], filter: 'service:checkout' }],
@@ -88,7 +88,7 @@ describe('metricsQueries', () => {
       const keys = queryClient.getQueryCache().getAll().map((q) => q.queryKey)
       expect(keys).toContainEqual(['metric-series', 'm|avg||30m', 'tenant:divtik'])
     } finally {
-      clearScope()
+      clearTenant()
     }
   })
 })
