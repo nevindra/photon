@@ -351,7 +351,10 @@ impl EngineConditionSource {
             | RumKind::VitalFcpP75
             | RumKind::VitalTtfbP75 => {
                 let metric = vital_metric_name(c.kind);
-                let vitals = self.metrics.rum_vitals(&c.app_id, start, now_ns).await?;
+                let vitals = self
+                    .metrics
+                    .rum_vitals(&c.app_id, start, now_ns, None)
+                    .await?;
                 match vitals.iter().find(|v| v.metric == metric) {
                     Some(v) => Ok(vec![SeriesSample {
                         key: Vec::new(),

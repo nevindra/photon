@@ -444,6 +444,10 @@ pub(crate) struct VitalsParams {
     app: String,
     start: i64,
     end: i64,
+    /// Optional metrics-grammar filter (e.g. the central tenant lens's `tenant:<name>`). Blank or
+    /// absent → no filter.
+    #[serde(default)]
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -452,6 +456,8 @@ pub(crate) struct BreakdownParams {
     dimension: String,
     start: i64,
     end: i64,
+    #[serde(default)]
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -459,6 +465,8 @@ pub(crate) struct PagesParams {
     app: String,
     start: i64,
     end: i64,
+    #[serde(default)]
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -467,6 +475,10 @@ pub(crate) struct PageDetailParams {
     route: String,
     start: i64,
     end: i64,
+    /// Resolved twice: as a metrics filter for the vitals/breakdown/attribution reads and as a
+    /// log-grammar filter for the route's error issues.
+    #[serde(default)]
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -485,6 +497,10 @@ pub(crate) struct ErrorDetailParams {
     app: String,
     start: i64,
     end: i64,
+    /// Optional log-query-grammar filter, same as `/rum/errors` — scopes the issue detail (e.g.
+    /// the central tenant lens's `tenant:<name>`).
+    #[serde(default)]
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -576,9 +592,39 @@ fn error_issue_json(e: &ErrorIssue) -> Value {
     })
 }
 
+#[derive(Deserialize)]
+pub(crate) struct AppsParams {
+    /// When present, derive the app list from mirrored vitals data stamped `tenant=<name>`
+    /// instead of the local registry — central's read-only tenant lens has no registry sync.
+    #[serde(default)]
+    tenant: Option<String>,
+}
+
+/// The lookback for the tenant-derived app list — an app with no vitals in the last 24h drops out.
+const DERIVED_APPS_WINDOW_NANOS: i64 = 24 * 3600 * 1_000_000_000;
+
 /// `GET /api/rum/apps` — the registered RUM apps (full records; the public `key` is safe to
-/// expose). Empty when nothing is registered yet.
-pub(crate) async fn apps(State(st): State<AppState>) -> Response {
+/// expose). Empty when nothing is registered yet. With `?tenant=<name>`, returns the names-only
+/// list derived from mirrored `web_vitals.*` data instead (400 on an invalid tenant name).
+pub(crate) async fn apps(State(st): State<AppState>, Query(p): Query<AppsParams>) -> Response {
+    if let Some(tenant) = p.tenant.as_deref() {
+        if let Err(e) = crate::tenants::validate_tenant_name(tenant) {
+            return bad_request(e);
+        }
+        let filter =
+            crate::tenants::tenant_metric_filter(tenant, st.metrics_query.promoted_attributes());
+        let end = now_nanos();
+        let names = match st
+            .metrics_query
+            .rum_app_names(Some(&filter), end - DERIVED_APPS_WINDOW_NANOS, end)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return err_500(e),
+        };
+        let apps: Vec<Value> = names.iter().map(|n| json!({ "name": n })).collect();
+        return Json(json!({ "apps": apps })).into_response();
+    }
     let apps: Vec<Value> = st
         .rum
         .as_ref()
@@ -598,10 +644,28 @@ fn rum_app_json(a: &crate::rum_apps::RumApp) -> Value {
     })
 }
 
-/// `GET /api/rum/vitals?app&start&end` — the five Core-Web-Vitals scorecards for an app over the
-/// window (vitals with no samples are omitted by the engine).
+/// Resolve an optional metrics-grammar `q` (blank → `None`); the caller turns the error into a
+/// 400 via `into_response()`, mirroring `metrics.rs`'s callers (keeps the Err variant small).
+fn resolve_metric_q(
+    st: &AppState,
+    q: Option<&str>,
+) -> Result<Option<photon_core::query::MetricResolvedQuery>, crate::query_params::QueryParamError> {
+    crate::metrics::resolve_metric_filter(q.unwrap_or(""), st.metrics_query.promoted_attributes())
+}
+
+/// `GET /api/rum/vitals?app&start&end&q` — the five Core-Web-Vitals scorecards for an app over
+/// the window (vitals with no samples are omitted by the engine), optionally narrowed by a
+/// metrics-grammar `q` (e.g. `tenant:<name>`).
 pub(crate) async fn vitals(State(st): State<AppState>, Query(p): Query<VitalsParams>) -> Response {
-    let summaries = match st.metrics_query.rum_vitals(&p.app, p.start, p.end).await {
+    let filter = match resolve_metric_q(&st, p.q.as_deref()) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
+    let summaries = match st
+        .metrics_query
+        .rum_vitals(&p.app, p.start, p.end, filter.as_ref())
+        .await
+    {
         Ok(v) => v,
         Err(e) => return err_500(e),
     };
@@ -615,9 +679,13 @@ pub(crate) async fn breakdown(
     State(st): State<AppState>,
     Query(p): Query<BreakdownParams>,
 ) -> Response {
+    let filter = match resolve_metric_q(&st, p.q.as_deref()) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
     let rows = match st
         .metrics_query
-        .rum_breakdown(&p.app, &p.dimension, p.start, p.end, None)
+        .rum_breakdown(&p.app, &p.dimension, p.start, p.end, None, filter.as_ref())
         .await
     {
         Ok(v) => v,
@@ -630,9 +698,13 @@ pub(crate) async fn breakdown(
 /// `GET /api/rum/pages?app&start&end` — one row per `browser.route`, with that page's LCP/INP/CLS
 /// p75 and a pageview proxy. A route-dimension breakdown surfaced as the pages list.
 pub(crate) async fn pages(State(st): State<AppState>, Query(p): Query<PagesParams>) -> Response {
+    let filter = match resolve_metric_q(&st, p.q.as_deref()) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
     let rows = match st
         .metrics_query
-        .rum_breakdown(&p.app, ATTR_ROUTE, p.start, p.end, None)
+        .rum_breakdown(&p.app, ATTR_ROUTE, p.start, p.end, None, filter.as_ref())
         .await
     {
         Ok(v) => v,
@@ -648,10 +720,22 @@ pub(crate) async fn page_detail(
     State(st): State<AppState>,
     Query(p): Query<PageDetailParams>,
 ) -> Response {
+    // `q` is resolved against both schemas: metrics for the vitals reads, logs for the errors.
+    let filter = match resolve_metric_q(&st, p.q.as_deref()) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
+    let rq = match crate::query_params::resolve_query(
+        p.q.as_deref().unwrap_or(""),
+        st.query.promoted_attributes(),
+    ) {
+        Ok(rq) => rq,
+        Err(e) => return e.into_response(),
+    };
     // Page vitals: the matching row from the app-wide `browser.route` breakdown.
     let page_rows = match st
         .metrics_query
-        .rum_breakdown(&p.app, ATTR_ROUTE, p.start, p.end, None)
+        .rum_breakdown(&p.app, ATTR_ROUTE, p.start, p.end, None, filter.as_ref())
         .await
     {
         Ok(v) => v,
@@ -669,7 +753,14 @@ pub(crate) async fn page_detail(
     // Device breakdown scoped to this route.
     let device_rows = match st
         .metrics_query
-        .rum_breakdown(&p.app, "device.type", p.start, p.end, Some(&p.route))
+        .rum_breakdown(
+            &p.app,
+            "device.type",
+            p.start,
+            p.end,
+            Some(&p.route),
+            filter.as_ref(),
+        )
         .await
     {
         Ok(v) => v,
@@ -679,7 +770,7 @@ pub(crate) async fn page_detail(
     // Error issues scoped to this route.
     let errors = match st
         .query
-        .rum_errors(&p.app, p.start, p.end, ERROR_LIMIT, Some(&p.route), None)
+        .rum_errors(&p.app, p.start, p.end, ERROR_LIMIT, Some(&p.route), rq)
         .await
     {
         Ok(v) => v,
@@ -689,7 +780,7 @@ pub(crate) async fn page_detail(
     // LCP attribution (the four sub-part averages + top element) scoped to this route.
     let attribution = match st
         .metrics_query
-        .rum_lcp_attribution(&p.app, Some(&p.route), p.start, p.end)
+        .rum_lcp_attribution(&p.app, Some(&p.route), p.start, p.end, filter.as_ref())
         .await
     {
         Ok(v) => v,
@@ -728,7 +819,7 @@ pub(crate) async fn errors(State(st): State<AppState>, Query(p): Query<ErrorsPar
     Json(json!({ "app": p.app, "errors": errors })).into_response()
 }
 
-/// `GET /api/rum/errors/:fingerprint?app&start&end` — full detail for one error issue: header
+/// `GET /api/rum/errors/:fingerprint?app&start&end&q` — full detail for one error issue: header
 /// stats, an occurrence series, tag breakdowns, a sample stack, and recent sample events. 200
 /// with all-empty sections when the fingerprint has no rows in the window.
 pub(crate) async fn error_detail(
@@ -736,9 +827,16 @@ pub(crate) async fn error_detail(
     Path(fingerprint): Path<String>,
     Query(p): Query<ErrorDetailParams>,
 ) -> Response {
+    let rq = match crate::query_params::resolve_query(
+        p.q.as_deref().unwrap_or(""),
+        st.query.promoted_attributes(),
+    ) {
+        Ok(rq) => rq,
+        Err(e) => return e.into_response(),
+    };
     let detail = match st
         .query
-        .rum_error_detail(&p.app, &fingerprint, p.start, p.end)
+        .rum_error_detail(&p.app, &fingerprint, p.start, p.end, rq)
         .await
     {
         Ok(d) => d,
@@ -1221,6 +1319,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn vitals_accepts_metric_query_grammar() {
+        let router = router_with_rum().await;
+        let (status, v) = authed_get(
+            &router,
+            "/api/rum/vitals?app=web&start=0&end=100&q=tenant:acme",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(v["vitals"].is_array());
+    }
+
+    #[tokio::test]
+    async fn vitals_rejects_bad_grammar_with_400() {
+        use tower::ServiceExt;
+        let router = router_with_rum().await;
+        let cookie = crate::session_cookie(&router).await;
+        let res = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/rum/vitals?app=web&start=0&end=100&q=%3A%3Abad")
+                    .header(axum::http::header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pages_and_page_detail_accept_query_grammar() {
+        let router = router_with_rum().await;
+        let (status, _) = authed_get(
+            &router,
+            "/api/rum/pages?app=web&start=0&end=100&q=tenant:acme",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, v) = authed_get(
+            &router,
+            "/api/rum/pages/detail?app=web&route=%2Fx&start=0&end=100&q=tenant:acme",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(v["errors"].is_array());
+    }
+
+    #[tokio::test]
+    async fn error_detail_accepts_query_grammar() {
+        let router = router_with_rum().await;
+        let (status, v) = authed_get(
+            &router,
+            "/api/rum/errors/deadbeef?app=web&start=0&end=100&q=tenant:acme",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["occurrences"], 0);
+    }
+
+    #[tokio::test]
+    async fn apps_with_invalid_tenant_is_400() {
+        let router = router_with_rum().await;
+        let (status, v) = authed_get(&router, "/api/rum/apps?tenant=Bad_Tenant!").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(v["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn apps_with_tenant_returns_derived_names_not_registry() {
+        // The registry has the `web` app, but the (empty) metrics store carries no mirrored
+        // vitals for tenant `acme` — the derived branch must return [] instead of the registry
+        // records. Name derivation itself is covered by photon-query's
+        // `rum_app_names_derives_distinct_services_for_tenant`.
+        let router = router_with_rum().await;
+        let (status, v) = authed_get(&router, "/api/rum/apps?tenant=acme").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["apps"], serde_json::json!([]));
     }
 
     #[tokio::test]

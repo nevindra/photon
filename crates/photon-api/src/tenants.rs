@@ -487,7 +487,7 @@ const SUMMARY_BUCKETS: usize = 30;
 
 /// `tenant:"{name}"` as a resolved metrics filter, built directly (no grammar round trip needed —
 /// tenant names are always `[a-z0-9-]{1,64}`, so resolution can't fail).
-fn tenant_metric_filter(name: &str, promoted: &[String]) -> MetricResolvedQuery {
+pub(crate) fn tenant_metric_filter(name: &str, promoted: &[String]) -> MetricResolvedQuery {
     let field = MetricFieldResolver::new(promoted)
         .resolve_field_name("tenant")
         .expect("resolve_field_name never errors on a plain label name");
@@ -714,7 +714,9 @@ mod tests {
     #[test]
     fn ui_url_only_accepts_http_schemes() {
         assert_eq!(
-            normalize_ui_url(Some("https://t.example")).unwrap().as_deref(),
+            normalize_ui_url(Some("https://t.example"))
+                .unwrap()
+                .as_deref(),
             Some("https://t.example")
         );
         assert_eq!(normalize_ui_url(Some("   ")).unwrap(), None);

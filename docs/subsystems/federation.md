@@ -20,7 +20,7 @@ Optional `[federation]` config block (omit = disabled):
 endpoint = "https://central.example.com:8080"    # required: central's OTLP/HTTP endpoint
 token = "tk_tenant_…"                            # required: per-tenant bearer token (minted by central, never generate locally)
 mode = "summary"                                 # optional: "summary" (default) or "full"
-signals = ["traces"]                             # optional, full mode only: subset of ["logs","traces","metrics"] to mirror
+signals = ["traces", "rum"]                      # optional, full mode only: subset of ["logs","traces","metrics","rum"] to mirror (omit = all four)
 interval_secs = 30                               # optional: how often to push summary metrics (default 30, min 5)
 queue_batches = 1024                             # optional: full-mode tee queue capacity (default 1024, min 16); dropped on overflow
 ```
@@ -76,11 +76,11 @@ All federation metrics carry a resource attribute `service.name = "photon"` + th
 
 ## Full-mode tee & forwarder (best-effort)
 
-`[federation].signals` (full mode only) narrows what the tee mirrors — e.g. `signals = ["traces"]` mirrors spans only, giving central the Services/APM + Traces views for the tenant without shipping logs (usually the heaviest signal). Omitted → all three. `signals` under `mode = "summary"` is a **config error** (fail-fast at startup): summary mirrors nothing, so a signal list there would be silently ignored — the config refuses the contradiction instead. The summary `mode` attribute reports the subset (`full:traces`), so the central card badge and its tooltip stay honest. Env override: `PHOTON_FEDERATION_SIGNALS=traces,metrics`.
+`[federation].signals` (full mode only) narrows what the tee mirrors — e.g. `signals = ["traces"]` mirrors spans only, giving central the Services/APM + Traces views for the tenant without shipping logs (usually the heaviest signal). Omitted → **all four** (`logs`, `traces`, `metrics`, `rum`). The `rum` signal gates both tee variants at once (`RumVitals` → `/v1/metrics`, `RumErrors` → `/v1/logs` — see below). `signals` under `mode = "summary"` is a **config error** (fail-fast at startup): summary mirrors nothing, so a signal list there would be silently ignored — the config refuses the contradiction instead. The summary `mode` attribute reports the subset (`full:traces`, `full:traces,rum`), so the central card badge and its tooltip stay honest. Env override: `PHOTON_FEDERATION_SIGNALS=traces,metrics,rum`.
 
 When `[federation].mode = "full"`:
 
-1. **Tenant-side tee** (in `photon-ingest`): after successful auth and decode, each OTLP batch is offered to a bounded MPSC channel (capacity = `[federation].queue_batches`). If the channel is full, the batch is dropped + a counter increments; the local ingest ack is NOT delayed (tee is non-blocking, never blocks ingest).
+1. **Tenant-side tee** (in `photon-ingest`): after successful auth and decode, each OTLP batch is offered to a bounded MPSC channel (capacity = `[federation].queue_batches`). If the channel is full, the batch is dropped + a counter increments; the local ingest ack is NOT delayed (tee is non-blocking, never blocks ingest). **RUM enters the same tee through a different door**: the browser beacon (`POST /api/rum`) never passes the OTLP receivers, so when `rum` is mirrored, `photon-server` wraps the local `RumSink` in a `TeeingRumSink` (`federation/mod.rs`) that — after a **successful** local write, per beacon, no batching — synthesizes OTLP protobuf from the stored rows (`build_rum_vitals`/`build_rum_errors` in `federation/otlp.rs`) and offers it as `TeeSignal::RumVitals` (→ `/v1/metrics`) / `TeeSignal::RumErrors` (→ `/v1/logs`). Same non-blocking `try_send`; a failed local write is never teed.
 
 2. **Tenant-side forwarder** (in `photon-server`): a background task drains the tee channel and POSTs each batch to central's `/v1/{logs|traces|metrics}` endpoint with the tenant bearer token. On failure:
    - HTTP-status failures (central reachable but erroring): up to 3 attempts with backoff between them (250ms, 1s — `FORWARD_BACKOFF`), then drop + increment `dropped`
@@ -164,9 +164,7 @@ Only present (non-`None`) when `[federation]` is configured; `enabled: false` wh
 
 ## Central Home board
 
-A new **Tenants** section (conditional, visible only when `enabled: true` in `GET /api/federation/status`... wait, that's tenant-side. Let me re-read the task.)
-
-Actually, the task says "Home gains a conditional tenant board" — that's on central, not tenant-side. Central's Home should show a grid of `TenantCard`s populated from `GET /api/tenants/summary`. Each card:
+Central's Home shows a grid of `TenantCard`s populated from `GET /api/tenants/summary` (the section renders only when the tenant registry is non-empty). Each card:
 - Name + mode Badge (`summary` | `full`)
 - Status dot (success/warning/error by up/stale/down)
 - Ingest rate, open incidents, hot bytes rows
@@ -184,15 +182,15 @@ With a tenant filter active, the board narrows to the active tenant's card (a he
 
 ## Tenant context dimension
 
-Central's UI gains `tenant` as its own global context dimension in `lib/core/context.ts`, alongside the time window. It is set via the Home board (full-mode card) or the ContextBar's tenant picker (a dropdown that only renders when the tenant registry is non-empty), synced to the `tenant` URL key, and carried by `correlate()`. The query composables append `tenantQueryTerm()` (`tenant:<name>`) to the existing `q` grammar filter, scoping Logs/Traces/Metrics, the Services (APM) vertical (`/api/red`, `/api/services/:service/{timeseries,dependencies}` take an optional `q` grammar param), and the Infrastructure vertical (`/api/infra/*` likewise) to that tenant's stamped records. `GET /api/red?group=service` additionally groups by the `tenant` attribute and returns it per row (null for local spans), so the Home/Services tables label federated rows with a tenant badge.
+Central's UI gains `tenant` as its own global context dimension in `lib/core/context.ts`, alongside the time window. It is set via the Home board (full-mode card) or the ContextBar's tenant picker (a dropdown that only renders when the tenant registry is non-empty), synced to the `tenant` URL key, and carried by `correlate()`. The query composables append `tenantQueryTerm()` (`tenant:<name>`) to the existing `q` grammar filter, scoping Logs/Traces/Metrics, the Services (APM) vertical (`/api/red`, `/api/services/:service/{timeseries,dependencies}` take an optional `q` grammar param), the Infrastructure vertical (`/api/infra/*` likewise), and the RUM vertical (the `/api/rum/*` read endpoints take an optional `q`; `rumQueries.ts` appends the tenant term) to that tenant's stamped records. `GET /api/red?group=service` additionally groups by the `tenant` attribute and returns it per row (null for local spans), so the Home/Services tables label federated rows with a tenant badge.
 
 The field catalogs (`logs/fields.ts`, `traces/spanFields.ts`, `metrics/metricFields.ts`) each gain a `tenant` entry for autocomplete.
 
 ## Files & modules
 
 **Tenant-side (photon-server):**
-- `crates/photon-server/src/federation/mod.rs` — summary pusher spawn + `FederationStats` shared telemetry
-- `crates/photon-server/src/federation/otlp.rs` — summary metric builder (`build_summary`, ~70 lines copied from `photon-agent/src/otlp.rs`)
+- `crates/photon-server/src/federation/mod.rs` — summary pusher spawn + `FederationStats` shared telemetry + `TeeingRumSink` (full-mode RUM tee at the `RumSink` boundary)
+- `crates/photon-server/src/federation/otlp.rs` — summary metric builder (`build_summary`, ~70 lines copied from `photon-agent/src/otlp.rs`) + `build_rum_vitals`/`build_rum_errors` (stored RUM rows → OTLP protobuf)
 
 **Central (photon-server):**
 - `crates/photon-server/src/federation/mod.rs` — full-mode forwarder spawn (same module as tenant-side summary)
@@ -224,6 +222,6 @@ The field catalogs (`logs/fields.ts`, `traces/spanFields.ts`, `metrics/metricFie
 
 - **No per-tenant retention** — central retention applies uniformly to all data, regardless of source or tenant. If different tenants need different retention, that's a future enhancement (separate retention groups per tenant).
 - **No central-controlled mode** — mode is set by the tenant in their config; central doesn't dictate it. Tenants can unilaterally upgrade from summary to full or downgrade.
-- **RUM and uptime are NOT federated (known v1 gap, deliberate)** — the full-mode tee sits in `photon-ingest`'s OTLP receivers, but RUM enters through a different front door entirely: the browser beacon (`POST /api/rum`, `photon-api`'s `RumSink`) writes straight to the WALs and never passes the tee, so a full-mode tenant's vitals/errors are never mirrored to central. Uptime is likewise a local SQLite vertical (only its open-incident count rides the summary metrics). Central's `/rum` would stay empty for tenants even if the data were mirrored — the app registry (`rum_apps`) is per-install SQLite, so central doesn't know tenant apps exist. The chosen posture: tenant RUM/uptime is monitored on the tenant's own UI (the Home tenant card links out via `ui_url`). Closing the gap would need both a `RumSink`-level tee (synthesizing OTLP from vitals/errors) and tenant app-registry sync — a follow-up if demand appears.
-- **Tenant filter coverage** — the tenant context dimension filters Logs, Traces, Metrics, Services (APM), and Infrastructure. Home's cross-signal tiles (RUM vitals, uptime) are not tenant-filtered — see the gap above.
+- **RUM IS federated; uptime is not (known gap, deliberate)** — RUM is its own federation signal (`"rum"`), gated like the other three; omitting `signals` in full mode mirrors all four. Because the browser beacon bypasses the OTLP receivers, the tenant side tees at the `RumSink` boundary instead: `TeeingRumSink` synthesizes OTLP protobuf per beacon after a successful local write (`RumVitals` → `/v1/metrics` as gauge metrics, `RumErrors` → `/v1/logs`), so central stores mirrored vitals/errors through the normal stamped ingest path. Central's `/rum` then acts as a **read-only tenant lens** when the tenant context is active: there is deliberately **no app-registry sync** — tenant apps are *derived* from the mirrored data (`GET /api/rum/apps?tenant=<name>` returns the distinct `service.name` among `web_vitals.*` metrics stamped `tenant=<name>`, 24h lookback), and the manage/register UI is hidden under the lens. Uptime remains a local SQLite vertical (only its open-incident count rides the summary metrics) — monitored on the tenant's own UI via the card's `ui_url` link-out; a follow-up if demand appears.
+- **Tenant filter coverage** — the tenant context dimension filters Logs, Traces, Metrics, Services (APM), Infrastructure, and RUM (the `/rum` views append `tenant:<name>` via the RUM read endpoints' `q` param). Uptime is not tenant-filtered — see the gap above.
 - **No Prometheus remote-write federation** — tenant tokens are rejected on `/api/v1/write` to avoid ambiguity in stamping (no rich resource attributes in the protocol).

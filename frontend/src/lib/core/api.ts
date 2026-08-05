@@ -1409,9 +1409,13 @@ export const api = {
 
   // --- RUM (Real User Monitoring) ---
 
-  async rumApps(opts: RequestOpts = {}): Promise<RumAppsResult> {
+  // With `tenant` set the server returns names-only rows derived from mirrored data — only `name`
+  // is real; the manage-only fields are absent (the tenant lens hides every manage affordance).
+  async rumApps(opts: RequestOpts = {}, tenant?: string): Promise<RumAppsResult> {
     try {
-      return await http.get('rum/apps', { signal: opts.signal }).json<RumAppsResult>()
+      return await http
+        .get('rum/apps', { searchParams: tenant ? { tenant } : {}, signal: opts.signal })
+        .json<RumAppsResult>()
     } catch (e: any) {
       if (e.status === 400) throw e
       api.mock = true
@@ -1536,10 +1540,12 @@ export const api = {
     }
   },
 
-  async rumVitals(app: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<RumVitalsResult> {
+  async rumVitals(app: string, startNs: string, endNs: string, opts: RequestOpts = {}, q?: string): Promise<RumVitalsResult> {
     try {
+      const searchParams: Record<string, string> = { app, start: startNs, end: endNs }
+      if (q && q.trim()) searchParams.q = q
       return await http
-        .get('rum/vitals', { searchParams: { app, start: startNs, end: endNs }, signal: opts.signal })
+        .get('rum/vitals', { searchParams, signal: opts.signal })
         .json<RumVitalsResult>()
     } catch (e: any) {
       if (e.status === 400) throw e
@@ -1548,13 +1554,12 @@ export const api = {
     }
   },
 
-  async rumBreakdown(app: string, dimension: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<RumBreakdownResult> {
+  async rumBreakdown(app: string, dimension: string, startNs: string, endNs: string, opts: RequestOpts = {}, q?: string): Promise<RumBreakdownResult> {
     try {
+      const searchParams: Record<string, string> = { app, dimension, start: startNs, end: endNs }
+      if (q && q.trim()) searchParams.q = q
       return await http
-        .get('rum/vitals/breakdown', {
-          searchParams: { app, dimension, start: startNs, end: endNs },
-          signal: opts.signal,
-        })
+        .get('rum/vitals/breakdown', { searchParams, signal: opts.signal })
         .json<RumBreakdownResult>()
     } catch (e: any) {
       if (e.status === 400) throw e
@@ -1563,10 +1568,12 @@ export const api = {
     }
   },
 
-  async rumPages(app: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<RumPagesResult> {
+  async rumPages(app: string, startNs: string, endNs: string, opts: RequestOpts = {}, q?: string): Promise<RumPagesResult> {
     try {
+      const searchParams: Record<string, string> = { app, start: startNs, end: endNs }
+      if (q && q.trim()) searchParams.q = q
       return await http
-        .get('rum/pages', { searchParams: { app, start: startNs, end: endNs }, signal: opts.signal })
+        .get('rum/pages', { searchParams, signal: opts.signal })
         .json<RumPagesResult>()
     } catch (e: any) {
       if (e.status === 400) throw e
@@ -1575,13 +1582,12 @@ export const api = {
     }
   },
 
-  async rumPageDetail(app: string, route: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<RumPageDetailResult> {
+  async rumPageDetail(app: string, route: string, startNs: string, endNs: string, opts: RequestOpts = {}, q?: string): Promise<RumPageDetailResult> {
     try {
+      const searchParams: Record<string, string> = { app, route, start: startNs, end: endNs }
+      if (q && q.trim()) searchParams.q = q
       return await http
-        .get('rum/pages/detail', {
-          searchParams: { app, route, start: startNs, end: endNs },
-          signal: opts.signal,
-        })
+        .get('rum/pages/detail', { searchParams, signal: opts.signal })
         .json<RumPageDetailResult>()
     } catch (e: any) {
       if (e.status === 400) throw e
@@ -1620,13 +1626,13 @@ export const api = {
     startNs: string,
     endNs: string,
     opts: RequestOpts = {},
+    q?: string,
   ): Promise<RumErrorDetailResult> {
     try {
+      const searchParams: Record<string, string> = { app, start: startNs, end: endNs }
+      if (q && q.trim()) searchParams.q = q
       return await http
-        .get(`rum/errors/${encodeURIComponent(fingerprint)}`, {
-          searchParams: { app, start: startNs, end: endNs },
-          signal: opts.signal,
-        })
+        .get(`rum/errors/${encodeURIComponent(fingerprint)}`, { searchParams, signal: opts.signal })
         .json<RumErrorDetailResult>()
     } catch (e: any) {
       if (e.status === 400) throw e

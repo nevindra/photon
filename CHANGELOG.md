@@ -35,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The global context is now **time + federation tenant** — the entity-scope dimension was
     removed as decorative-only. Picking a tenant filters logs/traces/metrics and the curated
     services/RED/infra endpoints via the query grammar (`tenant:<id>`).
+  - **RUM federation**: RUM is its own federation signal — `signals` may include `"rum"`, and
+    **omitting `signals` in full mode now mirrors all four signals** (logs, traces, metrics, rum;
+    previously all three — set an explicit subset to keep the old behavior). The browser beacon
+    bypasses the OTLP tee, so the tenant side wraps the local RUM write path (`TeeingRumSink`):
+    after each successful local write it synthesizes OTLP protobuf per beacon (no batching) and
+    offers it to the existing tee — vitals to `/v1/metrics`, errors to `/v1/logs` — encoded in the
+    summary mode attribute (`full:traces,rum`). Central derives tenant apps from the mirrored data
+    (`GET /api/rum/apps?tenant=` — distinct `service.name` among `web_vitals.*`; deliberately no
+    registry sync), and its `/rum` views become a read-only tenant lens when the tenant context is
+    active: the RUM read endpoints gain an optional `q` grammar filter carrying `tenant:<id>`, and
+    app management is hidden under the lens. Uptime remains local-only.
 
 ## [1.5.0] - 2026-08-04
 

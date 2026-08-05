@@ -41,6 +41,9 @@ pub enum TeeSignal {
     Logs,
     Traces,
     Metrics,
+    // RUM rides the standard OTLP endpoints: vitals are gauge metrics, errors are logs.
+    RumVitals,
+    RumErrors,
 }
 
 impl TeeSignal {
@@ -50,6 +53,8 @@ impl TeeSignal {
             TeeSignal::Logs => "logs",
             TeeSignal::Traces => "traces",
             TeeSignal::Metrics => "metrics",
+            TeeSignal::RumVitals => "metrics",
+            TeeSignal::RumErrors => "logs",
         }
     }
 }
@@ -64,13 +69,22 @@ pub struct FederationTee {
     tx: mpsc::Sender<(TeeSignal, Bytes)>,
     /// Signals this tee mirrors, indexed by `TeeSignal as usize`. A disabled signal is skipped
     /// silently in `offer` — deliberate config, not backpressure, so `dropped` doesn't count it.
-    enabled: [bool; 3],
+    enabled: [bool; 5],
     pub dropped: Arc<AtomicU64>,
 }
 
 impl FederationTee {
     pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<(TeeSignal, Bytes)>) {
-        Self::channel_for(capacity, &[TeeSignal::Logs, TeeSignal::Traces, TeeSignal::Metrics])
+        Self::channel_for(
+            capacity,
+            &[
+                TeeSignal::Logs,
+                TeeSignal::Traces,
+                TeeSignal::Metrics,
+                TeeSignal::RumVitals,
+                TeeSignal::RumErrors,
+            ],
+        )
     }
 
     /// A tee that mirrors only `signals` (the `[federation].signals` subset).
@@ -79,7 +93,7 @@ impl FederationTee {
         signals: &[TeeSignal],
     ) -> (Self, mpsc::Receiver<(TeeSignal, Bytes)>) {
         let (tx, rx) = mpsc::channel(capacity.max(1));
-        let mut enabled = [false; 3];
+        let mut enabled = [false; 5];
         for s in signals {
             enabled[*s as usize] = true;
         }
@@ -395,6 +409,33 @@ mod tee_tests {
         assert_eq!(signal, TeeSignal::Traces);
         assert!(rx.try_recv().is_err()); // logs/metrics never queued...
         assert_eq!(tee.dropped.load(Ordering::Relaxed), 0); // ...and not counted as drops
+    }
+
+    #[tokio::test]
+    async fn rum_variants_masked_together_pass_or_skip() {
+        // rum off: both variants skipped silently
+        let (tee, mut rx) = FederationTee::channel_for(4, &[TeeSignal::Logs]);
+        tee.offer(TeeSignal::RumVitals, Bytes::from_static(b"vitals"));
+        tee.offer(TeeSignal::RumErrors, Bytes::from_static(b"errors"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(tee.dropped.load(Ordering::Relaxed), 0);
+
+        // rum on: caller passes both variants; both pass through
+        let (tee, mut rx) =
+            FederationTee::channel_for(4, &[TeeSignal::RumVitals, TeeSignal::RumErrors]);
+        tee.offer(TeeSignal::RumVitals, Bytes::from_static(b"vitals"));
+        tee.offer(TeeSignal::RumErrors, Bytes::from_static(b"errors"));
+        tee.offer(TeeSignal::Logs, Bytes::from_static(b"log"));
+        assert_eq!(rx.recv().await.unwrap().0, TeeSignal::RumVitals);
+        assert_eq!(rx.recv().await.unwrap().0, TeeSignal::RumErrors);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(tee.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rum_variants_ride_standard_otlp_paths() {
+        assert_eq!(TeeSignal::RumVitals.path(), "metrics");
+        assert_eq!(TeeSignal::RumErrors.path(), "logs");
     }
 
     #[tokio::test]
