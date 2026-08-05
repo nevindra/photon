@@ -6,7 +6,7 @@
 // 8) — this view derives its current/previous windows from there, so "last 30m" and the KPI trend
 // chips mean the same thing everywhere. Mounting here also sets the app-wide entity SCOPE to this
 // service (surfaced as a chip in the ContextBar, cleared by the user via its ✕).
-import { computed, watch } from 'vue'
+import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppShell from '@/components/common/AppShell.vue'
 import ChartPanel from '@/components/charts/ChartPanel.vue'
@@ -37,7 +37,6 @@ import {
   endMs,
   prevStartNs,
   prevEndNs,
-  setScope,
 } from '@/lib/core/context'
 import { correlate } from '@/lib/core/useCorrelate'
 
@@ -49,16 +48,6 @@ const service = computed(() => {
   return ((Array.isArray(s) ? s[0] : s) ?? '').trim()
 })
 
-// Scope the app-wide context to this service. Keyed off `service` (not a one-shot onMounted) so it
-// stays in sync if the `:service` route param ever changes under an already-mounted instance (Vue
-// Router reuses the component for same-route param navigations).
-watch(
-  service,
-  (s) => {
-    if (s) setScope({ type: 'service', id: s, label: s })
-  },
-  { immediate: true },
-)
 
 // Same round-trip preservation as the trace detail's back button (see lib/core/useBackTo.ts):
 // return to the list's own history entry so its sort/search state survives.

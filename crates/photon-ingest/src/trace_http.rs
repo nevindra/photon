@@ -2,7 +2,7 @@
 //! mapping → spans-WAL append. Decode errors (and auth failures) are rejected before the WAL
 //! is touched.
 
-use crate::auth::check_bearer_token;
+use crate::auth::{resolve_bearer, stamp_tenant_traces, Auth};
 use crate::trace_mapping::{estimate_rows, otlp_traces_into_builder};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -15,6 +15,7 @@ use photon_core::ingest_counters::IngestCounters;
 use photon_core::span_record::SpanBatchBuilder;
 use photon_core::span_schema::SpanSchema;
 use photon_core::PhotonError;
+use photon_core::TenantTokenMap;
 use photon_wal::Wal;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -29,6 +30,12 @@ pub(crate) struct TraceHttpState<W: Wal + Send + Sync + 'static> {
     pub(crate) in_flight: Arc<Semaphore>,
     /// Cumulative ingest tallies, incremented after a successful WAL append.
     pub(crate) counters: Arc<IngestCounters>,
+    /// Federation: bearer token -> tenant name, consulted when the local token doesn't
+    /// match. Empty on a non-central node, so tenant auth simply never matches.
+    pub(crate) tenant_tokens: TenantTokenMap,
+    /// Federation `full` mode: the raw decoded body is offered here for best-effort
+    /// forwarding to central. `None` on a non-federated node.
+    pub(crate) federation_tee: Option<crate::FederationTee>,
 }
 
 /// Decode a raw protobuf body into an `ExportTraceServiceRequest`. Pure — no I/O — so the
@@ -56,7 +63,8 @@ async fn ingest_traces<W: Wal + Send + Sync + 'static>(
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if !check_bearer_token(auth_header, &state.token) {
+    let auth = resolve_bearer(auth_header, &state.token, &state.tenant_tokens);
+    if auth == Auth::Denied {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
 
@@ -71,13 +79,22 @@ async fn ingest_traces<W: Wal + Send + Sync + 'static>(
         }
     };
 
-    let req = match decode_export_request(&body) {
+    let mut req = match decode_export_request(&body) {
         Ok(req) => req,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // Full-mode federation: mirror the accepted payload to central. `Bytes` clone is a
+    // refcount bump and `offer` is try_send-only, so this never touches the ack path.
+    if let Some(tee) = &state.federation_tee {
+        tee.offer(crate::TeeSignal::Traces, body.clone());
+    }
     // Frees the request buffer before the WAL fsync await; up to `max_body_bytes` (~16 MiB)
     // per in-flight request would otherwise stay pinned for the duration of the append.
     drop(body);
+
+    if let Auth::Tenant(tenant) = &auth {
+        stamp_tenant_traces(&mut req, tenant);
+    }
 
     let mut builder = SpanBatchBuilder::with_capacity(&state.schema, estimate_rows(&req));
     otlp_traces_into_builder(req, &mut builder);
@@ -159,6 +176,8 @@ mod tests {
             schema: SpanSchema::new(&["service.name".to_string()]),
             in_flight: Arc::new(Semaphore::new(1)),
             counters: Arc::new(photon_core::ingest_counters::IngestCounters::new()),
+            tenant_tokens: TenantTokenMap::default(),
+            federation_tee: None,
         };
 
         let _first = state

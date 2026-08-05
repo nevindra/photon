@@ -34,7 +34,7 @@ fn parse_ts(s: &str, field: &str) -> Result<i64, QueryParamError> {
 
 /// Compile a metrics filter string (label matchers) to a resolved query. Empty → None. Parse
 /// errors carry a byte offset for the UI underline.
-fn resolve_metric_filter(
+pub(crate) fn resolve_metric_filter(
     filter: &str,
     promoted: &[String],
 ) -> Result<Option<MetricResolvedQuery>, QueryParamError> {

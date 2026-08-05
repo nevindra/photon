@@ -29,6 +29,11 @@ pub enum PhotonError {
     Alerts(String),
 }
 
+/// Federation: bearer token → tenant name, shared live between the tenant registry (which
+/// rebuilds it on every mutation) and the ingest receivers (which read it per request).
+pub type TenantTokenMap =
+    std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>;
+
 pub mod config;
 pub mod ingest_counters;
 pub mod manifest;

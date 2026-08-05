@@ -31,6 +31,78 @@ pub use promrw_mapping::promrw_to_points;
 pub use promrw_proto::{Label, Sample, TimeSeries, WriteRequest};
 pub use trace_mapping::{otlp_traces_into_builder, otlp_traces_to_spans};
 
+use bytes::Bytes;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::mpsc;
+
+/// Which OTLP endpoint a teed payload came from — the forwarder maps it back to a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeeSignal {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl TeeSignal {
+    /// Path segment under `/v1/` this signal is re-POSTed to at central.
+    pub fn path(self) -> &'static str {
+        match self {
+            TeeSignal::Logs => "logs",
+            TeeSignal::Traces => "traces",
+            TeeSignal::Metrics => "metrics",
+        }
+    }
+}
+
+/// Bounded, non-blocking tee of decompressed OTLP protobuf payloads (tenant-side `full`
+/// federation mode). `offer` is `try_send` only — it never awaits, so it can never delay or
+/// fail the ack path. A full queue drops the *newest* payload and bumps `dropped`
+/// (drop-newest approximates drop-oldest; tokio's mpsc offers no drop-oldest mode and the
+/// mirror is explicitly best-effort).
+#[derive(Clone)]
+pub struct FederationTee {
+    tx: mpsc::Sender<(TeeSignal, Bytes)>,
+    /// Signals this tee mirrors, indexed by `TeeSignal as usize`. A disabled signal is skipped
+    /// silently in `offer` — deliberate config, not backpressure, so `dropped` doesn't count it.
+    enabled: [bool; 3],
+    pub dropped: Arc<AtomicU64>,
+}
+
+impl FederationTee {
+    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<(TeeSignal, Bytes)>) {
+        Self::channel_for(capacity, &[TeeSignal::Logs, TeeSignal::Traces, TeeSignal::Metrics])
+    }
+
+    /// A tee that mirrors only `signals` (the `[federation].signals` subset).
+    pub fn channel_for(
+        capacity: usize,
+        signals: &[TeeSignal],
+    ) -> (Self, mpsc::Receiver<(TeeSignal, Bytes)>) {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        let mut enabled = [false; 3];
+        for s in signals {
+            enabled[*s as usize] = true;
+        }
+        (
+            FederationTee {
+                tx,
+                enabled,
+                dropped: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
+    pub fn offer(&self, signal: TeeSignal, payload: Bytes) {
+        if !self.enabled[signal as usize] {
+            return;
+        }
+        if self.tx.try_send((signal, payload)).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use grpc::GrpcLogsService;
@@ -46,6 +118,7 @@ use photon_core::metric_schema::MetricSchema;
 use photon_core::schema::LogSchema;
 use photon_core::span_schema::SpanSchema;
 use photon_core::PhotonError;
+use photon_core::TenantTokenMap;
 use photon_wal::Wal;
 use promrw_http::PromRwHttpState;
 use std::net::SocketAddr;
@@ -79,6 +152,14 @@ pub struct IngestServer<W: Wal + Send + Sync + 'static> {
     /// Shared with the usage sampler (`photon-server`) so `/api/usage/series` can report
     /// ingest rates without touching the WAL or the compactor.
     counters: Arc<IngestCounters>,
+    /// Central-side federation: bearer token -> tenant name, shared live with the tenant
+    /// registry (which rebuilds it on every mutation). Empty by default = tenant auth never
+    /// matches, so a non-central node behaves exactly as before.
+    pub tenant_tokens: TenantTokenMap,
+    /// Tenant-side federation `full` mode: every accepted OTLP batch is offered to this
+    /// bounded tee for best-effort forwarding to central. `None` = no mirroring. The tee runs
+    /// on tenant installs and the token map runs on central; both fields coexist harmlessly.
+    pub federation_tee: Option<FederationTee>,
 }
 
 impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
@@ -106,6 +187,8 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             max_in_flight,
             max_body_bytes,
             counters,
+            tenant_tokens: TenantTokenMap::default(),
+            federation_tee: None,
         }
     }
 
@@ -135,6 +218,8 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.schema.clone(),
             in_flight: in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
+            federation_tee: self.federation_tee.clone(),
         };
         let grpc_trace_service = GrpcTraceService {
             wal: self.spans_wal.clone(),
@@ -142,6 +227,8 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.span_schema.clone(),
             in_flight: traces_in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
+            federation_tee: self.federation_tee.clone(),
         };
         let grpc_metrics_service = GrpcMetricsService {
             wal: self.metrics_wal.clone(),
@@ -149,6 +236,8 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.metric_schema.clone(),
             in_flight: metrics_in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
+            federation_tee: self.federation_tee.clone(),
         };
         // `accept_compressed(Gzip)` lets a stock OTel Collector (which gzips gRPC by default)
         // talk to us; `max_decoding_message_size(max_body_bytes)` makes the gRPC front door agree
@@ -178,6 +267,8 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.schema.clone(),
             in_flight: in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
+            federation_tee: self.federation_tee.clone(),
         });
         let trace_state = Arc::new(TraceHttpState {
             wal: self.spans_wal.clone(),
@@ -185,6 +276,8 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.span_schema.clone(),
             in_flight: traces_in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
+            federation_tee: self.federation_tee.clone(),
         });
         let metrics_state = Arc::new(MetricsHttpState {
             wal: self.metrics_wal.clone(),
@@ -192,6 +285,8 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             schema: self.metric_schema.clone(),
             in_flight: metrics_in_flight.clone(),
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
+            federation_tee: self.federation_tee.clone(),
         });
         let promrw_state = Arc::new(PromRwHttpState {
             wal: self.metrics_wal.clone(),
@@ -200,6 +295,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             in_flight: promrw_in_flight.clone(),
             max_body_bytes: self.max_body_bytes,
             counters: self.counters.clone(),
+            tenant_tokens: self.tenant_tokens.clone(),
         });
         let app = build_http_router(
             http_state,
@@ -269,6 +365,50 @@ fn build_http_router<W: Wal + Send + Sync + 'static>(
         .layer(tower_http::decompression::RequestDecompressionLayer::new())
 }
 
+/// The tee sits on the ack path, so its only load-bearing property is that `offer` never
+/// blocks — not even when the queue is full and the forwarder is stalled.
+#[cfg(test)]
+mod tee_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn offer_never_blocks_and_counts_drops() {
+        let (tee, _rx) = FederationTee::channel(2);
+        // Nobody drains `_rx`, so offers 3..=10 hit a full queue.
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            for _ in 0..10 {
+                tee.offer(TeeSignal::Logs, Bytes::from_static(b"x"));
+            }
+        })
+        .await
+        .expect("offer must never await, even on a full queue");
+        assert_eq!(tee.dropped.load(Ordering::Relaxed), 8);
+    }
+
+    #[tokio::test]
+    async fn disabled_signal_is_skipped_silently() {
+        let (tee, mut rx) = FederationTee::channel_for(4, &[TeeSignal::Traces]);
+        tee.offer(TeeSignal::Logs, Bytes::from_static(b"log"));
+        tee.offer(TeeSignal::Metrics, Bytes::from_static(b"metric"));
+        tee.offer(TeeSignal::Traces, Bytes::from_static(b"span"));
+        let (signal, _) = rx.recv().await.expect("only the enabled signal arrives");
+        assert_eq!(signal, TeeSignal::Traces);
+        assert!(rx.try_recv().is_err()); // logs/metrics never queued...
+        assert_eq!(tee.dropped.load(Ordering::Relaxed), 0); // ...and not counted as drops
+    }
+
+    #[tokio::test]
+    async fn payload_arrives_byte_identical() {
+        let (tee, mut rx) = FederationTee::channel(4);
+        let payload = Bytes::from_static(b"\x0a\x00otlp-protobuf");
+        tee.offer(TeeSignal::Traces, payload.clone());
+        let (signal, got) = rx.recv().await.expect("one teed payload");
+        assert_eq!(signal, TeeSignal::Traces);
+        assert_eq!(got, payload);
+        assert_eq!(tee.dropped.load(Ordering::Relaxed), 0);
+    }
+}
+
 /// The load-bearing interop test (fix-notes item 6): the merged ingest router, driven through its
 /// real middleware stack, must (1) transparently gunzip a gzipped OTLP body → 2xx (stock OTel
 /// Collector interop) and (2) reject a body whose **decompressed** size exceeds `max_body_bytes`
@@ -334,6 +474,8 @@ mod gzip_interop_tests {
                 schema: LogSchema::new(&promoted),
                 in_flight: in_flight.clone(),
                 counters: counters.clone(),
+                tenant_tokens: TenantTokenMap::default(),
+                federation_tee: None,
             }),
             Arc::new(TraceHttpState {
                 wal: wal.clone(),
@@ -341,6 +483,8 @@ mod gzip_interop_tests {
                 schema: SpanSchema::new(&promoted),
                 in_flight: in_flight.clone(),
                 counters: counters.clone(),
+                tenant_tokens: TenantTokenMap::default(),
+                federation_tee: None,
             }),
             Arc::new(MetricsHttpState {
                 wal: wal.clone(),
@@ -348,6 +492,8 @@ mod gzip_interop_tests {
                 schema: MetricSchema::new(&promoted),
                 in_flight: in_flight.clone(),
                 counters: counters.clone(),
+                tenant_tokens: TenantTokenMap::default(),
+                federation_tee: None,
             }),
             Arc::new(PromRwHttpState {
                 wal: wal.clone(),
@@ -356,6 +502,7 @@ mod gzip_interop_tests {
                 in_flight: in_flight.clone(),
                 max_body_bytes,
                 counters: counters.clone(),
+                tenant_tokens: TenantTokenMap::default(),
             }),
             max_body_bytes,
         )

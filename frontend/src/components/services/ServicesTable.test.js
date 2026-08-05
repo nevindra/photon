@@ -18,6 +18,16 @@ describe('ServicesTable', () => {
     expect(w.text()).toContain('Critical')
     expect(w.text()).toContain('240') // crit requests
   })
+  it('labels a federated row with its tenant badge, local rows unlabeled', () => {
+    const withTenant = [
+      { ...rows[0], tenant: 'divtik' },
+      { ...rows[1] },
+    ]
+    const w = mount(ServicesTable, { props: { rows: withTenant } })
+    const badges = w.findAll('[data-testid="service-tenant-badge"]')
+    expect(badges.length).toBe(1)
+    expect(badges[0].text()).toBe('divtik')
+  })
   it('shows an error-rate trend chip when prev-rows are supplied', () => {
     const prevRows = [{ service: 'crit', error_rate: 0.02 }]
     const w = mount(ServicesTable, { props: { rows, prevRows } })

@@ -150,6 +150,12 @@ already was, without adding a new storage engine:
 | `GET /api/infra/hosts/:host/processes?start=<ns>&end=<ns>` | the supervised processes running on one host + their latest resource usage (`process`, `cpuPct` (a percent, not a fraction), `rssBytes`, `fds`, `threads`, `restarts` — all nullable; `lastSeenNs`). Processes are the distinct `service.name` values among `process.*` metrics scoped to the host, enumerated from the CPU metric, and capped at the top 200 by CPU. Powers the per-host Processes table |
 | `GET /api/infra/hosts/:host/timeseries?resource=cpu\|memory\|disk\|network\|gpu\|gpu_memory\|gpu_temp\|gpu_power\|load&start=<ns>&end=<ns>&buckets=<n>` | curated bucketed series for one resource panel (`buckets` optional, default 48, clamped 1–500) |
 
+All four routes accept an optional `q` — a metrics-grammar filter string (compiled by the same
+`resolve_metric_filter` as `/api/metrics/query`; parse errors → 400 `{error, offset}`) applied to
+every read behind the response. The UI uses it to carry the global tenant scope
+(`tenant:<id>`, a non-promoted `attributes` map field stamped by federation), so the host list,
+detail, processes, and series all narrow to the active tenant.
+
 ### Per-host processes (`infra_host_processes`)
 
 A process row is **one `service.name` on the host**: two instances of the same service on a host

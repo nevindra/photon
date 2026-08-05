@@ -4,6 +4,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { api } from '@/lib/core/api'
 import { useSearchTraces, useSearchSpans } from '@/lib/traces/tracesQueries'
+import { setTenant, clearTenant } from '@/lib/core/context'
 
 // Neither `useSearchTraces` nor `useSearchSpans` had a dedicated test file before this one —
 // like `metricsQueries.test.js`/`dataQueries.test.js`, `useQuery`/`useInfiniteQuery` require an
@@ -40,7 +41,7 @@ describe('tracesQueries', () => {
         expect.objectContaining({ signal: expect.anything() }),
       )
       const keys = queryClient.getQueryCache().getAll().map((q) => q.queryKey)
-      expect(keys).toContainEqual(['search-traces', 'q=foo|1h'])
+      expect(keys).toContainEqual(['search-traces', 'q=foo|1h', null])
       expect(query.data.value.pages[0].traces).toEqual([{ trace_id: 't1' }])
     })
 
@@ -84,7 +85,7 @@ describe('tracesQueries', () => {
         expect.objectContaining({ signal: expect.anything() }),
       )
       const keys = queryClient.getQueryCache().getAll().map((q) => q.queryKey)
-      expect(keys).toContainEqual(['spans-search', 'q=bar|30m'])
+      expect(keys).toContainEqual(['spans-search', 'q=bar|30m', null])
       // Result pages expose `rows` (not `traces`).
       expect(query.data.value.pages[0].rows).toEqual([{ span_id: 's1' }])
       expect(query.data.value.pages[0].matched_count).toBe(1)
@@ -122,6 +123,44 @@ describe('tracesQueries', () => {
       for (const key of ['isFetching', 'isFetchingNextPage', 'error', 'errorUpdatedAt', 'dataUpdatedAt', 'hasNextPage', 'fetchNextPage']) {
         expect(query).toHaveProperty(key)
       }
+    })
+  })
+
+  // Task 12: `tenant` is the context dimension that actually filters. useSearchTraces/useSearchSpans
+  // are the only tracesQueries.ts composables tenant-wrapped — the pinned facet/histogram/latency
+  // composables below stay unwrapped since they're shared with the (not tenant-scoped) Services
+  // vertical.
+  describe('tenant filter', () => {
+    afterEach(() => { clearTenant() })
+
+    it('useSearchSpans appends the tenant term to the request query and re-keys on it', async () => {
+      const spy = vi
+        .spyOn(api, 'searchSpans')
+        .mockResolvedValue({ rows: [], matched_count: 0, elapsed_ms: 0, next_cursor: null })
+      setTenant('divtik')
+      const buildRequest = (cursor) => ({ query: 'status:error', start: '0', end: '10', cursor })
+
+      const { queryClient } = mountHarness(() => useSearchSpans(ref('descriptor'), buildRequest))
+      await flushPromises()
+
+      expect(spy).toHaveBeenCalledWith(
+        expect.objectContaining({ query: 'status:error tenant:divtik' }),
+        expect.anything(),
+      )
+      const keys = queryClient.getQueryCache().getAll().map((q) => q.queryKey)
+      expect(keys).toContainEqual(['spans-search', 'descriptor', 'tenant:divtik'])
+    })
+
+    it('useSearchTraces adds no term without a tenant', async () => {
+      const spy = vi
+        .spyOn(api, 'searchTraces')
+        .mockResolvedValue({ traces: [], matched_count: 0, elapsed_ms: 0, next_cursor: null })
+      const buildRequest = (cursor) => ({ query: 'foo', start: '0', end: '10', cursor })
+
+      mountHarness(() => useSearchTraces(ref('descriptor'), buildRequest))
+      await flushPromises()
+
+      expect(spy).toHaveBeenCalledWith(expect.objectContaining({ query: 'foo' }), expect.anything())
     })
   })
 })

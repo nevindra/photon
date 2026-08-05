@@ -4,9 +4,8 @@
 // strip), Retention (the retention form), and Delete (per-signal purge actions). The active tab
 // lives in the `?tab=` query param so tabs are deep-linkable and survive a refresh. The tab switch
 // folds into the ContextBar's search region as a query-driven sub-nav (NavTabItem is a RouterLink),
-// so there's no second header bar; the four bodies render conditionally by the active tab. Each
-// body is its own component and owns its data composables, mirroring the settings dialog this page
-// retired.
+// so there's no second header bar; the four bodies render conditionally by the active tab. Each body is its own component and owns its data
+// composables, mirroring the settings dialog this page retired.
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { Activity, HardDrive, Timer, Trash2 } from 'lucide-vue-next'

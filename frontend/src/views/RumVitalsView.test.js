@@ -7,7 +7,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
-import { startNs, endNs, scope, customRange, setTimeRange, clearScope } from '@/lib/core/context'
+import { startNs, endNs, customRange, setTimeRange } from '@/lib/core/context'
 import RumVitalsView from './RumVitalsView.vue'
 import WebVitalScorecard from '@/components/rum/WebVitalScorecard.vue'
 
@@ -71,9 +71,8 @@ async function mountVitals(initial = '/rum/web-storefront') {
 describe('RumVitalsView (integration)', () => {
   beforeEach(() => {
     window.history.replaceState(null, '', '/')
-    // Time + scope are global now (lib/context) — reset the module singletons between tests.
+    // Time is global now (lib/context) — reset the module singletons between tests.
     customRange.value = null
-    clearScope()
     setTimeRange('30m')
   })
 
@@ -108,7 +107,7 @@ describe('RumVitalsView (integration)', () => {
     wrapper.unmount()
   })
 
-  it('queries vitals with the global context window and scopes to the app', async () => {
+  it('queries vitals with the global context window', async () => {
     const { api } = await import('@/lib/core/api')
     setTimeRange('15m')
     api.rumVitals.mockClear() // call history accumulates across this file's tests — isolate ours
@@ -118,8 +117,6 @@ describe('RumVitalsView (integration)', () => {
     const call = api.rumVitals.mock.calls[0]
     expect(call[1]).toBe(startNs.value)
     expect(call[2]).toBe(endNs.value)
-    // Mounting the vitals hero sets the active entity scope to this RUM app.
-    expect(scope.value).toEqual({ type: 'rumApp', id: 'web-storefront', label: 'web-storefront' })
     wrapper.unmount()
   })
 

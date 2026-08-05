@@ -47,6 +47,7 @@ describe('DataView', () => {
     expect(joined).toMatch(/Storage/)
     expect(joined).toMatch(/Retention/)
     expect(joined).toMatch(/Delete/)
+    expect(w.find('[data-testid="data-tab-tenants"]').exists()).toBe(false)
   })
 
   it('syncs the active tab from the ?tab= query param', async () => {

@@ -33,7 +33,9 @@ export function buildMetricCatalog(
   return keys.map((name) =>
     name === 'service' || name === 'service.name'
       ? { name: 'service', description: 'Service name', kind: 'match', values: 'services' }
-      : { name, description: `Label ${name}`, kind: 'match' },
+      : name === 'tenant'
+        ? { name: 'tenant', description: 'Federated tenant (stamped by central)', kind: 'match' }
+        : { name, description: `Label ${name}`, kind: 'match' },
   )
 }
 

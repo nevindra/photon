@@ -103,6 +103,7 @@ fn red_row_to_json(r: &RedRow, window_secs: f64) -> Value {
     };
     json!({
         "service": r.service,
+        "tenant": r.tenant,                // null for local spans / group=operation
         "operation": r.operation,          // null for group=service (serde maps Option::None → null)
         "count": r.count,
         "rate": r.count as f64 / window_secs,

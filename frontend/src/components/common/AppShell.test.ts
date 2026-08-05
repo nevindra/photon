@@ -1,9 +1,14 @@
-import { it, expect } from 'vitest'
+import { it, expect, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
+import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import AppShell from './AppShell.vue'
 import ContextBar from './ContextBar.vue'
+
+vi.mock('@/lib/core/api', () => ({
+  api: { mock: false, tenants: vi.fn().mockResolvedValue({ tenants: [] }) },
+}))
 
 const router = createRouter({
   history: createMemoryHistory(),
@@ -23,7 +28,15 @@ it('AppShell renders the global ContextBar with the crumb', async () => {
       template:
         '<TooltipProvider><AppShell crumb="Logs"><div class="child"/></AppShell></TooltipProvider>',
     },
-    { global: { plugins: [router] }, attachTo: document.body },
+    {
+      global: {
+        plugins: [
+          router,
+          [VueQueryPlugin, { queryClient: new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } }) }],
+        ],
+      },
+      attachTo: document.body,
+    },
   )
   const bar = w.findComponent(ContextBar)
   expect(bar.exists()).toBe(true)

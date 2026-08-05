@@ -47,6 +47,9 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 /// The alerts `ConditionSource` seam over the three query engines (wired into the scheduler in a
 /// later task). Kept as a module so it can carry its own tests without bloating `main`.
 mod alerts_source;
+/// Tenant-side federation: the summary pusher (always on when `[federation]` is present) and,
+/// in `full` mode, the OTLP tee/forwarder that mirrors raw batches to central.
+mod federation;
 /// Adapter that mirrors uptime up/down transitions onto the shared alerts store + channels while
 /// preserving the legacy per-monitor webhook. Kept as a module so it can carry its own tests.
 mod uptime_bridge;
@@ -62,16 +65,17 @@ use argon2::{Argon2, PasswordHasher};
 
 use photon_api::settings::{SettingsStore, SqliteSettingsStore};
 use photon_api::{
-    signal_from_path, ApiServer, DataAdmin, LiveHub, PurgeCommand, ReplicationStatus,
-    RetentionAtomics, SqliteUsageStore, UsageStore,
+    signal_from_path, ApiServer, DataAdmin, FederationStatus, FederationStatusSnapshot, LiveHub,
+    PurgeCommand, ReplicationStatus, RetentionAtomics, SqliteUsageStore, UsageStore,
 };
 use photon_compact::{Compactor, MetricsCompactor, SpanCompactor};
-use photon_core::config::Config;
+use photon_core::config::{Config, FederationMode};
 use photon_core::ingest_counters::IngestCounters;
 use photon_core::metric_schema::MetricSchema;
 use photon_core::schema::LogSchema;
 use photon_core::span_schema::SpanSchema;
-use photon_ingest::IngestServer;
+use photon_core::TenantTokenMap;
+use photon_ingest::{FederationTee, IngestServer, TeeSignal};
 use photon_query::{MetricsQueryEngine, QueryEngine, SpanQueryEngine};
 use photon_storage::{Replicator, Storage};
 use photon_wal::{BroadcastingWal, DiskWal, Wal};
@@ -389,7 +393,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e| format!("invalid PHOTON_API_ADDR {api_addr_str:?}: {e}"))?;
 
-    let ingest = IngestServer::new(
+    // Central-side federation: bearer token -> tenant name, shared live between ingest auth
+    // resolution and the tenant registry (which rebuilds it on every mutation). Empty by
+    // default = tenant auth never matches, so a non-central node behaves exactly as before.
+    let tenant_tokens = TenantTokenMap::default();
+    let mut ingest = IngestServer::new(
         wal.clone(),
         spans_wal.clone(),
         metrics_wal.clone(),
@@ -401,6 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.ingest.max_body_bytes,
         counters.clone(),
     );
+    ingest.tenant_tokens = tenant_tokens.clone();
     let span_query = SpanQueryEngine::new(cfg.storage.hot_dir.clone(), span_schema.clone())?;
     let metrics_query =
         MetricsQueryEngine::new(cfg.storage.hot_dir.clone(), metric_schema.clone())?;
@@ -433,6 +442,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics: metrics_query.clone(),
     });
     let alerts_api = spawn_alerts(&cfg.alerts, &cfg.storage.db_path, alerts_source)?;
+
+    // Tenant-side federation: `summary` mode always pushes synthetic health metrics; `full` mode
+    // additionally tees every accepted OTLP batch to central. Absent `[federation]` = fully inert.
+    let mut federation_stats_dropped = None;
+    let mut federation_rx = None;
+    if let Some(fed) = cfg
+        .federation
+        .as_ref()
+        .filter(|f| f.mode == FederationMode::Full)
+    {
+        // `[federation].signals` narrows what full mode mirrors; absent → all three.
+        let tee_signals: Vec<TeeSignal> = match fed.signals.as_deref() {
+            None => vec![TeeSignal::Logs, TeeSignal::Traces, TeeSignal::Metrics],
+            Some(sigs) => sigs
+                .iter()
+                .map(|s| match s {
+                    photon_core::config::FederationSignal::Logs => TeeSignal::Logs,
+                    photon_core::config::FederationSignal::Traces => TeeSignal::Traces,
+                    photon_core::config::FederationSignal::Metrics => TeeSignal::Metrics,
+                })
+                .collect(),
+        };
+        let (tee, rx) = FederationTee::channel_for(fed.queue_batches, &tee_signals);
+        // The tee's own drop counter IS the stats counter, so `/api/federation/status` reports
+        // queue-full drops and forwarder give-ups as one number.
+        federation_stats_dropped = Some(tee.dropped.clone());
+        ingest.federation_tee = Some(tee);
+        federation_rx = Some(rx);
+    }
+    let federation_stats = Arc::new(federation::FederationStats {
+        dropped: federation_stats_dropped.unwrap_or_default(),
+        ..Default::default()
+    });
+    if let Some(fed) = cfg.federation.clone() {
+        if let Some(rx) = federation_rx {
+            federation::spawn_forwarder(fed.clone(), rx, federation_stats.clone());
+        }
+        federation::spawn_summary_pusher(
+            fed,
+            federation::SummaryDeps {
+                counters: counters.clone(),
+                query: query.clone(),
+                span_query: span_query.clone(),
+                metrics_query: metrics_query.clone(),
+                alerts: alerts_api.store.clone(),
+            },
+            federation_stats.clone(),
+        );
+    }
+
+    // photon-api cannot depend on photon-server, so expose the pusher/tee to the API through the
+    // `FederationStatus` trait — same newtype-over-orphan-rule shape as `ReplStatus` above.
+    struct FedStatus(
+        Option<photon_core::config::FederationConfig>,
+        Arc<federation::FederationStats>,
+    );
+    impl FederationStatus for FedStatus {
+        fn snapshot(&self) -> Option<FederationStatusSnapshot> {
+            let cfg = self.0.as_ref()?;
+            let stats = &self.1;
+            Some(FederationStatusSnapshot {
+                mode: match cfg.mode {
+                    FederationMode::Summary => "summary".to_string(),
+                    FederationMode::Full => "full".to_string(),
+                },
+                endpoint: cfg.endpoint.clone(),
+                last_push_ms: stats.last_push_ms.load(std::sync::atomic::Ordering::Relaxed),
+                last_error: stats.last_error.lock().unwrap().clone(),
+                pushed: stats.pushed.load(std::sync::atomic::Ordering::Relaxed),
+                dropped: stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
+                queued: stats.queued.load(std::sync::atomic::Ordering::Relaxed),
+            })
+        }
+    }
+    let federation_status: Arc<dyn FederationStatus> =
+        Arc::new(FedStatus(cfg.federation.clone(), federation_stats.clone()));
 
     // Uptime monitoring is always on: the scheduler + prune tasks run and the uptime tables are
     // opened in the shared control-plane SQLite. With no monitors configured it stays idle (no
@@ -476,6 +561,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(photon_api::RumApi::new(rum_store, sink).await)
     };
 
+    // Tenant registry (federation control plane): the customer Photon installs allowed to push
+    // into this central node. Always enabled — the store starts empty, so an unconfigured node
+    // simply has no tenant tokens and behaves exactly as before. Shares `tenant_tokens` with the
+    // ingest front end constructed above so a mutation here is live for the next ingest request.
+    let tenant_api = {
+        let tenant_store: Arc<dyn photon_api::tenants::TenantStore> = Arc::new(
+            photon_api::tenants::SqliteTenantStore::open(&cfg.storage.db_path)?,
+        );
+        Some(photon_api::TenantApi::new(tenant_store, tenant_tokens.clone()).await?)
+    };
+
     let api = ApiServer::new(
         query,
         span_query,
@@ -488,7 +584,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_data_admin(Some(data_admin))
     .with_live_hub(live_hub)
     .with_usage(usage.clone(), repl_status.clone())
-    .with_rum(rum_api);
+    .with_rum(rum_api)
+    .with_tenant_store(tenant_api)
+    .with_federation_status(Some(federation_status));
 
     println!("photon-server listening: otlp-grpc={grpc_addr} otlp-http={http_addr} api={api_addr}");
 

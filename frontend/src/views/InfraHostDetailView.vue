@@ -5,7 +5,7 @@
 // (util/memory/temperature/power). Sets the global scope to this host on mount so "Related ▾" and
 // cross-signal correlation carry `host.name` + the active time window. Mirrors RumErrorDetailView's
 // AppShell + `#lead` back-arrow shell and its route-param normalization.
-import { computed, watch } from 'vue'
+import { computed } from 'vue'
 import { useRoute, RouterLink } from 'vue-router'
 import { ArrowLeft } from 'lucide-vue-next'
 import AppShell from '@/components/common/AppShell.vue'
@@ -16,7 +16,7 @@ import RelatedMenu from '@/components/common/RelatedMenu.vue'
 import { Spinner } from '@/components/ui/spinner'
 import { api, type InfraProcess } from '@/lib/core/api'
 import { formatBytes } from '@/lib/core/format'
-import { startNs, endNs, setScope } from '@/lib/core/context'
+import { startNs, endNs } from '@/lib/core/context'
 import { useInfraHost, useHostResourceSeries, useInfraHostProcesses } from '@/lib/infra/infraQueries'
 
 const route = useRoute()
@@ -27,13 +27,6 @@ const host = computed<string>(() => {
   const h = route.params.host
   return ((Array.isArray(h) ? h[0] : h) ?? '').trim()
 })
-watch(
-  host,
-  (h) => {
-    if (h) setScope({ type: 'host', id: h, label: h })
-  },
-  { immediate: true },
-)
 
 const q = useInfraHost(host, startNs, endNs)
 const detail = computed(() => q.data.value ?? null)

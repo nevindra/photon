@@ -274,6 +274,7 @@ impl MetricsQueryEngine {
         &self,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<Vec<HostSummary>, PhotonError> {
         let mut out: BTreeMap<String, HostSummary> = BTreeMap::new();
 
@@ -282,7 +283,7 @@ impl MetricsQueryEngine {
             metric: CPU_UTIL.to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: None,
         };
         if let Some(df) = self.survivors_df(&req).await? {
@@ -326,21 +327,30 @@ impl MetricsQueryEngine {
         }
 
         // Latest memory utilization per host (fills mem_util).
-        self.fill_latest_gauge(&mut out, MEM_UTIL, start_ns, end_ns, |h, v| {
+        self.fill_latest_gauge(&mut out, MEM_UTIL, start_ns, end_ns, filter, |h, v| {
             h.mem_util = Some(v)
         })
         .await?;
         // GPU presence: any gpu-utilization row for the host in-window.
-        self.mark_gpu_presence(&mut out, start_ns, end_ns).await?;
+        self.mark_gpu_presence(&mut out, start_ns, end_ns, filter)
+            .await?;
         // Disk: worst mountpoint AND the mean across mountpoints (both shown in the UI).
-        self.fill_group_gauge(&mut out, FS_UTIL, "mountpoint", start_ns, end_ns, |h, g| {
-            h.disk_util = Some(g.max);
-            h.disk_util_avg = Some(g.mean);
-            h.disk_groups = g.groups;
-        })
+        self.fill_group_gauge(
+            &mut out,
+            FS_UTIL,
+            "mountpoint",
+            start_ns,
+            end_ns,
+            filter,
+            |h, g| {
+                h.disk_util = Some(g.max);
+                h.disk_util_avg = Some(g.mean);
+                h.disk_groups = g.groups;
+            },
+        )
         .await?;
         // GPU: worst device AND the mean across devices.
-        self.fill_group_gauge(&mut out, GPU_UTIL, "gpu", start_ns, end_ns, |h, g| {
+        self.fill_group_gauge(&mut out, GPU_UTIL, "gpu", start_ns, end_ns, filter, |h, g| {
             h.gpu_util = Some(g.max);
             h.gpu_util_avg = Some(g.mean);
             h.gpu_groups = g.groups;
@@ -358,13 +368,14 @@ impl MetricsQueryEngine {
         metric: &str,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
         set: impl Fn(&mut HostSummary, f64),
     ) -> Result<(), PhotonError> {
         let req = MetricRequest {
             metric: metric.to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: None,
         };
         let Some(df) = self.survivors_df(&req).await? else {
@@ -406,6 +417,7 @@ impl MetricsQueryEngine {
     /// stops that max from reading as if the whole host were saturated when one group is hot and
     /// the rest idle. The UI renders them side by side. Hosts absent from `out` (no CPU signal)
     /// are ignored — same semantics as `fill_latest_gauge`.
+    #[allow(clippy::too_many_arguments)]
     async fn fill_group_gauge(
         &self,
         out: &mut BTreeMap<String, HostSummary>,
@@ -413,13 +425,14 @@ impl MetricsQueryEngine {
         group_attr: &str,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
         set: impl Fn(&mut HostSummary, GroupStat),
     ) -> Result<(), PhotonError> {
         let req = MetricRequest {
             metric: metric.to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: None,
         };
         let Some(df) = self.survivors_df(&req).await? else {
@@ -477,12 +490,13 @@ impl MetricsQueryEngine {
         out: &mut BTreeMap<String, HostSummary>,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<(), PhotonError> {
         let req = MetricRequest {
             metric: GPU_UTIL.to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: None,
         };
         let Some(df) = self.survivors_df(&req).await? else {
@@ -523,18 +537,19 @@ impl MetricsQueryEngine {
         host: &str,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<HostDetail, PhotonError> {
         let (cores_f, _) = self
-            .host_latest_scalar(CPU_CORES, host, start_ns, end_ns)
+            .host_latest_scalar(CPU_CORES, host, start_ns, end_ns, filter)
             .await?;
         let (ram_f, _) = self
-            .host_latest_scalar(MEM_LIMIT, host, start_ns, end_ns)
+            .host_latest_scalar(MEM_LIMIT, host, start_ns, end_ns, filter)
             .await?;
         let (_, last_seen_ns) = self
-            .host_latest_scalar(CPU_UTIL, host, start_ns, end_ns)
+            .host_latest_scalar(CPU_UTIL, host, start_ns, end_ns, filter)
             .await?;
-        let gpus = self.host_gpu_names(host, start_ns, end_ns).await?;
-        let os = self.host_os(host, start_ns, end_ns).await?;
+        let gpus = self.host_gpu_names(host, start_ns, end_ns, filter).await?;
+        let os = self.host_os(host, start_ns, end_ns, filter).await?;
 
         Ok(HostDetail {
             host: host.to_string(),
@@ -567,6 +582,7 @@ impl MetricsQueryEngine {
         host: &str,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<Vec<ProcessSummary>, PhotonError> {
         let mut out: BTreeMap<String, ProcessSummary> = BTreeMap::new();
 
@@ -579,6 +595,7 @@ impl MetricsQueryEngine {
             host,
             start_ns,
             end_ns,
+            filter,
         )
         .await?;
         let used_semconv = !out.is_empty();
@@ -590,6 +607,7 @@ impl MetricsQueryEngine {
                 host,
                 start_ns,
                 end_ns,
+                filter,
             )
             .await?;
         }
@@ -609,6 +627,7 @@ impl MetricsQueryEngine {
             host,
             start_ns,
             end_ns,
+            filter,
             |p, v| p.rss_bytes = Some(v),
         )
         .await?;
@@ -619,6 +638,7 @@ impl MetricsQueryEngine {
             host,
             start_ns,
             end_ns,
+            filter,
             |p, v| p.fds = Some(v),
         )
         .await?;
@@ -629,6 +649,7 @@ impl MetricsQueryEngine {
             host,
             start_ns,
             end_ns,
+            filter,
             |p, v| p.threads = Some(v),
         )
         .await?;
@@ -639,6 +660,7 @@ impl MetricsQueryEngine {
             host,
             start_ns,
             end_ns,
+            filter,
             |p, v| p.restarts = Some(v),
         )
         .await?;
@@ -660,6 +682,7 @@ impl MetricsQueryEngine {
     /// the already-percent bespoke metric — plus the newest sample timestamp). Capped at the top
     /// `PROC_ROW_CAP` by CPU in-query (cf. `red_metrics`). No-op when the metric has no surviving
     /// files, so a caller can try semconv then bespoke and keep whichever populated `out`.
+    #[allow(clippy::too_many_arguments)]
     async fn enumerate_processes_from_cpu(
         &self,
         out: &mut BTreeMap<String, ProcessSummary>,
@@ -668,12 +691,13 @@ impl MetricsQueryEngine {
         host: &str,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<(), PhotonError> {
         let req = MetricRequest {
             metric: metric.to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: Some(host.to_string()),
         };
         let Some(df) = self.survivors_df(&req).await? else {
@@ -735,13 +759,14 @@ impl MetricsQueryEngine {
         host: &str,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
         set: impl Fn(&mut ProcessSummary, f64),
     ) -> Result<(), PhotonError> {
         let req = MetricRequest {
             metric: metric.to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: Some(host.to_string()),
         };
         let Some(df) = self.survivors_df(&req).await? else {
@@ -783,12 +808,13 @@ impl MetricsQueryEngine {
         host: &str,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<(Option<f64>, i64), PhotonError> {
         let req = MetricRequest {
             metric: metric.to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: Some(host.to_string()),
         };
         let Some(df) = self.survivors_df(&req).await? else {
@@ -823,12 +849,13 @@ impl MetricsQueryEngine {
         host: &str,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<Option<String>, PhotonError> {
         let req = MetricRequest {
             metric: CPU_UTIL.to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: Some(host.to_string()),
         };
         let Some(df) = self.survivors_df(&req).await? else {
@@ -869,12 +896,13 @@ impl MetricsQueryEngine {
         host: &str,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<Vec<String>, PhotonError> {
         let req = MetricRequest {
             metric: GPU_UTIL.to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: Some(host.to_string()),
         };
         let Some(df) = self.survivors_df(&req).await? else {
@@ -912,8 +940,14 @@ impl MetricsQueryEngine {
         start_ns: i64,
         end_ns: i64,
         buckets: usize,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<HostSeries, PhotonError> {
         let (metric, group) = resource.primary();
+        // The host pin and the caller's filter AND together (terms are conjunctive).
+        let mut compiled = self.host_filter(host);
+        if let Some(extra) = filter {
+            compiled.terms.extend(extra.terms.iter().cloned());
+        }
         // Defense-in-depth: mirrors `photon-api`'s `MAX_BUCKETS`
         // (`crates/photon-api/src/query_params.rs`); `photon-query` can't depend on `photon-api`,
         // so the value is restated here as a literal. `photon-api/src/infra.rs`'s handler already
@@ -923,7 +957,7 @@ impl MetricsQueryEngine {
             metric: metric.to_string(),
             agg: None,
             group_by: vec![group.to_string()],
-            filter: Some(self.host_filter(host)),
+            filter: Some(compiled),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
             buckets: buckets.clamp(1, 3000),
@@ -1184,6 +1218,31 @@ mod tests_fixture {
         (dir, engine)
     }
 
+    /// Two hosts whose CPU points carry different `tenant` map attributes (the federation stamp),
+    /// so a `tenant:a` filter must keep only `host-a`.
+    pub(super) async fn two_tenant_hosts() -> (tempfile::TempDir, MetricsQueryEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().to_path_buf();
+        let schema = schema();
+        compact(
+            &hot,
+            &schema,
+            vec![(
+                SegmentId(0),
+                vec![batch(
+                    &schema,
+                    &[
+                        mp(CPU_UTIL, "host-a", 10, 0.30, &[("tenant", "a")]),
+                        mp(CPU_UTIL, "host-b", 10, 0.40, &[("tenant", "b")]),
+                    ],
+                )],
+            )],
+        )
+        .await;
+        let engine = MetricsQueryEngine::new(hot, schema).unwrap();
+        (dir, engine)
+    }
+
     /// A `mp`-style point that also sets a specific `service.name` (the process/worker name), so a
     /// segment can carry several distinct processes on one host. Used by the processes fixture.
     fn proc_mp(metric: &str, host: &str, process: &str, ts: i64, value: f64) -> MetricPoint {
@@ -1282,7 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn infra_hosts_lists_distinct_hosts_with_latest_cpu() {
         let (_dir, engine) = super::tests_fixture::two_hosts_cpu().await;
-        let mut hosts = engine.infra_hosts(0, i64::MAX).await.unwrap();
+        let mut hosts = engine.infra_hosts(0, i64::MAX, None).await.unwrap();
         hosts.sort_by(|a, b| a.host.cmp(&b.host));
         assert_eq!(
             hosts.iter().map(|h| h.host.clone()).collect::<Vec<_>>(),
@@ -1296,7 +1355,7 @@ mod tests {
     #[tokio::test]
     async fn infra_hosts_reports_worst_disk_and_gpu_util() {
         let (_dir, engine) = super::tests_fixture::two_hosts_cpu().await;
-        let mut hosts = engine.infra_hosts(0, i64::MAX).await.unwrap();
+        let mut hosts = engine.infra_hosts(0, i64::MAX, None).await.unwrap();
         hosts.sort_by(|a, b| a.host.cmp(&b.host));
         let web1 = &hosts[0];
         let web2 = &hosts[1];
@@ -1318,7 +1377,7 @@ mod tests {
     #[tokio::test]
     async fn infra_hosts_carries_the_across_group_mean_beside_the_worst_group() {
         let (_dir, engine) = super::tests_fixture::two_hosts_cpu().await;
-        let mut hosts = engine.infra_hosts(0, i64::MAX).await.unwrap();
+        let mut hosts = engine.infra_hosts(0, i64::MAX, None).await.unwrap();
         hosts.sort_by(|a, b| a.host.cmp(&b.host));
         let web1 = &hosts[0];
 
@@ -1353,7 +1412,7 @@ mod tests {
     async fn infra_host_detail_reports_cores_and_last_seen() {
         let (_dir, engine) = super::tests_fixture::host_with_core_count().await;
         let d = engine
-            .infra_host_detail("web-1", 0, i64::MAX)
+            .infra_host_detail("web-1", 0, i64::MAX, None)
             .await
             .unwrap();
         assert_eq!(d.host, "web-1");
@@ -1365,7 +1424,7 @@ mod tests {
     async fn infra_host_series_cpu_returns_bucketed_series_for_host() {
         let (_dir, engine) = super::tests_fixture::two_hosts_cpu().await;
         let r = engine
-            .infra_host_series("web-1", InfraResource::Cpu, 0, i64::MAX, 12)
+            .infra_host_series("web-1", InfraResource::Cpu, 0, i64::MAX, 12, None)
             .await
             .unwrap();
         assert_eq!(r.resource, "cpu");
@@ -1385,7 +1444,7 @@ mod tests {
         // able to drive a multi-million-point series via `buckets`.
         let (_dir, engine) = super::tests_fixture::two_hosts_cpu().await;
         let r = engine
-            .infra_host_series("web-1", InfraResource::Cpu, 0, i64::MAX, 10_000_000)
+            .infra_host_series("web-1", InfraResource::Cpu, 0, i64::MAX, 10_000_000, None)
             .await
             .unwrap();
         for s in &r.series {
@@ -1401,7 +1460,7 @@ mod tests {
     async fn infra_host_processes_lists_host_workers_with_usage() {
         let (_dir, engine) = super::tests_fixture::host_with_processes().await;
         let procs = engine
-            .infra_host_processes("web-1", 0, i64::MAX)
+            .infra_host_processes("web-1", 0, i64::MAX, None)
             .await
             .unwrap();
         // Only web-1's two processes — web-2's `api` must NOT leak in. Returned CPU-desc, so the
@@ -1436,7 +1495,7 @@ mod tests {
     async fn infra_host_processes_reads_semconv_names_and_scales_utilization() {
         let (_dir, engine) = super::tests_fixture::host_with_semconv_processes().await;
         let procs = engine
-            .infra_host_processes("web-1", 0, i64::MAX)
+            .infra_host_processes("web-1", 0, i64::MAX, None)
             .await
             .unwrap();
         let api = procs.iter().find(|p| p.process == "api").unwrap();
@@ -1451,6 +1510,28 @@ mod tests {
         assert_eq!(api.fds, Some(128.0));
         assert_eq!(api.threads, Some(12.0));
         assert_eq!(api.restarts, Some(2.0));
+    }
+
+    #[tokio::test]
+    async fn infra_hosts_applies_a_tenant_attribute_filter() {
+        let (_dir, engine) = super::tests_fixture::two_tenant_hosts().await;
+        let ast = photon_core::query::parser::parse("tenant:a").unwrap();
+        let filter = MetricFieldResolver::new(engine.promoted_attributes())
+            .resolve(&ast)
+            .unwrap();
+
+        let hosts = engine.infra_hosts(0, i64::MAX, Some(&filter)).await.unwrap();
+        assert_eq!(
+            hosts.iter().map(|h| h.host.clone()).collect::<Vec<_>>(),
+            vec!["host-a".to_string()]
+        );
+
+        let mut all = engine.infra_hosts(0, i64::MAX, None).await.unwrap();
+        all.sort_by(|a, b| a.host.cmp(&b.host));
+        assert_eq!(
+            all.iter().map(|h| h.host.clone()).collect::<Vec<_>>(),
+            vec!["host-a".to_string(), "host-b".to_string()]
+        );
     }
 
     #[test]
@@ -1481,7 +1562,7 @@ mod tests {
             (InfraResource::Load, "load"),
         ] {
             let r = engine
-                .infra_host_series("web-1", resource, 0, i64::MAX, 12)
+                .infra_host_series("web-1", resource, 0, i64::MAX, 12, None)
                 .await
                 .unwrap();
             assert_eq!(r.resource, name);

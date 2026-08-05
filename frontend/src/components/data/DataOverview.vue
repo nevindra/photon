@@ -1,23 +1,33 @@
 <script setup>
 // The Overview tab of the /data page: a KPI tile row (on-disk / durable / rows / current ingest
 // rate) + a storage-composition bar + two usage-over-time charts (storage footprint by signal, and
-// ingestion rate by signal). Storage totals come from `useStorage` (the reshaped `{ signals,
-// durable }` payload); the time series comes from `useUsageSeries(usageWindow)`, whose window is
-// derived from the ONE global time control (the ContextBar) — there is no page-local window
-// selector. The durable tile is hidden entirely when no durable replica is configured. Chart series
-// are built the same way ServiceDetailView builds its MetricChart series — `{ key, points:[{t,v}] }`.
+// ingestion rate by signal) + (when this install pushes to a federation central) a status strip.
+// Storage totals come from `useStorage` (the reshaped `{ signals, durable }` payload); the time
+// series comes from `useUsageSeries(usageWindow)`, whose window is derived from the ONE global time
+// control (the ContextBar) — there is no page-local window selector. The durable tile is hidden
+// entirely when no durable replica is configured. Chart series are built the same way
+// ServiceDetailView builds its MetricChart series — `{ key, points:[{t,v}] }`.
 import { computed } from 'vue'
 import ChartPanel from '@/components/charts/ChartPanel.vue'
 import { Spinner } from '@/components/ui/spinner'
 import UsageChart from '@/components/data/UsageChart.vue'
 import { StatTile } from '@/components/ui/stat-tile'
+import { Badge } from '@/components/ui/badge'
 import { useStorage, useUsageSeries, usageWindow } from '@/lib/data/dataQueries'
-import { formatBytes, formatNumber } from '@/lib/core/format'
+import { useFederationStatus } from '@/lib/tenants/tenantsQueries'
+import { formatBytes, formatNumber, relative } from '@/lib/core/format'
 import { signalColor } from '@/lib/core/signalMeta'
 
 const { data: storage } = useStorage()
 // Window follows the global ContextBar range (context.windowMs → usageWindow) — no local selector.
 const { data: usage, isLoading } = useUsageSeries(usageWindow)
+const { data: fed } = useFederationStatus()
+
+// last_push_ms is ms-since-epoch, 0 meaning "never" — `relative()` wants nanoseconds.
+const lastPush = computed(() => {
+  const ms = fed.value?.status?.last_push_ms ?? 0
+  return ms === 0 ? 'never' : relative(BigInt(ms) * 1_000_000n)
+})
 
 const SIGNALS = ['logs', 'traces', 'metrics']
 
@@ -105,6 +115,36 @@ const ingestionSeries = computed(() =>
         :value="`${formatNumber(Math.round(ingestRate))}/s`"
         accent="neutral"
       />
+    </div>
+
+    <div
+      v-if="fed?.enabled"
+      data-testid="federation-status"
+      class="rounded-lg border border-border bg-surface-1 p-4"
+    >
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="flex items-center gap-2">
+          <h3 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Federation</h3>
+          <Badge variant="secondary">{{ fed.status.mode }}</Badge>
+        </div>
+        <span class="truncate font-mono text-xs text-muted-foreground">{{ fed.status.endpoint }}</span>
+      </div>
+      <p class="mt-1 text-xs text-muted-foreground">Last push {{ lastPush }}</p>
+      <div class="mt-3 grid grid-cols-3 gap-3 text-center">
+        <div>
+          <p class="font-mono text-lg font-semibold tabular-nums text-foreground">{{ formatNumber(fed.status.pushed) }}</p>
+          <p class="text-[11px] text-muted-foreground">Pushed</p>
+        </div>
+        <div>
+          <p class="font-mono text-lg font-semibold tabular-nums text-foreground">{{ formatNumber(fed.status.dropped) }}</p>
+          <p class="text-[11px] text-muted-foreground">Dropped</p>
+        </div>
+        <div>
+          <p class="font-mono text-lg font-semibold tabular-nums text-foreground">{{ formatNumber(fed.status.queued) }}</p>
+          <p class="text-[11px] text-muted-foreground">Queued</p>
+        </div>
+      </div>
+      <p v-if="fed.status.last_error" class="mt-2 text-xs text-sev-error">{{ fed.status.last_error }}</p>
     </div>
 
     <ChartPanel title="Storage composition" subtitle="On-disk share by signal">

@@ -1331,6 +1331,83 @@ export function mockDeleteRumApp(name: string): { ok: boolean; error?: string } 
   return { ok: true }
 }
 
+// --- Tenants / Federation ---
+export interface Tenant {
+  name: string
+  token: string
+  ui_url: string | null
+  created_at: number
+}
+export interface TenantSummary {
+  name: string
+  mode: string | null
+  status: 'up' | 'stale' | 'down'
+  last_seen_ms: number
+  ingest_rows_per_sec: number
+  open_incidents: number
+  hot_bytes: number
+  ui_url: string | null
+  spark: [number, number][]
+}
+
+const redactToken = (token: string): string => `…${token.slice(-4)}`
+
+let mockTenantsList: Tenant[] = [
+  { name: 'divtik', token: 'tk_tenant_mockdivtik0001', ui_url: 'https://divtik.example.com', created_at: 1_700_000_000_000 },
+  { name: 'cpin', token: 'tk_tenant_mockcpin00002', ui_url: null, created_at: 1_700_100_000_000 },
+]
+
+export function mockTenants(): { tenants: Tenant[] } {
+  return { tenants: mockTenantsList.map((t) => ({ ...t, token: redactToken(t.token) })) }
+}
+
+export function mockCreateTenant(name: string, uiUrl?: string | null): { ok: boolean; error?: string; token?: string } {
+  const trimmed = name.trim()
+  if (!/^[a-z0-9-]{1,64}$/.test(trimmed)) return { ok: false, error: 'name must be lowercase alphanumeric/hyphen, 1-64 chars' }
+  if (mockTenantsList.some((t) => t.name === trimmed)) return { ok: false, error: 'a tenant with that name already exists' }
+  const token = `tk_tenant_mock${Math.random().toString(16).slice(2, 12)}`
+  mockTenantsList = [...mockTenantsList, { name: trimmed, token, ui_url: uiUrl ?? null, created_at: Date.now() }]
+  return { ok: true, token }
+}
+
+export function mockUpdateTenant(name: string, uiUrl: string | null): { ok: boolean; error?: string } {
+  if (!mockTenantsList.some((t) => t.name === name)) return { ok: false, error: 'no such tenant' }
+  mockTenantsList = mockTenantsList.map((t) => (t.name === name ? { ...t, ui_url: uiUrl } : t))
+  return { ok: true }
+}
+
+export function mockRotateTenantToken(name: string): { ok: boolean; error?: string; token?: string } {
+  if (!mockTenantsList.some((t) => t.name === name)) return { ok: false, error: 'no such tenant' }
+  const token = `tk_tenant_mock${Math.random().toString(16).slice(2, 12)}`
+  mockTenantsList = mockTenantsList.map((t) => (t.name === name ? { ...t, token } : t))
+  return { ok: true, token }
+}
+
+export function mockDeleteTenant(name: string): { ok: boolean; error?: string } {
+  if (!mockTenantsList.some((t) => t.name === name)) return { ok: false, error: 'no such tenant' }
+  mockTenantsList = mockTenantsList.filter((t) => t.name !== name)
+  return { ok: true }
+}
+
+export function mockTenantsSummary(): TenantSummary[] {
+  const now = Date.now()
+  return mockTenantsList.map((t, i) => ({
+    name: t.name,
+    mode: i % 2 === 0 ? 'summary' : 'full',
+    status: 'up',
+    last_seen_ms: now - 5_000,
+    ingest_rows_per_sec: 120 + i * 30,
+    open_incidents: i,
+    hot_bytes: 5_000_000 + i * 1_000_000,
+    ui_url: t.ui_url,
+    spark: Array.from({ length: 12 }, (_, j) => [now - (11 - j) * 60_000, 100 + Math.random() * 40] as [number, number]),
+  }))
+}
+
+export function mockFederationStatus(): { enabled: boolean; status: null } {
+  return { enabled: false, status: null }
+}
+
 const RUM_THRESHOLDS: Record<string, [number, number]> = {
   'web_vitals.lcp': [2500.0, 4000.0],
   'web_vitals.inp': [200.0, 500.0],

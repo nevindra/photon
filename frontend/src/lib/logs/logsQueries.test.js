@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 // Mock useQuery so we can assert the plain options object each wrapper builds (mirrors the
 // caching-options block in tracesQueries.test.js).
@@ -8,8 +8,10 @@ vi.mock('@tanstack/vue-query', async (orig) => ({
   useQuery: (opts) => useQueryMock(opts),
 }))
 
-import { useFacet, useHistogram } from '@/lib/logs/logsQueries'
+import { useFacet, useHistogram, useSearchLogs } from '@/lib/logs/logsQueries'
 import { keepPreviousData } from '@tanstack/vue-query'
+import { api } from '@/lib/core/api'
+import { setTenant, clearTenant } from '@/lib/core/context'
 
 describe('logsQueries caching options', () => {
   beforeEach(() => useQueryMock.mockClear())
@@ -22,5 +24,35 @@ describe('logsQueries caching options', () => {
     expect(opts.staleTime).toBe(30_000)
     expect(opts.gcTime).toBe(5 * 60_000)
     expect(opts.placeholderData).toBe(keepPreviousData)
+  })
+})
+
+// Task 12: `tenant` is the context dimension that actually filters — every composable here appends
+// the active tenant's grammar term to its request (and re-keys on it), so a tenant pick narrows
+// logs without the caller (LogsView) having to know about tenant at all.
+describe('logsQueries tenant filter', () => {
+  beforeEach(() => {
+    useQueryMock.mockClear()
+    clearTenant()
+  })
+  afterEach(() => { clearTenant() })
+
+  it('useSearchLogs appends the tenant term to the request query and the cache key', async () => {
+    const spy = vi.spyOn(api, 'search').mockResolvedValue({ rows: [], matched_count: 0, elapsed_ms: 0 })
+    setTenant('divtik')
+    useSearchLogs('key', () => ({ start_ts_nanos: '0', end_ts_nanos: '1', query: 'level:error', limit: 10 }))
+    const opts = useQueryMock.mock.calls.at(-1)[0]
+
+    expect(opts.queryKey.value).toContain('tenant:divtik')
+    await opts.queryFn({ signal: undefined })
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({ query: 'level:error tenant:divtik' }),
+      expect.anything(),
+    )
+  })
+
+  it('adds no term when no tenant is set', () => {
+    useSearchLogs('key', () => ({ start_ts_nanos: '0', end_ts_nanos: '1', query: 'level:error', limit: 10 }))
+    expect(useQueryMock.mock.calls.at(-1)[0].queryKey.value.at(-1)).toBeNull()
   })
 })

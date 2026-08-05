@@ -14,6 +14,12 @@ describe('metricFields', () => {
     )
     expect(cat.every((f) => f.kind === 'match')).toBe(true)
   })
+  it('gives tenant a federation-flavored description when it appears in the attribute keys', () => {
+    const cat = buildMetricCatalog(['service', 'tenant'], [])
+    const tenant = cat.find((f) => f.name === 'tenant')
+    expect(tenant.kind).toBe('match')
+    expect(tenant.description).toContain('tenant')
+  })
   it('offers type-appropriate aggregations with the smart default first', () => {
     expect(aggOptionsForType('gauge', null)[0]).toBe('avg')
     expect(aggOptionsForType('sum', true)[0]).toBe('rate')

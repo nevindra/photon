@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { timeRange, customRange, scope } from '@/lib/core/context'
+import { timeRange, customRange } from '@/lib/core/context'
 import { correlate, relatedFor } from '@/lib/core/useCorrelate'
 
-beforeEach(() => { timeRange.value = '15m'; customRange.value = null; scope.value = null })
+beforeEach(() => { timeRange.value = '15m'; customRange.value = null })
 
 describe('correlate() never drops context', () => {
   it('injects the active preset range', () => {
@@ -12,11 +12,6 @@ describe('correlate() never drops context', () => {
   it('injects a custom from/to window instead of range', () => {
     customRange.value = { startMs: 500, endMs: 800 }
     expect(correlate({ path: '/traces' })).toBe('/traces?from=500&to=800')
-  })
-  it('injects the active scope on every hop', () => {
-    scope.value = { type: 'service', id: 'checkout', label: 'checkout' }
-    expect(correlate({ path: '/logs', query: { q: 'error:true' } }))
-      .toBe('/logs?q=error%3Atrue&range=15m&scope=service%3Acheckout')
   })
 })
 

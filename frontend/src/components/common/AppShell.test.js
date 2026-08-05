@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { defineComponent, h } from 'vue'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import AppShell from '@/components/common/AppShell.vue'
@@ -9,7 +10,7 @@ import { authed } from '@/lib/core/auth'
 
 // AppShell now owns nav + logout via the router (auth.logout hits api.logout).
 vi.mock('@/lib/core/api', () => ({
-  api: { mock: false, logout: vi.fn().mockResolvedValue(undefined) },
+  api: { mock: false, logout: vi.fn().mockResolvedValue(undefined), tenants: vi.fn().mockResolvedValue({ tenants: [] }) },
 }))
 
 const routes = [
@@ -27,7 +28,8 @@ async function mountShell(initial = '/logs') {
   const Harness = defineComponent({
     setup: () => () => h(TooltipProvider, null, { default: () => h(AppShell) }),
   })
-  const wrapper = mount(Harness, { global: { plugins: [router] }, attachTo: document.body })
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+  const wrapper = mount(Harness, { global: { plugins: [router, [VueQueryPlugin, { queryClient }]] }, attachTo: document.body })
   return { wrapper, router }
 }
 

@@ -89,8 +89,9 @@ WAL-allocated IDs.
 | **Metrics** | `MetricsService` / `POST /v1/metrics` | `metrics_wal` | `(metric_name, service.name, host.name, timestamp)` | `data-metrics/` | bloom over whole `metric_name` + `host.name` min/max range (binary v2; see [`subsystems/infra.md`](subsystems/infra.md)) |
 
 The flow (identical per signal): **OTLP request → (gzip-decompress if `Content-Encoding: gzip`) +
-`max_body_bytes` cap on the decompressed body → bearer-token check + per-signal semaphore →
-`otlp_*_to_*` mapping → Arrow `RecordBatch` → `wal.append`** (the group-commit `fsync` completes =
+`max_body_bytes` cap on the decompressed body → bearer-token check (local or tenant) + tenant stamping +
+per-signal semaphore → `otlp_*_to_*` mapping → Arrow `RecordBatch` → optional federation tee
+(non-blocking, full-mode only) → `wal.append`** (the group-commit `fsync` completes =
 **the ack / durability boundary**; data survives a crash from here) **+ `IngestCounters` bump →**
 the signal's background compactor `run_once` drains each _closed_ WAL segment → concat + lexsort by
 the sort key → stream one zstd Parquet (level from `[storage] zstd_level`) + build the skip-index
@@ -252,7 +253,7 @@ backend can't be silently replaced with demo data.
 - **Live tail (SSE):** `GET /api/stream/logs`, `GET /api/stream/spans`.
 - **Traces / spans:** `GET /api/traces/:trace_id`, `POST /api/traces/search`, `POST /api/spans/search`,
   `GET /api/traces/fields|facet|histogram|latency`.
-- **Services (APM):** `GET /api/red`, `GET /api/services/:service/timeseries|dependencies|settings`.
+- **Services (APM):** `GET /api/red`, `GET /api/services/:service/timeseries|dependencies|settings` (`timeseries`/`dependencies` take an optional `q` grammar param AND-ed with the service term — the UI's tenant filter).
 - **Metrics:** `POST /api/metrics/query`, `GET /api/metrics/catalog|metadata/:name|labels`.
 - **Infrastructure (host/GPU resource monitoring):** `GET /api/infra/hosts`,
   `GET /api/infra/hosts/:host`, `GET /api/infra/hosts/:host/processes`,
@@ -274,6 +275,11 @@ backend can't be silently replaced with demo data.
   [`subsystems/alerts.md`](subsystems/alerts.md).
 - **Data / usage / retention:** `GET /api/storage`, `GET /api/usage/series`, `GET/PUT /api/retention`,
   `POST /api/data/purge`.
+- **Federation (central + tenant):** `GET /api/tenants` (central list all), `POST /api/tenants`
+  (central create), `PATCH/DELETE /api/tenants/:name` (central update/remove),
+  `POST /api/tenants/:name/rotate-token` (central rotate), `GET /api/tenants/summary` (central curated
+  per-tenant health + rate/incidents/disk), `GET /api/federation/status` (tenant see local federation
+  config + push telemetry) — see [`subsystems/federation.md`](subsystems/federation.md).
 - **Auth / users:** `POST /api/logout`, `GET/POST /api/users`, `DELETE /api/users/:username`.
 
 Everything else falls through to the embedded UI (SPA fallback to `index.html`).

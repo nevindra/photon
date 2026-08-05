@@ -12,7 +12,7 @@ wraps `<router-view>` in one app-wide `TooltipProvider` + `Toaster` and calls `i
 
 **No Pinia.** Server state lives in TanStack Query; within-view state lives in URL params. App-wide
 auth/theme/context are a few ad-hoc reactive-ref modules (`lib/core/auth.ts`, `lib/core/theme.ts`,
-`lib/core/context.ts` — the app-wide time window + entity scope).
+`lib/core/context.ts` — the app-wide time window + federation tenant).
 
 ## Design tokens & elevation
 
@@ -70,7 +70,7 @@ corpus (`lib/core/mock.ts`) on a **network** failure, while still surfacing real
 
 | Path | View | Section |
 |---|---|---|
-| `/` → `/home` | `HomeView.vue` | Home dashboard (landing) |
+| `/` → `/home` | `HomeView.vue` | Home dashboard (landing, with conditional tenant board when federation enabled) |
 | `/logs` | `LogsView.vue` | Logs explorer |
 | `/traces` · `/traces/:traceId` | `TracesExplorer.vue` · `TraceDetailView.vue` | Traces + waterfall |
 | `/services` · `/services/:service` | `ServicesListView.vue` · `ServiceDetailView.vue` | APM |
@@ -80,6 +80,7 @@ corpus (`lib/core/mock.ts`) on a **network** failure, while still surfacing real
 | `/infra` · `/infra/:host` | `InfraHostsView.vue` · `InfraHostDetailView.vue` | Infrastructure (host/GPU resource monitoring) |
 | `/data` | `DataView.vue` | Usage / storage / retention |
 | `/alerts` | `AlertsView.vue` | Alerts (webhook rules, incidents, channels) |
+| `/tenants` | `TenantsView.vue` | Federation tenant registry (central-side) |
 | `/login` · `/onboarding` | `LoginView.vue` · `OnboardingView.vue` | Auth (public) |
 
 `router/index.js` has a global `beforeEach` guard: cached `hydrate()` auth probe, onboarding-first
@@ -91,7 +92,7 @@ per-signal list: an ungrouped **Home** entry, then three worlds — **Frontend**
 (→ `/services`), **Infrastructure** (two items: **Hosts** → `/infra`, **Ops** → `/uptime`) — Frontend
 and Backend are each today a single landing item into an existing route (room to grow their own
 sub-nav later), then **Explore** (Logs · Traces · Metrics, the raw per-signal browsers) and **Manage**
-(Data, then Alerts — the cross-signal webhook alert engine). The rail is 74px wide, so a group
+(Data, then Alerts — the cross-signal webhook alert engine — then Tenants, the federation tenant registry). The rail is 74px wide, so a group
 **heading** has room for ~10 characters at its 9px uppercase/`tracking-wider` size — the
 Infrastructure world is headed **"Infra"** for that reason (the full word overflowed both edges and
 was clipped by the rail border, reading as a mis-centred label; it stays full-length in breadcrumbs).
@@ -109,7 +110,7 @@ pushes to.
   `ChartPanel`, `ChartTooltipCard`, plus pure option builders (`chartOptions.js`), the lifecycle
   composable (`useUplot.js`), and theme-aware colors (`useChartTheme.js`).
 - **`common/`** — app chrome & toolbar widgets: `AppShell`, `NavRail`, `ContextBar` (the single
-  consolidated header row, mounted once by `AppShell`: breadcrumb + scope chip on the left, a
+  consolidated header row, mounted once by `AppShell`: breadcrumb + tenant picker on the left, a
   middle `search` slot, and the global time picker + `LiveControl` on the right — searchable views
   forward their `SearchBar` into that slot via `AppShell`'s `toolbar` slot; non-searchable views
   leave it empty and the breadcrumb labels the page), `PhotonMark`, `SearchBar` (query-language
@@ -130,7 +131,10 @@ pushes to.
   `HostProcessesTable.vue` (the `/infra/:host` **Processes** table — one row per supervised process
   (`service.name`) on the host, built on `ui/table` + `EmptyState`, click-to-sort columns defaulting
   to CPU descending with nulls last; see
-  [`subsystems/infra.md`](subsystems/infra.md)). `alerts/` (the webhook alert engine, cross-signal):
+  [`subsystems/infra.md`](subsystems/infra.md)). `tenants/` (federation central registry):
+  `TenantCard.vue` (the Home board tenant card — health status, sparkline, mode badge, open-UI link for
+  summary-mode), `TenantManageDialog.vue` (add/edit dialog with rotate + minted-token panel; delete is a row action in `data/DataTenants.vue`), see
+  [`subsystems/federation.md`](subsystems/federation.md). `alerts/` (the webhook alert engine, cross-signal):
   `AlertStatBand`, `AlertRulesTable`/`AlertRuleRow` (its "Browse templates" button + empty-state link
   open the quick-setup picker), `AlertRuleDialog`/`ConditionBuilder` (the plain-English condition
   builder — `AlertRuleDialog` also accepts an optional `:seed` prop, a partial `RuleInput` that
@@ -187,13 +191,15 @@ cross-cutting. Imports use the extensionless alias form `@/lib/<folder>/<name>`.
 **`core/` — shared foundations used across signals:**
 - *Transport:* `api.ts` (Ky + mock fallback), `mock.ts` (in-browser mock corpus), `liveStream.ts`
   (`EventSource` wrapper for live-tail SSE).
-- *App-wide reactive state & navigation:* `auth.ts`, `context.ts` (app-wide time range + entity scope
-  — the same module-singleton pattern as `auth.ts`/`theme.ts`; sole owner of the
-  `range`/`from`/`to`/`scope` URL keys), `useUrlState.ts` (per-view `svc`/`sev`/`q`; merge-preserves
+- *App-wide reactive state & navigation:* `auth.ts`, `context.ts` (app-wide time range + federation
+  tenant — the same module-singleton pattern as `auth.ts`/`theme.ts`; sole owner of the
+  `range`/`from`/`to`/`tenant` URL keys; `tenantQueryTerm()` is what the logs/traces/metrics
+  composables append to `q`, picked via the ContextBar dropdown or a Home tenant card),
+  `useUrlState.ts` (per-view `svc`/`sev`/`q`; merge-preserves
   every other key, including the context ones), `historyUrl.ts` (`replaceSearch()` — the **only**
   sanctioned way to rewrite the query string without navigating; preserves vue-router's entry state
   and keeps its `current` in step, see [conventions](conventions.md)), `useCorrelate.ts` (`correlate()` builds a same-app
-  link that always carries the current time+scope; `relatedFor()` is the per-entity-kind
+  link that always carries the current time+tenant; `relatedFor()` is the per-entity-kind
   related-destination graph behind `RelatedMenu`; **every destination must send a key its target
   view actually reads** — `q` for logs/traces/metrics/uptime, `app` for `/rum` — a param nothing
   consumes silently lands the pivot unfiltered), `useBackTo.ts` (`backTo(router, listPath)` —
@@ -224,6 +230,8 @@ follow the same contract) plus its signal-specific helpers:
 - **`infra/`** — `infraQueries.ts` (`useInfraHosts`/`useInfraHost`/`useInfraHostSeries`, plus
   `useHostResourceSeries` — the nine-resource query bundle for one host-detail view) and
   `hostStats.ts` (pure last-point/worst-series/threshold helpers for the glance tiles).
+- **`tenants/`** (federation central only) — `tenantsQueries.ts` (`useTenants`/`useTenantsSummary` +
+  mutations for create/update/rotate/delete, all with mutation side-effects: invalidate + toast).
 
 **Cross-signal:**
 - `alertsQueries.ts` (root `lib/`, not a per-signal folder — the alert engine spans metrics/logs/

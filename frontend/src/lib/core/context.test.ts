@@ -1,15 +1,16 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import {
-  timeRange, customRange, scope, nowTick,
+  timeRange, customRange, nowTick,
   startNs, endNs, prevStartNs, prevEndNs,
-  setTimeRange, setCustomRange, setScope, clearScope, RANGE_MS,
+  setTimeRange, setCustomRange, RANGE_MS,
+  tenant, setTenant, clearTenant, tenantQueryTerm,
   parseContext, seedContextFromUrl, syncContextToUrl,
 } from '@/lib/core/context'
 
 beforeEach(() => {
   // reset module singletons between tests
   customRange.value = null
-  scope.value = null
+  tenant.value = null
   nowTick.value = 1_000_000 // ms; deterministic "now"
   timeRange.value = '30m'
 })
@@ -43,21 +44,31 @@ describe('context time math', () => {
     expect(timeRange.value).toBe('1h')
   })
 
-  it('scope set/clear', () => {
-    setScope({ type: 'service', id: 'checkout', label: 'checkout' })
-    expect(scope.value?.id).toBe('checkout')
-    clearScope()
-    expect(scope.value).toBeNull()
+  it('tenant set/clear drives tenantQueryTerm', () => {
+    expect(tenantQueryTerm()).toBeNull()
+    setTenant('divtik')
+    expect(tenantQueryTerm()).toBe('tenant:divtik')
+    clearTenant()
+    expect(tenantQueryTerm()).toBeNull()
+  })
+
+  it('tenantQueryTerm ignores values outside the tenant-name shape (URL-injected)', () => {
+    // `?tenant=a b` would otherwise leak ` b` into the query as a body-substring term.
+    setTenant('a b')
+    expect(tenantQueryTerm()).toBeNull()
+    setTenant('a"quoted')
+    expect(tenantQueryTerm()).toBeNull()
+    clearTenant()
   })
 })
 
 describe('context URL', () => {
   beforeEach(() => { window.history.replaceState(null, '', '/') })
 
-  it('parseContext reads range + scope', () => {
-    const c = parseContext('?range=15m&scope=service:checkout&q=foo')
+  it('parseContext reads range + tenant', () => {
+    const c = parseContext('?range=15m&tenant=divtik&q=foo')
     expect(c.timeRange).toBe('15m')
-    expect(c.scope).toEqual({ type: 'service', id: 'checkout', label: 'checkout' })
+    expect(c.tenant).toBe('divtik')
   })
 
   it('parseContext reads a custom from/to window', () => {
@@ -66,22 +77,22 @@ describe('context URL', () => {
   })
 
   it('seedContextFromUrl hydrates the module refs', () => {
-    window.history.replaceState(null, '', '/logs?range=1h&scope=rumApp:web')
+    window.history.replaceState(null, '', '/logs?range=1h&tenant=divtik')
     seedContextFromUrl()
     expect(timeRange.value).toBe('1h')
-    expect(scope.value).toEqual({ type: 'rumApp', id: 'web', label: 'web' })
+    expect(tenant.value).toBe('divtik')
   })
 
   // Regression for the router.afterEach wiring in router/index.js: a bare `router.push(...)`
   // (NavRail world switch, list drill-ins, back buttons) navigates to a URL with no query at
   // all — the watch() in startContextUrlSync only fires on ref changes, so nothing re-syncs
-  // range/scope onto the new path unless something explicitly calls syncContextToUrl() after
+  // range/tenant onto the new path unless something explicitly calls syncContextToUrl() after
   // the navigation. This proves that call carries the active context onto a bare URL. It only
   // passes because syncContextToUrl is exported (Fix A) — before that it wasn't importable and
   // the call below throws "syncContextToUrl is not a function".
-  it('syncContextToUrl carries the active range + scope onto a bare navigation with no query', () => {
+  it('syncContextToUrl carries the active range + tenant onto a bare navigation with no query', () => {
     setTimeRange('1h')
-    setScope({ type: 'service', id: 'checkout', label: 'checkout' })
+    setTenant('divtik')
     // Simulate what vue-router did: navigated to a new path, dropping the old query entirely.
     window.history.replaceState(null, '', '/services')
     expect(window.location.search).toBe('')
@@ -90,7 +101,7 @@ describe('context URL', () => {
 
     const params = new URLSearchParams(window.location.search)
     expect(params.get('range')).toBe('1h')
-    expect(params.get('scope')).toBe('service:checkout')
+    expect(params.get('tenant')).toBe('divtik')
   })
 
   // Regression: syncContextToUrl runs from router.afterEach on EVERY navigation, i.e. immediately

@@ -6,7 +6,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
-import { startNs, endNs, customRange, clearScope, setTimeRange } from '@/lib/core/context'
+import { startNs, endNs, customRange, setTimeRange } from '@/lib/core/context'
 import RumErrorsView from './RumErrorsView.vue'
 
 vi.mock('@/lib/core/api', () => ({
@@ -53,7 +53,6 @@ describe('RumErrorsView (integration)', () => {
   beforeEach(() => {
     window.history.replaceState(null, '', '/')
     customRange.value = null
-    clearScope()
     setTimeRange('30m')
   })
 

@@ -1,5 +1,6 @@
 <script setup>
 import { computed, ref } from 'vue'
+import { Badge } from '@/components/ui/badge'
 import { ArrowUp, ArrowDown } from 'lucide-vue-next'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { EmptyState } from '@/components/ui/empty-state'
@@ -124,7 +125,7 @@ const COLUMNS = computed(() =>
       <TableBody>
         <TableRow
           v-for="row in sortedRows"
-          :key="row.service + '::' + (row.operation ?? '')"
+          :key="row.service + '::' + (row.tenant ?? '') + '::' + (row.operation ?? '')"
           data-testid="red-row"
           :data-service="row.service"
           role="button"
@@ -137,7 +138,14 @@ const COLUMNS = computed(() =>
           <TableCell class="py-1.5 pl-3 pr-0">
             <StatusDot :tone="healthTone(row)" />
           </TableCell>
-          <TableCell class="py-1.5 text-foreground">{{ row.service }}</TableCell>
+          <TableCell class="py-1.5 text-foreground">
+            <span class="inline-flex items-center gap-1.5">
+              {{ row.service }}
+              <Badge v-if="row.tenant" data-testid="red-tenant-badge" class="rounded-full border-brand/35 bg-brand-soft px-1.5 py-0 text-[10px] text-brand">
+                {{ row.tenant }}
+              </Badge>
+            </span>
+          </TableCell>
           <TableCell v-if="group === 'operation'" data-testid="col-operation" class="py-1.5 text-muted-foreground">
             {{ row.operation ?? '—' }}
           </TableCell>

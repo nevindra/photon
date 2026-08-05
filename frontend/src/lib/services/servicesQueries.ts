@@ -15,7 +15,12 @@
 import { computed, toValue, type MaybeRefOrGetter } from 'vue'
 import { useQuery, useMutation, useQueryClient, type QueryClient } from '@tanstack/vue-query'
 import { api, type ApiError, type ServiceDependencies, type ServiceSettings, type ServiceTimeseriesBucket } from '@/lib/core/api'
+import { tenantQueryTerm } from '@/lib/core/context'
 import { toast } from '@/components/ui/toast'
+
+// Appends the active tenant's grammar term, mirroring logs/traces/metricsQueries — the Backend
+// (APM) vertical filters by tenant too.
+const withTenant = (q: string): string => [q, tenantQueryTerm()].filter(Boolean).join(' ')
 
 export const servicesListQueryKey = (
   query: MaybeRefOrGetter<string>,
@@ -66,8 +71,8 @@ export function useServicesList(
   endNs: MaybeRefOrGetter<string>,
 ) {
   return useQuery({
-    queryKey: computed(() => servicesListQueryKey(query, startNs, endNs)),
-    queryFn: ({ signal }) => api.red(toValue(query), toValue(startNs), toValue(endNs), 'service', { signal }),
+    queryKey: computed(() => [...servicesListQueryKey(query, startNs, endNs), tenantQueryTerm()]),
+    queryFn: ({ signal }) => api.red(withTenant(toValue(query)), toValue(startNs), toValue(endNs), 'service', { signal }),
     refetchInterval: 15_000,
   })
 }
@@ -81,11 +86,11 @@ export function useServiceTimeseries(
   buckets: MaybeRefOrGetter<number> = 48,
 ) {
   return useQuery<ServiceTimeseriesBucket[]>({
-    queryKey: computed(() => serviceTimeseriesQueryKey(service, startNs, endNs, buckets)),
+    queryKey: computed(() => [...serviceTimeseriesQueryKey(service, startNs, endNs, buckets), tenantQueryTerm()]),
     queryFn: ({ signal }) =>
       api.serviceTimeseries(
         toValue(service),
-        { start: toValue(startNs), end: toValue(endNs), buckets: toValue(buckets) },
+        { start: toValue(startNs), end: toValue(endNs), buckets: toValue(buckets), q: tenantQueryTerm() ?? undefined },
         { signal },
       ),
     enabled: computed(() => !!toValue(service)),
@@ -99,9 +104,13 @@ export function useServiceDependencies(
   endNs: MaybeRefOrGetter<string>,
 ) {
   return useQuery<ServiceDependencies>({
-    queryKey: computed(() => serviceDependenciesQueryKey(service, startNs, endNs)),
+    queryKey: computed(() => [...serviceDependenciesQueryKey(service, startNs, endNs), tenantQueryTerm()]),
     queryFn: ({ signal }) =>
-      api.serviceDependencies(toValue(service), { start: toValue(startNs), end: toValue(endNs) }, { signal }),
+      api.serviceDependencies(
+        toValue(service),
+        { start: toValue(startNs), end: toValue(endNs), q: tenantQueryTerm() ?? undefined },
+        { signal },
+      ),
     enabled: computed(() => !!toValue(service)),
   })
 }

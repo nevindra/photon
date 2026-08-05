@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import RelatedMenu from './RelatedMenu.vue'
-import { scope, timeRange, customRange } from '@/lib/core/context'
+import { timeRange, customRange } from '@/lib/core/context'
 
 // Reka DropdownMenu portals (teleports) its content to document.body, so once the menu is open we
 // query the document rather than the component wrapper (mirrors NavRail.test.js's account menu).
@@ -17,7 +17,6 @@ describe('RelatedMenu', () => {
   it('navigates to a related destination carrying context', async () => {
     timeRange.value = '15m'
     customRange.value = null
-    scope.value = null
     // Memory history performs no initial navigation until pushed/installed — push first so
     // router.isReady() resolves (mirrors NavRail/ServiceDetailView tests) instead of deadlocking.
     router.push('/')

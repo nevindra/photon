@@ -10,6 +10,7 @@ import AppShell from '@/components/common/AppShell.vue'
 import ChartPanel from '@/components/charts/ChartPanel.vue'
 import LineChart from '@/components/charts/LineChart.vue'
 import RedTable from '@/components/metrics/RedTable.vue'
+import TenantCard from '@/components/tenants/TenantCard.vue'
 import { StatTile } from '@/components/ui/stat-tile'
 import { Sparkline } from '@/components/ui/sparkline'
 import { StatusDot } from '@/components/ui/status-dot'
@@ -20,6 +21,8 @@ import { correlate } from '@/lib/core/useCorrelate'
 import { useServicesList, useServiceTimeseries } from '@/lib/services/servicesQueries'
 import { useRumApps, useRumVitals } from '@/lib/rum/rumQueries'
 import { useMonitors } from '@/lib/uptime/uptimeQueries'
+import { useTenantsSummary, type TenantSummary } from '@/lib/tenants/tenantsQueries'
+import { tenant as activeTenant, setTenant } from '@/lib/core/context'
 import { formatDuration, formatNumber } from '@/lib/core/format'
 
 const router = useRouter()
@@ -44,6 +47,27 @@ const vitals = computed<any[]>(() => vitalsQuery.data.value?.vitals ?? [])
 // --- Infra world: uptime monitors ---
 const monitorsQuery = useMonitors()
 const monitors = computed<any[]>(() => monitorsQuery.data.value ?? [])
+
+const tenantsSummaryQuery = useTenantsSummary()
+const allTenants = computed<TenantSummary[]>(() => tenantsSummaryQuery.data.value ?? [])
+// With a tenant filter active the board narrows to that tenant's card — a health header for the
+// tenant being inspected — instead of repeating the whole fleet under filtered tiles.
+const tenants = computed<TenantSummary[]>(() =>
+  activeTenant.value ? allTenants.value.filter((t) => t.name === activeTenant.value) : allTenants.value,
+)
+// Column count follows the card count (capped at 4/row) so a small fleet fills the row instead of
+// leaving grid whitespace. Literal class strings — Tailwind can't see computed names.
+const TENANT_COLS: Record<number, string> = {
+  1: 'grid-cols-1',
+  2: 'grid-cols-1 sm:grid-cols-2',
+  3: 'grid-cols-1 sm:grid-cols-2 xl:grid-cols-3',
+  4: 'grid-cols-1 sm:grid-cols-2 xl:grid-cols-4',
+}
+const tenantGridClass = computed(() =>
+  activeTenant.value
+    ? 'flex flex-col gap-2'
+    : `grid gap-4 ${TENANT_COLS[Math.min(tenants.value.length, 4)]}`,
+)
 
 // --- Headline-service timeseries feeds both trend charts (busiest service by request rate) ---
 const topService = computed<string>(() => {
@@ -179,11 +203,45 @@ function openService(service: string) {
 function onOpenExemplars({ service }: { service: string }) {
   openService(service)
 }
+
+// Full-mode tenants mirror raw telemetry, so their data is queryable here via the tenant
+// context dimension — drill into the first signal they actually mirror (`full:traces` mirrors no
+// logs, so /logs would be empty). Summary-mode tenants only ever push synthetic health metrics,
+// so there's nothing to browse locally; they link out to the tenant's own UI.
+function openTenant(tenant: TenantSummary) {
+  if (tenant.mode === 'summary') {
+    // No ui_url registered → nothing to open; a '#' tab would just be a blank page.
+    if (tenant.ui_url) window.open(tenant.ui_url, '_blank')
+    return
+  }
+  setTenant(tenant.name)
+  // mode is `full` (all three) or `full:<csv>` — e.g. `full:traces,metrics`.
+  const signals = tenant.mode?.includes(':') ? tenant.mode.slice(tenant.mode.indexOf(':') + 1).split(',') : null
+  const path = !signals || signals.includes('logs') ? '/logs' : signals.includes('traces') ? '/traces' : '/metrics'
+  router.push(correlate({ path }))
+}
 </script>
 
 <template>
   <AppShell active="home" :mock="api.mock" crumb="Home · Overview">
     <main class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4" data-testid="home">
+      <!-- Tenants (federation board) -->
+      <section v-if="tenants.length" data-testid="home-tenants" class="flex flex-col gap-2">
+        <div class="flex items-center justify-between">
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Tenants{{ activeTenant ? ` · ${activeTenant}` : '' }}
+          </h3>
+          <span v-if="activeTenant && allTenants.length > 1" class="text-[11px] text-muted-foreground">
+            {{ allTenants.length - 1 }} more hidden by the tenant filter
+          </span>
+        </div>
+        <!-- Filtered → one full-width strip (a lone grid card leaves 2/3 dead space); else a grid
+             whose column count tracks the card count (max 4/row). -->
+        <div :class="tenantGridClass">
+          <TenantCard v-for="t in tenants" :key="t.name" :tenant="t" :compact="!!activeTenant" @select="openTenant" />
+        </div>
+      </section>
+
       <!-- Cross-world KPI strip -->
       <section class="grid grid-cols-2 gap-3 md:grid-cols-6">
         <StatTile

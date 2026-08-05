@@ -1,7 +1,7 @@
 // One source of truth for cross-signal links. correlate() ALWAYS merges the active time window +
-// scope from context.ts, so no navigation hop can drop context. relatedFor() returns the typed
+// tenant from context.ts, so no navigation hop can drop context. relatedFor() returns the typed
 // destination list per entity kind, dropping any destination whose required field is absent.
-import { timeRange, customRange, scope } from '@/lib/core/context'
+import { timeRange, customRange, tenant } from '@/lib/core/context'
 
 export interface Destination {
   path: string
@@ -20,7 +20,7 @@ export function correlate(dest: Destination): string {
   } else if (timeRange.value) {
     p.set('range', timeRange.value)
   }
-  if (scope.value) p.set('scope', `${scope.value.type}:${scope.value.id}`)
+  if (tenant.value) p.set('tenant', tenant.value)
   const qs = p.toString()
   return path + (qs ? `?${qs}` : '')
 }

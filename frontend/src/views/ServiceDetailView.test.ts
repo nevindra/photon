@@ -11,7 +11,7 @@ import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import ServiceDetailView from './ServiceDetailView.vue'
 import AppShell from '@/components/common/AppShell.vue'
-import { timeRange, customRange, scope, startNs, endNs, setTimeRange } from '@/lib/core/context'
+import { timeRange, customRange, startNs, endNs, setTimeRange } from '@/lib/core/context'
 
 vi.mock('@/lib/core/api', () => ({
   api: {
@@ -51,7 +51,6 @@ describe('ServiceDetailView', () => {
     window.history.replaceState(null, '', '/')
     customRange.value = null
     timeRange.value = '30m'
-    scope.value = null
     vi.clearAllMocks()
   })
 
@@ -59,22 +58,6 @@ describe('ServiceDetailView', () => {
     const { wrapper } = await mountView('/services/checkout')
     await flushPromises()
     expect(wrapper.findComponent(AppShell).props('crumb')).toBe('Backend › checkout')
-    wrapper.unmount()
-  })
-
-  it('scopes the app-wide context to the routed service on mount', async () => {
-    const { wrapper } = await mountView('/services/checkout')
-    await flushPromises()
-    expect(scope.value).toEqual({ type: 'service', id: 'checkout', label: 'checkout' })
-    wrapper.unmount()
-  })
-
-  it('re-scopes when the :service route param changes under the same instance', async () => {
-    const { wrapper, router } = await mountView('/services/checkout')
-    await flushPromises()
-    await router.push('/services/web')
-    await flushPromises()
-    expect(scope.value).toEqual({ type: 'service', id: 'web', label: 'web' })
     wrapper.unmount()
   })
 

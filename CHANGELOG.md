@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-tenant federation: satellite Photon instances report into one central Photon.** Opt-in
+  via a tenant-side `[federation]` config block (`endpoint`, `token`, `mode`, `interval_secs`,
+  `queue_batches`, `signals`; `PHOTON_FEDERATION_*` env overrides; invalid combinations fail
+  startup, not silently). Everything rides the existing OTLP ingest path — no clustering, no new
+  storage engine. See [`docs/subsystems/federation.md`](docs/subsystems/federation.md).
+  - **Summary mode** (default): a background pusher periodically sends a health snapshot as OTLP
+    metrics — liveness (`photon.federation.up`), per-signal ingest rates, open-incident count from
+    the local alert engine, disk usage. Best-effort by design: central being down never affects the
+    tenant's own ingest or UI.
+  - **Full mode**: an ingest-side tee mirrors accepted OTLP batches to central through a bounded
+    queue + forwarder — drop-oldest under backpressure, never on the ack path. The summary pusher
+    runs in this mode too. **`signals`** narrows what full mode mirrors (e.g.
+    `signals = ["traces"]` for services/APM at central without shipping logs); the subset is
+    encoded in the summary's mode attribute (`full:traces`) so central can show what's mirrored.
+  - **Central-side tenant registry** in the control-plane SQLite DB (`GET/POST /api/tenants`,
+    `PATCH/DELETE /api/tenants/:id`, token rotation). A registered tenant gets a `tk_tenant_…`
+    ingest token; ingest resolves it and **server-side stamps** every row with the tenant id —
+    client-supplied tenant attributes are overwritten, so tenants can't spoof each other.
+  - **Fleet UI**: a tenant board on Home fed by the curated `GET /api/tenants/summary` (status:
+    up ≤ 2 min since the last summary, stale ≤ 10 min, down after; ingest sparkline, incidents,
+    disk, mode badge), a `/tenants` registry view, and a manage dialog that emits a copy-paste
+    `[federation]` snippet (summary / full / traces-only presets). `GET /api/federation/status`
+    exposes pusher/forwarder health in the tenant's own UI.
+  - The global context is now **time + federation tenant** — the entity-scope dimension was
+    removed as decorative-only. Picking a tenant filters logs/traces/metrics and the curated
+    services/RED/infra endpoints via the query grammar (`tenant:<id>`).
+
 ## [1.5.0] - 2026-08-04
 
 A **performance release driven by production measurement**, not by benchmarks: every change below

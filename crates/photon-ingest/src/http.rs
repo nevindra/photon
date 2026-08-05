@@ -1,7 +1,7 @@
 //! axum `POST /v1/logs` receiver: token check → protobuf decode → OTLP→`LogRecord` mapping
 //! → WAL append. Decode errors (and auth failures) are rejected before the WAL is touched.
 
-use crate::auth::check_bearer_token;
+use crate::auth::{resolve_bearer, stamp_tenant_logs, Auth};
 use crate::mapping::otlp_logs_into_builder;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -14,6 +14,7 @@ use photon_core::ingest_counters::IngestCounters;
 use photon_core::record::RecordBatchBuilder;
 use photon_core::schema::LogSchema;
 use photon_core::PhotonError;
+use photon_core::TenantTokenMap;
 use photon_wal::Wal;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -28,6 +29,12 @@ pub(crate) struct HttpState<W: Wal + Send + Sync + 'static> {
     pub(crate) in_flight: Arc<Semaphore>,
     /// Cumulative ingest tallies, incremented after a successful WAL append.
     pub(crate) counters: Arc<IngestCounters>,
+    /// Federation: bearer token -> tenant name, consulted when the local token doesn't
+    /// match. Empty on a non-central node, so tenant auth simply never matches.
+    pub(crate) tenant_tokens: TenantTokenMap,
+    /// Federation `full` mode: the raw decoded body is offered here for best-effort
+    /// forwarding to central. `None` on a non-federated node.
+    pub(crate) federation_tee: Option<crate::FederationTee>,
 }
 
 /// Decode a raw protobuf body into an `ExportLogsServiceRequest`. Pure — no I/O — so the
@@ -55,7 +62,8 @@ async fn ingest_logs<W: Wal + Send + Sync + 'static>(
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if !check_bearer_token(auth_header, &state.token) {
+    let auth = resolve_bearer(auth_header, &state.token, &state.tenant_tokens);
+    if auth == Auth::Denied {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
 
@@ -74,13 +82,22 @@ async fn ingest_logs<W: Wal + Send + Sync + 'static>(
         }
     };
 
-    let req = match decode_export_request(&body) {
+    let mut req = match decode_export_request(&body) {
         Ok(req) => req,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // Full-mode federation: mirror the accepted payload to central. `Bytes` clone is a
+    // refcount bump and `offer` is try_send-only, so this never touches the ack path.
+    if let Some(tee) = &state.federation_tee {
+        tee.offer(crate::TeeSignal::Logs, body.clone());
+    }
     // Frees the request buffer before the WAL fsync await; up to `max_body_bytes` (~16 MiB)
     // per in-flight request would otherwise stay pinned for the duration of the append.
     drop(body);
+
+    if let Auth::Tenant(tenant) = &auth {
+        stamp_tenant_logs(&mut req, tenant);
+    }
 
     let mut builder = RecordBatchBuilder::with_capacity(&state.schema, estimate_rows(&req));
     otlp_logs_into_builder(req, &mut builder);
@@ -180,6 +197,8 @@ mod tests {
             schema: LogSchema::new(&["service.name".to_string()]),
             in_flight: Arc::new(Semaphore::new(1)),
             counters: Arc::new(photon_core::ingest_counters::IngestCounters::new()),
+            tenant_tokens: TenantTokenMap::default(),
+            federation_tee: None,
         };
 
         let _first_permit = state
@@ -268,6 +287,115 @@ mod counter_tests {
         Bytes::from(buf)
     }
 
+    /// WAL fake that keeps every appended batch so a test can inspect the mapped columns.
+    #[derive(Default)]
+    struct CapturingWal {
+        batches: std::sync::Mutex<Vec<arrow::record_batch::RecordBatch>>,
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl Wal for CapturingWal {
+        fn append(
+            &self,
+            batch: arrow::record_batch::RecordBatch,
+        ) -> impl std::future::Future<Output = Result<(), PhotonError>> + Send {
+            self.batches.lock().unwrap().push(batch);
+            async move { Ok(()) }
+        }
+        fn sync(&self) -> impl std::future::Future<Output = Result<(), PhotonError>> + Send {
+            async move { unimplemented!("CapturingWal::sync is not exercised by this test") }
+        }
+        fn list_closed_segments(&self) -> Result<Vec<SegmentId>, PhotonError> {
+            unimplemented!("CapturingWal::list_closed_segments is not exercised by this test")
+        }
+        fn read_segment(
+            &self,
+            _id: SegmentId,
+        ) -> impl std::future::Future<
+            Output = Result<Vec<arrow::record_batch::RecordBatch>, PhotonError>,
+        > + Send {
+            async move { unimplemented!("CapturingWal::read_segment is not exercised by this test") }
+        }
+        fn remove_segment(&self, _id: SegmentId) -> Result<(), PhotonError> {
+            unimplemented!("CapturingWal::remove_segment is not exercised by this test")
+        }
+    }
+
+    /// Trust boundary: a request authenticated with a *tenant* token is stamped server-side, and
+    /// the client's own `tenant` label (resource AND record level) never survives.
+    #[tokio::test]
+    async fn tenant_token_stamps_tenant_over_client_label() {
+        use opentelemetry_proto::tonic::common::v1::{any_value::Value, AnyValue, KeyValue};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        fn kv(key: &str, value: &str) -> KeyValue {
+            KeyValue {
+                key: key.to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue(value.to_string())),
+                }),
+            }
+        }
+
+        let tenant_tokens = TenantTokenMap::default();
+        tenant_tokens
+            .write()
+            .unwrap()
+            .insert("tk_tenant_x".into(), "divtik".into());
+
+        let wal = Arc::new(CapturingWal::default());
+        let state = Arc::new(HttpState {
+            wal: wal.clone(),
+            token: "local".to_string(),
+            schema: LogSchema::new(&["service.name".to_string(), "tenant".to_string()]),
+            in_flight: Arc::new(Semaphore::new(4)),
+            counters: Arc::new(IngestCounters::new()),
+            tenant_tokens,
+            federation_tee: None,
+        });
+
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", "api"), kv("tenant", "spoofed")],
+                    dropped_attributes_count: 0,
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![OtlpLogRecord {
+                        time_unix_nano: 1,
+                        attributes: vec![kv("tenant", "spoofed-record")],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let mut buf = Vec::new();
+        <ExportLogsServiceRequest as prost::Message>::encode(&req, &mut buf).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer tk_tenant_x".parse().unwrap(),
+        );
+
+        let resp = ingest_logs::<CapturingWal>(State(state), headers, Bytes::from(buf)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let batches = wal.batches.lock().unwrap();
+        let batch = batches.first().expect("one appended batch");
+        let col = batch
+            .column_by_name("tenant")
+            .expect("tenant is a promoted column here");
+        let tenants = col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(tenants.value(0), "divtik");
+    }
+
     #[tokio::test]
     async fn ingest_logs_advances_the_logs_counter() {
         let counters = Arc::new(IngestCounters::new());
@@ -277,6 +405,8 @@ mod counter_tests {
             schema: LogSchema::new(&["service.name".to_string()]),
             in_flight: Arc::new(Semaphore::new(4)),
             counters: counters.clone(),
+            tenant_tokens: TenantTokenMap::default(),
+            federation_tee: None,
         });
 
         let mut headers = HeaderMap::new();

@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
+import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
+
+vi.mock('@/lib/core/api', () => ({
+  api: { mock: false, tenants: vi.fn().mockResolvedValue({ tenants: [] }) },
+}))
 
 vi.mock('@/lib/uptime/uptimeQueries', () => ({
   useMonitors: () => ({ data: { value: [
@@ -34,7 +39,14 @@ async function mountUptime() {
   await router.isReady()
   return mount(
     { components: { TooltipProvider, UptimeDashboard }, template: '<TooltipProvider><UptimeDashboard /></TooltipProvider>' },
-    { global: { plugins: [router] } },
+    {
+      global: {
+        plugins: [
+          router,
+          [VueQueryPlugin, { queryClient: new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } }) }],
+        ],
+      },
+    },
   )
 }
 
