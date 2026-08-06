@@ -45,7 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`GET /api/rum/apps?tenant=` — distinct `service.name` among `web_vitals.*`; deliberately no
     registry sync), and its `/rum` views become a read-only tenant lens when the tenant context is
     active: the RUM read endpoints gain an optional `q` grammar filter carrying `tenant:<id>`, and
-    app management is hidden under the lens. Uptime remains local-only.
+    app management is hidden under the lens. Uptime remains local-only. Mirrored error records
+    keep their `trace_id`/`span_id` (log→trace correlation works on central when traces are
+    mirrored too), RUM alert rules evaluate over local data only (`-tenant:*`), and
+    `?tenant=<name>` 404s a tenant that isn't in the registry.
+
+### Fixed
+
+- **Home "Traffic & errors" / "Latency" charts (and the Service detail charts) rendered empty**
+  while their corner sparklines showed data: `GET /api/services/:service/timeseries` emitted each
+  bucket's `ts` as a nanosecond *string*, but the UI plots it raw as an epoch-ms number, so every
+  point landed far outside the chart's x-window. The endpoint now serves `ts` as an epoch-ms
+  number (present since v1.0.0).
 
 ## [1.5.0] - 2026-08-04
 
