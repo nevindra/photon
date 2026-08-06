@@ -156,7 +156,7 @@ session-authed management API:
 
 | Route | Purpose |
 |---|---|
-| `GET /api/rum/apps` | list full app records, including the public `key` |
+| `GET /api/rum/apps` | list full app records, including the public `key`; with `?tenant=<name>` (central-side), the names-only list derived from mirrored `web_vitals.*` data instead — fixed 24h lookback, 400 invalid name, 404 unregistered tenant |
 | `POST /api/rum/apps` | register an app; the server mints the `pk_live_<uuid>` key (201; 400 invalid fields; 409 duplicate name) |
 | `PATCH /api/rum/apps/:name` | update `allowed_origins`/`sample_rate`/`rate_limit` (name + key immutable) (200; 404 unknown; 400 invalid) |
 | `POST /api/rum/apps/:name/rotate-key` | mint a fresh key, invalidating the old one (200 `{key}`; 404 unknown) |
@@ -232,18 +232,18 @@ unscored engagement measure, not a rated vital.
 
 | Route | Purpose |
 |---|---|
-| `GET /api/rum/apps` | full app registry records (name/key/allowed_origins/sample_rate/rate_limit/created_at) |
+| `GET /api/rum/apps` | full app registry records (name/key/allowed_origins/sample_rate/rate_limit/created_at); `?tenant=<name>` switches to the names-only tenant-derived list (24h lookback; 400/404 as above) |
 | `POST /api/rum/apps` | register a new app (see "Endpoint & auth" above) |
 | `PATCH /api/rum/apps/:name` | update an app's origins/sampling/rate limit |
 | `POST /api/rum/apps/:name/rotate-key` | rotate an app's public key |
 | `DELETE /api/rum/apps/:name` | unregister an app |
-| `GET /api/rum/vitals` | the vital scorecards — the 5 Core Web Vitals plus `route_change` whenever the window has soft-nav samples (p75 + distribution + trend) |
-| `GET /api/rum/vitals/breakdown` | breakdown table by `dimension` |
-| `GET /api/rum/pages` | pages list |
-| `GET /api/rum/pages/detail` | page detail (vitals + attribution + breakdown + errors) |
+| `GET /api/rum/vitals` | the vital scorecards — the 5 Core Web Vitals plus `route_change` whenever the window has soft-nav samples (p75 + distribution + trend); optional metrics-grammar `q` (e.g. `tenant:<name>`) |
+| `GET /api/rum/vitals/breakdown` | breakdown table by `dimension`; optional metrics-grammar `q` |
+| `GET /api/rum/pages` | pages list; optional metrics-grammar `q` |
+| `GET /api/rum/pages/detail` | page detail (vitals + attribution + breakdown + errors); optional `q` resolved against BOTH grammars (metrics for vitals, logs for errors) — it must be valid in both, so shared fields like `tenant:<name>` work while signal-specific fields 400 |
 | `GET /api/rum/errors` | error issues (grouped by fingerprint); optional `q` log-grammar filter (same syntax as Logs search) — a malformed `q` yields a 400 with a byte `offset` |
 | `GET /api/rum/errors/facets` | top values + counts for each of the 6 fixed facet fields (`exception.type`, `error.kind`, `browser.route`, `browser.name`, `device.type`, `network.connection`), scoped to ERROR rows and optionally the same `q` filter; registered ahead of `:fingerprint` below so axum matches the static segment first |
-| `GET /api/rum/errors/:fingerprint` | issue detail (`rum_error_detail`): header stats + occurrence series + tag breakdowns + sample stack + recent sample events |
+| `GET /api/rum/errors/:fingerprint` | issue detail (`rum_error_detail`): header stats + occurrence series + tag breakdowns + sample stack + recent sample events; optional log-grammar `q` |
 | `POST /api/rum` | **public** ingest beacon (the only unauthenticated, CORS-enabled RUM route) |
 
 ## The SDK — `@photon/rum` (`sdk/rum/`)

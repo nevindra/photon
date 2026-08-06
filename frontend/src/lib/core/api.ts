@@ -912,6 +912,12 @@ function hydrateTraces(traces: any[]): TraceSummary[] {
   })) as TraceSummary[]
 }
 
+// Append a non-blank grammar `q` to a searchParams literal (shared by the RUM read methods).
+function withQ(searchParams: Record<string, string>, q?: string): Record<string, string> {
+  if (q && q.trim()) searchParams.q = q
+  return searchParams
+}
+
 let mockUsers: UserInfo[] = [{ username: 'demo', created_at: Date.now() }]
 
 // Local mutable copy of `mockRetention` (imported `let` bindings from another ES module are
@@ -1542,8 +1548,7 @@ export const api = {
 
   async rumVitals(app: string, startNs: string, endNs: string, opts: RequestOpts = {}, q?: string): Promise<RumVitalsResult> {
     try {
-      const searchParams: Record<string, string> = { app, start: startNs, end: endNs }
-      if (q && q.trim()) searchParams.q = q
+      const searchParams = withQ({ app, start: startNs, end: endNs }, q)
       return await http
         .get('rum/vitals', { searchParams, signal: opts.signal })
         .json<RumVitalsResult>()
@@ -1556,8 +1561,7 @@ export const api = {
 
   async rumBreakdown(app: string, dimension: string, startNs: string, endNs: string, opts: RequestOpts = {}, q?: string): Promise<RumBreakdownResult> {
     try {
-      const searchParams: Record<string, string> = { app, dimension, start: startNs, end: endNs }
-      if (q && q.trim()) searchParams.q = q
+      const searchParams = withQ({ app, dimension, start: startNs, end: endNs }, q)
       return await http
         .get('rum/vitals/breakdown', { searchParams, signal: opts.signal })
         .json<RumBreakdownResult>()
@@ -1570,8 +1574,7 @@ export const api = {
 
   async rumPages(app: string, startNs: string, endNs: string, opts: RequestOpts = {}, q?: string): Promise<RumPagesResult> {
     try {
-      const searchParams: Record<string, string> = { app, start: startNs, end: endNs }
-      if (q && q.trim()) searchParams.q = q
+      const searchParams = withQ({ app, start: startNs, end: endNs }, q)
       return await http
         .get('rum/pages', { searchParams, signal: opts.signal })
         .json<RumPagesResult>()
@@ -1584,8 +1587,7 @@ export const api = {
 
   async rumPageDetail(app: string, route: string, startNs: string, endNs: string, opts: RequestOpts = {}, q?: string): Promise<RumPageDetailResult> {
     try {
-      const searchParams: Record<string, string> = { app, route, start: startNs, end: endNs }
-      if (q && q.trim()) searchParams.q = q
+      const searchParams = withQ({ app, route, start: startNs, end: endNs }, q)
       return await http
         .get('rum/pages/detail', { searchParams, signal: opts.signal })
         .json<RumPageDetailResult>()
@@ -1598,8 +1600,7 @@ export const api = {
 
   async rumErrors(app: string, startNs: string, endNs: string, opts: RequestOpts = {}, q?: string): Promise<RumErrorsResult> {
     try {
-      const searchParams: Record<string, string> = { app, start: startNs, end: endNs }
-      if (q && q.trim()) searchParams.q = q
+      const searchParams = withQ({ app, start: startNs, end: endNs }, q)
       return await http.get('rum/errors', { searchParams, signal: opts.signal }).json<RumErrorsResult>()
     } catch (e: any) {
       if (e.status === 400) throw e
@@ -1610,8 +1611,7 @@ export const api = {
 
   async rumErrorFacets(app: string, q: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<RumErrorFacetsResult> {
     try {
-      const searchParams: Record<string, string> = { app, start: startNs, end: endNs }
-      if (q && q.trim()) searchParams.q = q
+      const searchParams = withQ({ app, start: startNs, end: endNs }, q)
       return await http.get('rum/errors/facets', { searchParams, signal: opts.signal }).json<RumErrorFacetsResult>()
     } catch (e: any) {
       if (e.status === 400) throw e
@@ -1629,8 +1629,7 @@ export const api = {
     q?: string,
   ): Promise<RumErrorDetailResult> {
     try {
-      const searchParams: Record<string, string> = { app, start: startNs, end: endNs }
-      if (q && q.trim()) searchParams.q = q
+      const searchParams = withQ({ app, start: startNs, end: endNs }, q)
       return await http
         .get(`rum/errors/${encodeURIComponent(fingerprint)}`, { searchParams, signal: opts.signal })
         .json<RumErrorDetailResult>()

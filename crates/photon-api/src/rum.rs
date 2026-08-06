@@ -605,11 +605,26 @@ const DERIVED_APPS_WINDOW_NANOS: i64 = 24 * 3600 * 1_000_000_000;
 
 /// `GET /api/rum/apps` — the registered RUM apps (full records; the public `key` is safe to
 /// expose). Empty when nothing is registered yet. With `?tenant=<name>`, returns the names-only
-/// list derived from mirrored `web_vitals.*` data instead (400 on an invalid tenant name).
+/// list derived from mirrored `web_vitals.*` data instead (400 on an invalid tenant name, 404
+/// when the name isn't in the tenant registry).
 pub(crate) async fn apps(State(st): State<AppState>, Query(p): Query<AppsParams>) -> Response {
     if let Some(tenant) = p.tenant.as_deref() {
         if let Err(e) = crate::tenants::validate_tenant_name(tenant) {
             return bad_request(e);
+        }
+        let registered = match st.tenants.as_ref() {
+            Some(t) => match t.list().await {
+                Ok(list) => list.iter().any(|x| x.name == tenant),
+                Err(e) => return err_500(e),
+            },
+            None => false,
+        };
+        if !registered {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("unknown tenant '{tenant}'") })),
+            )
+                .into_response();
         }
         let filter =
             crate::tenants::tenant_metric_filter(tenant, st.metrics_query.promoted_attributes());
@@ -720,7 +735,10 @@ pub(crate) async fn page_detail(
     State(st): State<AppState>,
     Query(p): Query<PageDetailParams>,
 ) -> Response {
-    // `q` is resolved against both schemas: metrics for the vitals reads, logs for the errors.
+    // `q` is resolved against both schemas — metrics for the vitals reads, logs for the errors —
+    // and must be valid in BOTH (400 otherwise). Shared fields like `tenant:<name>` qualify;
+    // signal-specific fields don't. Deliberate: silently applying a filter to only one side
+    // would return half-filtered data.
     let filter = match resolve_metric_q(&st, p.q.as_deref()) {
         Ok(f) => f,
         Err(e) => return e.into_response(),
@@ -1143,6 +1161,30 @@ mod tests {
         crate::test_server().with_rum(Some(rum)).into_router()
     }
 
+    /// Like `router_with_rum`, plus a tenant registry holding one tenant `name`.
+    async fn router_with_rum_and_tenant(name: &str) -> axum::Router {
+        use crate::tenants::{SqliteTenantStore, Tenant, TenantApi, TenantStore};
+        use photon_core::TenantTokenMap;
+        let store = SqliteTenantStore::open_in_memory().unwrap();
+        store
+            .create(&Tenant {
+                name: name.to_string(),
+                token: format!("tk_{name}"),
+                ui_url: None,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        let api = TenantApi::new(Arc::new(store), TenantTokenMap::default())
+            .await
+            .unwrap();
+        let rum = rum_api_with(vec![app()], Arc::new(FakeSink::default())).await;
+        crate::test_server()
+            .with_rum(Some(rum))
+            .with_tenant_store(Some(api))
+            .into_router()
+    }
+
     /// Log in, then GET `uri` with the session cookie; decode the JSON body.
     async fn authed_get(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
         use tower::ServiceExt;
@@ -1395,10 +1437,24 @@ mod tests {
         // vitals for tenant `acme` — the derived branch must return [] instead of the registry
         // records. Name derivation itself is covered by photon-query's
         // `rum_app_names_derives_distinct_services_for_tenant`.
-        let router = router_with_rum().await;
+        let router = router_with_rum_and_tenant("acme").await;
         let (status, v) = authed_get(&router, "/api/rum/apps?tenant=acme").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["apps"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn apps_with_unregistered_tenant_is_404() {
+        // Well-formed name, but not in the tenant registry (nor is any registry attached in the
+        // plain fixture) — must 404, not silently 200 an empty list.
+        let router = router_with_rum_and_tenant("acme").await;
+        let (status, v) = authed_get(&router, "/api/rum/apps?tenant=ghost").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(v["error"].is_string());
+
+        let no_registry = router_with_rum().await;
+        let (status, _) = authed_get(&no_registry, "/api/rum/apps?tenant=acme").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -47,6 +47,20 @@ pub enum TeeSignal {
 }
 
 impl TeeSignal {
+    pub const COUNT: usize = 5;
+
+    /// Stable index into per-signal arrays — an exhaustive match, so adding a variant without
+    /// growing `COUNT`/this mapping is a compile error (no silent discriminant coupling).
+    fn idx(self) -> usize {
+        match self {
+            TeeSignal::Logs => 0,
+            TeeSignal::Traces => 1,
+            TeeSignal::Metrics => 2,
+            TeeSignal::RumVitals => 3,
+            TeeSignal::RumErrors => 4,
+        }
+    }
+
     /// Path segment under `/v1/` this signal is re-POSTed to at central.
     pub fn path(self) -> &'static str {
         match self {
@@ -67,9 +81,9 @@ impl TeeSignal {
 #[derive(Clone)]
 pub struct FederationTee {
     tx: mpsc::Sender<(TeeSignal, Bytes)>,
-    /// Signals this tee mirrors, indexed by `TeeSignal as usize`. A disabled signal is skipped
+    /// Signals this tee mirrors, indexed by `TeeSignal::idx`. A disabled signal is skipped
     /// silently in `offer` — deliberate config, not backpressure, so `dropped` doesn't count it.
-    enabled: [bool; 5],
+    enabled: [bool; TeeSignal::COUNT],
     pub dropped: Arc<AtomicU64>,
 }
 
@@ -93,9 +107,9 @@ impl FederationTee {
         signals: &[TeeSignal],
     ) -> (Self, mpsc::Receiver<(TeeSignal, Bytes)>) {
         let (tx, rx) = mpsc::channel(capacity.max(1));
-        let mut enabled = [false; 5];
+        let mut enabled = [false; TeeSignal::COUNT];
         for s in signals {
-            enabled[*s as usize] = true;
+            enabled[s.idx()] = true;
         }
         (
             FederationTee {
@@ -108,7 +122,7 @@ impl FederationTee {
     }
 
     pub fn offer(&self, signal: TeeSignal, payload: Bytes) {
-        if !self.enabled[signal as usize] {
+        if !self.enabled[signal.idx()] {
             return;
         }
         if self.tx.try_send((signal, payload)).is_err() {

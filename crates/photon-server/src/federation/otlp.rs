@@ -198,8 +198,22 @@ pub fn build_rum_vitals(
     }
 }
 
+/// Lowercase-hex id (the `LogRecord` string form) -> OTLP bytes; empty on malformed/absent.
+fn hex_to_bytes(id: Option<&str>) -> Vec<u8> {
+    let s = id.unwrap_or("");
+    if s.is_empty() || !s.len().is_multiple_of(2) {
+        return Vec::new();
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .unwrap_or_default()
+}
+
 /// Pure reverse-map: locally-stored RUM error log rows -> the OTLP request the full-mode
 /// forwarder POSTs to `{endpoint}/v1/logs`. Attributes ride on the log record; resource empty.
+/// `scope` stays `None` — `beacon_to_log_records` never sets `scope_name`.
 pub fn build_rum_errors(records: &[photon_core::record::LogRecord]) -> ExportLogsServiceRequest {
     let log_records = records
         .iter()
@@ -211,6 +225,8 @@ pub fn build_rum_errors(records: &[photon_core::record::LogRecord]) -> ExportLog
             body: r.body.as_ref().map(|b| AnyValue {
                 value: Some(Value::StringValue(b.clone())),
             }),
+            trace_id: hex_to_bytes(r.trace_id.as_deref()),
+            span_id: hex_to_bytes(r.span_id.as_deref()),
             attributes: r.attributes.iter().map(|(k, v)| kv(k, v)).collect(),
             ..Default::default()
         })
@@ -374,6 +390,8 @@ mod tests {
             severity_number: Some(17),
             severity_text: Some("ERROR".into()),
             body: Some("TypeError: x is undefined".into()),
+            trace_id: Some("0af7651916cd43dd8448eb211c80319c".into()),
+            span_id: Some("b7ad6b7169203331".into()),
             attributes: [
                 ("service.name".to_string(), "shop-web".to_string()),
                 ("rum.fingerprint".to_string(), "abc123".to_string()),
@@ -389,6 +407,8 @@ mod tests {
         assert_eq!(r.severity_number, record.severity_number);
         assert_eq!(r.severity_text, record.severity_text);
         assert_eq!(r.body, record.body);
+        assert_eq!(r.trace_id, record.trace_id);
+        assert_eq!(r.span_id, record.span_id);
         assert_eq!(r.attributes, record.attributes);
     }
 }

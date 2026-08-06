@@ -21,6 +21,7 @@ import { formatNumber, formatCompact } from '@/lib/core/format'
 import { startNs, endNs, tenant } from '@/lib/core/context'
 import { correlate } from '@/lib/core/useCorrelate'
 import { useRumApps, useRumAppsVitals, useRumAppsErrors, useRumAppsPages } from '@/lib/rum/rumQueries'
+import { useTenants } from '@/lib/tenants/tenantsQueries'
 import { fleetKpis, fleetVitals, rankApps, topIssues, slowestRoutes, formatVital, VITAL_FULL } from '@/lib/rum/rumSummary'
 
 const route = useRoute()
@@ -47,6 +48,10 @@ const perApp = computed(() =>
 )
 
 const appsLoading = computed(() => appsQuery.isLoading.value)
+
+// On a central with tenants, an empty *local* registry usually means "pick a tenant", not "onboard".
+const tenantsQuery = useTenants()
+const hasTenants = computed(() => (tenantsQuery.data.value?.tenants ?? []).length > 0)
 
 // --- Rollups (pure helpers) ---
 const kpiData = computed(() => fleetKpis(perApp.value))
@@ -168,8 +173,10 @@ function openRoute({ app, route }) {
         <EmptyState
           title="No RUM apps"
           :description="tenant
-            ? `No mirrored RUM data for tenant ${tenant} in this range.`
-            : 'Instrument a web app with the Photon RUM SDK to see Core Web Vitals here.'"
+            ? `No mirrored RUM data for tenant ${tenant} in the last 24 hours.`
+            : hasTenants
+              ? 'No RUM apps registered on this install. Pick a tenant in the context bar to view its federated RUM, or add a local app.'
+              : 'Instrument a web app with the Photon RUM SDK to see Core Web Vitals here.'"
           class="h-auto"
         />
         <button

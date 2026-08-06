@@ -45,6 +45,18 @@ const SINGLE_BUCKET: usize = 1;
 /// Real apps carry far fewer than this many distinct fingerprints in one window.
 const RUM_ERROR_FINGERPRINT_LIMIT: usize = 10_000;
 
+/// RUM alert rules target the LOCAL app registry, so evaluation excludes mirrored tenant rows —
+/// a tenant app sharing a local app's name would otherwise leak into the same series.
+fn local_only_log_filter(promoted: &[String]) -> Option<ResolvedQuery> {
+    let ast = parse("-tenant:*").ok()?;
+    FieldResolver::new(promoted).resolve(&ast).ok()
+}
+
+fn local_only_metric_filter(promoted: &[String]) -> Option<MetricResolvedQuery> {
+    let ast = parse("-tenant:*").ok()?;
+    MetricFieldResolver::new(promoted).resolve(&ast).ok()
+}
+
 /// The alerts `ConditionSource` implemented over the three query engines. All three derive `Clone`
 /// (Arc-backed manifest/services caches), so owning them by value is cheap — a clone shares the
 /// same caches with the copy handed to `ApiServer`.
@@ -336,7 +348,7 @@ impl EngineConditionSource {
                         now_ns,
                         RUM_ERROR_FINGERPRINT_LIMIT,
                         c.route.as_deref(),
-                        None,
+                        local_only_log_filter(self.logs.promoted_attributes()),
                     )
                     .await?;
                 let total: i64 = issues.iter().map(|i| i.count).sum();
@@ -351,9 +363,10 @@ impl EngineConditionSource {
             | RumKind::VitalFcpP75
             | RumKind::VitalTtfbP75 => {
                 let metric = vital_metric_name(c.kind);
+                let filter = local_only_metric_filter(self.metrics.promoted_attributes());
                 let vitals = self
                     .metrics
-                    .rum_vitals(&c.app_id, start, now_ns, None)
+                    .rum_vitals(&c.app_id, start, now_ns, filter.as_ref())
                     .await?;
                 match vitals.iter().find(|v| v.metric == metric) {
                     Some(v) => Ok(vec![SeriesSample {
