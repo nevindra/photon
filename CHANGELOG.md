@@ -30,7 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Fleet UI**: a tenant board on Home fed by the curated `GET /api/tenants/summary` (status:
     up ≤ 2 min since the last summary, stale ≤ 10 min, down after; ingest sparkline, incidents,
     disk, mode badge), a `/tenants` registry view, and a manage dialog that emits a copy-paste
-    `[federation]` snippet (summary / full / traces-only presets). `GET /api/federation/status`
+    `[federation]` snippet (summary / full / traces-only presets, as TOML or `PHOTON_FEDERATION_*`
+    env vars). `GET /api/federation/status`
     exposes pusher/forwarder health in the tenant's own UI.
   - The global context is now **time + federation tenant** — the entity-scope dimension was
     removed as decorative-only. Picking a tenant filters logs/traces/metrics and the curated

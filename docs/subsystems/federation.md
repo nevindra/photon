@@ -206,7 +206,7 @@ The field catalogs (`logs/fields.ts`, `traces/spanFields.ts`, `metrics/metricFie
 **Frontend (central):**
 - `frontend/src/lib/tenants/tenantsQueries.ts` — API client + TanStack Query composables
 - `frontend/src/components/tenants/TenantCard.vue` — card for Home board
-- `frontend/src/components/tenants/TenantManageDialog.vue` — add/edit dialog (rotate token inside edit; minted/rotated token snippet shown once)
+- `frontend/src/components/tenants/TenantManageDialog.vue` — add/edit dialog (rotate token inside edit; minted/rotated token snippet shown once, copyable as `PHOTON_FEDERATION_*` env vars (default) or `[federation]` TOML)
 - `frontend/src/views/TenantsView.vue` — the `/tenants` page (NavRail Manage group)
 - `frontend/src/components/data/DataTenants.vue` — the registry table (per-row edit/delete actions, "Add tenant" button) rendered by TenantsView
 - `frontend/src/components/data/DataOverview.vue` — federation status strip (tenant-side only, shown when `enabled: true`)
