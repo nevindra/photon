@@ -151,6 +151,38 @@ pub fn spawn_summary_pusher(
     })
 }
 
+/// Wraps the local RUM write path when full mode mirrors `rum`: after a successful local write,
+/// re-encode the rows as OTLP protobuf and offer them to the tee. The tee is `try_send`-only, so
+/// a full queue or disabled signal can never fail or delay the beacon.
+pub struct TeeingRumSink {
+    pub inner: Arc<dyn photon_api::RumSink>,
+    pub tee: photon_ingest::FederationTee,
+}
+
+#[async_trait::async_trait]
+impl photon_api::RumSink for TeeingRumSink {
+    async fn ingest_vitals(
+        &self,
+        points: Vec<photon_core::metric_record::MetricPoint>,
+    ) -> Result<(), photon_core::PhotonError> {
+        // Encode before handing `points` to inner (it takes ownership); offer only on Ok.
+        let payload = bytes::Bytes::from(otlp::build_rum_vitals(&points).encode_to_vec());
+        self.inner.ingest_vitals(points).await?;
+        self.tee.offer(photon_ingest::TeeSignal::RumVitals, payload);
+        Ok(())
+    }
+
+    async fn ingest_errors(
+        &self,
+        records: Vec<photon_core::record::LogRecord>,
+    ) -> Result<(), photon_core::PhotonError> {
+        let payload = bytes::Bytes::from(otlp::build_rum_errors(&records).encode_to_vec());
+        self.inner.ingest_errors(records).await?;
+        self.tee.offer(photon_ingest::TeeSignal::RumErrors, payload);
+        Ok(())
+    }
+}
+
 /// Attempt backoffs for one teed payload. Three attempts total; after the last failure the
 /// payload is dropped (`stats.dropped`) — federation is a best-effort mirror, never a queue we
 /// grow without bound.
@@ -379,5 +411,79 @@ mod forwarder_tests {
         assert_eq!(got.0, "/v1/metrics");
         assert_eq!(got.2, b"recovered");
         assert_eq!(stats.dropped.load(Ordering::Relaxed), 1);
+    }
+
+    /// RUM rides the standard OTLP endpoints: vitals -> /v1/metrics, errors -> /v1/logs.
+    #[tokio::test]
+    async fn rum_signals_land_on_metrics_and_logs_paths() {
+        let (addr, captured, _fail) = stub_central().await;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        spawn_forwarder(cfg(addr), rx, Arc::new(FederationStats::default()));
+
+        tx.send((TeeSignal::RumVitals, Bytes::from_static(b"vitals")))
+            .await
+            .unwrap();
+        tx.send((TeeSignal::RumErrors, Bytes::from_static(b"errors")))
+            .await
+            .unwrap();
+        eventually(|| captured.lock().unwrap().len() == 2).await;
+
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(got[0].0, "/v1/metrics");
+        assert_eq!(got[0].2, b"vitals");
+        assert_eq!(got[1].0, "/v1/logs");
+        assert_eq!(got[1].2, b"errors");
+    }
+}
+
+#[cfg(test)]
+mod teeing_rum_sink_tests {
+    use super::*;
+    use photon_api::RumSink;
+    use photon_ingest::{FederationTee, TeeSignal};
+    use std::sync::atomic::AtomicBool;
+
+    struct FakeSink {
+        fail: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl photon_api::RumSink for FakeSink {
+        async fn ingest_vitals(
+            &self,
+            _points: Vec<photon_core::metric_record::MetricPoint>,
+        ) -> Result<(), photon_core::PhotonError> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(photon_core::PhotonError::Wal("wal down".into()));
+            }
+            Ok(())
+        }
+        async fn ingest_errors(
+            &self,
+            _records: Vec<photon_core::record::LogRecord>,
+        ) -> Result<(), photon_core::PhotonError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tees_only_after_a_successful_local_write() {
+        let (tee, mut rx) = FederationTee::channel(4);
+        let inner = Arc::new(FakeSink {
+            fail: AtomicBool::new(false),
+        });
+        let sink = TeeingRumSink {
+            inner: inner.clone(),
+            tee,
+        };
+
+        sink.ingest_vitals(vec![Default::default()]).await.unwrap();
+        sink.ingest_errors(vec![Default::default()]).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap().0, TeeSignal::RumVitals);
+        assert_eq!(rx.try_recv().unwrap().0, TeeSignal::RumErrors);
+
+        inner.fail.store(true, Ordering::Relaxed);
+        assert!(sink.ingest_vitals(vec![Default::default()]).await.is_err());
+        assert!(rx.try_recv().is_err(), "failed local write must not tee");
     }
 }

@@ -143,12 +143,15 @@ impl QueryEngine {
     /// stack, and the N most-recent sample events (each with its own `trace_id`). Scoped by
     /// `service`, ERROR severity (17–24), the `rum.error.fingerprint` attribute, and the window.
     /// Returns an all-empty detail when nothing survives pruning / the fingerprint has no rows.
+    /// `query`, when `Some`, is a resolved log-grammar filter (e.g. `tenant:<name>`) ANDed on top
+    /// via `base_predicate`, same as [`Self::rum_errors`].
     pub async fn rum_error_detail(
         &self,
         service: &str,
         fingerprint: &str,
         start_ns: i64,
         end_ns: i64,
+        query: Option<ResolvedQuery>,
     ) -> Result<ErrorDetail, PhotonError> {
         let req = QueryRequest {
             start_ts_nanos: start_ns,
@@ -156,7 +159,7 @@ impl QueryEngine {
             services: vec![service.to_string()],
             severities: vec![(17, 24)],
             text: None,
-            query: None,
+            query,
             limit: 0,
         };
         let Some(df) = self.survivors_df(&req).await? else {

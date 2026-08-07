@@ -236,7 +236,7 @@ const catalogQuery = useMetricCatalog(startNs, endNs)
 const metricNames = computed(() => catalogQuery.data.value?.map((m) => m.name) ?? [])
 const servicesQuery = useServices()
 const serviceNames = computed(() => servicesQuery.data.value ?? [])
-const rumAppsQuery = useRumApps()
+const rumAppsQuery = useRumApps({ localOnly: true })
 const rumAppNames = computed(() => (rumAppsQuery.data.value?.apps ?? []).map((a) => a.name))
 
 // --- Unit hints + threshold precision ----------------------------------------------------------

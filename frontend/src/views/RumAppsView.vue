@@ -18,9 +18,10 @@ import { Spinner } from '@/components/ui/spinner'
 import { EmptyState } from '@/components/ui/empty-state'
 import { api } from '@/lib/core/api'
 import { formatNumber, formatCompact } from '@/lib/core/format'
-import { startNs, endNs } from '@/lib/core/context'
+import { startNs, endNs, tenant } from '@/lib/core/context'
 import { correlate } from '@/lib/core/useCorrelate'
 import { useRumApps, useRumAppsVitals, useRumAppsErrors, useRumAppsPages } from '@/lib/rum/rumQueries'
+import { useTenants } from '@/lib/tenants/tenantsQueries'
 import { fleetKpis, fleetVitals, rankApps, topIssues, slowestRoutes, formatVital, VITAL_FULL } from '@/lib/rum/rumSummary'
 
 const route = useRoute()
@@ -47,6 +48,10 @@ const perApp = computed(() =>
 )
 
 const appsLoading = computed(() => appsQuery.isLoading.value)
+
+// On a central with tenants, an empty *local* registry usually means "pick a tenant", not "onboard".
+const tenantsQuery = useTenants()
+const hasTenants = computed(() => (tenantsQuery.data.value?.tenants ?? []).length > 0)
 
 // --- Rollups (pure helpers) ---
 const kpiData = computed(() => fleetKpis(perApp.value))
@@ -167,10 +172,15 @@ function openRoute({ app, route }) {
       <div v-else-if="!apps.length" class="flex flex-1 flex-col items-center justify-center gap-4">
         <EmptyState
           title="No RUM apps"
-          description="Instrument a web app with the Photon RUM SDK to see Core Web Vitals here."
+          :description="tenant
+            ? `No mirrored RUM data for tenant ${tenant} in the last 24 hours.`
+            : hasTenants
+              ? 'No RUM apps registered on this install. Pick a tenant in the context bar to view its federated RUM, or add a local app.'
+              : 'Instrument a web app with the Photon RUM SDK to see Core Web Vitals here.'"
           class="h-auto"
         />
         <button
+          v-if="!tenant"
           type="button"
           class="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
           @click="manageOpen = true"
@@ -180,8 +190,13 @@ function openRoute({ app, route }) {
       </div>
 
       <template v-else>
+        <!-- Tenant lens is read-only: apps are derived from mirrored data, nothing to manage. -->
         <div class="flex items-center justify-end">
+          <span v-if="tenant" data-testid="rum-tenant-hint" class="text-[11px] text-muted-foreground">
+            viewing tenant {{ tenant }}
+          </span>
           <button
+            v-else
             type="button"
             class="rounded-md border border-border px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
             @click="manageOpen = true"
@@ -255,7 +270,7 @@ function openRoute({ app, route }) {
         </section>
       </template>
 
-      <RumManageAppsDialog v-model:open="manageOpen" :apps="appRecords" />
+      <RumManageAppsDialog v-if="!tenant" v-model:open="manageOpen" :apps="appRecords" />
     </main>
   </AppShell>
 </template>

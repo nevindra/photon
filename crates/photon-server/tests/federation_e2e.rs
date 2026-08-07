@@ -16,13 +16,13 @@ use argon2::{Argon2, PasswordHasher};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{any_value::Value, AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber};
 use opentelemetry_proto::tonic::metrics::v1::{
     metric::Data, number_data_point::Value as NumVal, AggregationTemporality, Gauge, Metric,
     NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
 };
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message as _;
@@ -471,6 +471,143 @@ fn federation_summary_request(now_nanos: i64) -> ExportMetricsServiceRequest {
             schema_url: String::new(),
         }],
     }
+}
+
+/// A mirrored RUM vital as the tenant-side forwarder would synthesize it: one `web_vitals.lcp`
+/// gauge whose datapoint attrs carry the app's `service.name` plus a client-spoofed `tenant`
+/// (stripped at ingest; the server-side resource stamp wins).
+fn mirrored_rum_vital_request(now_nanos: i64) -> ExportMetricsServiceRequest {
+    let name = photon_core::rum::metric_name_for("LCP").unwrap();
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![kv("tenant", "cpin")],
+                dropped_attributes_count: 0,
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![gauge_metric(
+                    name,
+                    1234.0,
+                    vec![kv("service.name", "shop-web"), kv("tenant", "cpin")],
+                    now_nanos as u64,
+                )],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+#[tokio::test]
+async fn rum_federation_derived_apps_and_tenant_lens() {
+    let server = spawn_central().await;
+    let client = reqwest::Client::new();
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+
+    let cookie = login(&server, "admin", "admin").await;
+    let create_resp = client
+        .post(server.url("/api/tenants"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "name": "divtik" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), reqwest::StatusCode::CREATED);
+    let tenant_body: serde_json::Value = create_resp.json().await.unwrap();
+    let tenant_token = tenant_body["token"].as_str().unwrap();
+
+    // A mirrored RUM vital pushed with the TENANT token: central must stamp tenant=divtik over
+    // the client-spoofed value on both the resource and the datapoint attrs.
+    let status = client
+        .post(format!("{}/v1/metrics", server.ingest_http_base))
+        .header("content-type", "application/x-protobuf")
+        .header("authorization", format!("Bearer {tenant_token}"))
+        .body(mirrored_rum_vital_request(now_nanos).encode_to_vec())
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, reqwest::StatusCode::OK);
+    compact_metrics(&server).await;
+
+    // (a) The tenant-derived app list surfaces shop-web; the local registry (central runs no RUM
+    // subsystem here) does not.
+    let derived_resp = client
+        .get(server.url("/api/rum/apps?tenant=divtik"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(derived_resp.status().is_success());
+    let derived: serde_json::Value = derived_resp.json().await.unwrap();
+    assert!(
+        derived["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["name"] == "shop-web"),
+        "expected shop-web in the derived app list: {derived}"
+    );
+
+    let local_resp = client
+        .get(server.url("/api/rum/apps"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(local_resp.status().is_success());
+    let local: serde_json::Value = local_resp.json().await.unwrap();
+    assert!(
+        !local["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["name"] == "shop-web"),
+        "the local registry must not contain the derived app: {local}"
+    );
+
+    // (b) The vitals read scoped by the tenant lens sees the datapoint; another tenant does not.
+    let window = |q: &str| {
+        server.url(&format!(
+            "/api/rum/vitals?app=shop-web&start={}&end={}&q={q}",
+            now_nanos - 3_600_000_000_000i64,
+            now_nanos + 3_600_000_000_000i64
+        ))
+    };
+    let vitals_resp = client
+        .get(window("tenant:divtik"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(vitals_resp.status().is_success());
+    let vitals: serde_json::Value = vitals_resp.json().await.unwrap();
+    assert!(
+        vitals["vitals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["metric"] == "web_vitals.lcp"),
+        "expected the mirrored LCP point under tenant:divtik: {vitals}"
+    );
+
+    let other_resp = client
+        .get(window("tenant:other"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(other_resp.status().is_success());
+    let other: serde_json::Value = other_resp.json().await.unwrap();
+    assert_eq!(
+        other["vitals"],
+        serde_json::json!([]),
+        "another tenant's lens must be empty"
+    );
 }
 
 #[tokio::test]
