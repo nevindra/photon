@@ -52,7 +52,7 @@ watch(() => props.open, (o) => { if (o) { target.value = 'service'; selected.val
 
 // --- target selector options ---
 const servicesQuery = useServices()
-const rumAppsQuery = useRumApps()
+const rumAppsQuery = useRumApps({ localOnly: true })
 const hostsQuery = useInfraHosts(startNs, endNs)
 const targetOptions = computed<{ value: string; label: string }[]>(() => {
   const names =

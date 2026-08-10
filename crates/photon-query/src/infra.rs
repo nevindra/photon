@@ -350,11 +350,19 @@ impl MetricsQueryEngine {
         )
         .await?;
         // GPU: worst device AND the mean across devices.
-        self.fill_group_gauge(&mut out, GPU_UTIL, "gpu", start_ns, end_ns, filter, |h, g| {
-            h.gpu_util = Some(g.max);
-            h.gpu_util_avg = Some(g.mean);
-            h.gpu_groups = g.groups;
-        })
+        self.fill_group_gauge(
+            &mut out,
+            GPU_UTIL,
+            "gpu",
+            start_ns,
+            end_ns,
+            filter,
+            |h, g| {
+                h.gpu_util = Some(g.max);
+                h.gpu_util_avg = Some(g.mean);
+                h.gpu_groups = g.groups;
+            },
+        )
         .await?;
 
         Ok(out.into_values().collect())
@@ -1520,7 +1528,10 @@ mod tests {
             .resolve(&ast)
             .unwrap();
 
-        let hosts = engine.infra_hosts(0, i64::MAX, Some(&filter)).await.unwrap();
+        let hosts = engine
+            .infra_hosts(0, i64::MAX, Some(&filter))
+            .await
+            .unwrap();
         assert_eq!(
             hosts.iter().map(|h| h.host.clone()).collect::<Vec<_>>(),
             vec!["host-a".to_string()]

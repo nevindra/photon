@@ -82,7 +82,7 @@ pub(crate) async fn timeseries(
             rows.iter()
                 .map(|b| {
                     json!({
-                        "ts": b.ts.to_string(),
+                        "ts": b.ts / 1_000_000, // bucket start, epoch ms — UI charts plot this raw
                         "rate": b.count as f64 / secs_per_bucket,
                         "error_rate": if b.count > 0 { b.error_count as f64 / b.count as f64 } else { 0.0 },
                         "count": b.count,
@@ -489,12 +489,16 @@ mod tests {
         let app = router_with_data_admin();
         let (s, v) = get(
             &app,
-            "/api/services/web/timeseries?start=0&end=100&buckets=2",
+            "/api/services/web/timeseries?start=0&end=120000000000&buckets=2",
         )
         .await;
         assert_eq!(s, axum::http::StatusCode::OK);
         assert!(v.is_array());
         assert_eq!(v.as_array().unwrap().len(), 2);
+
+        // `ts` must be an epoch-ms NUMBER — the UI plots it raw against a ms x-window.
+        let b1 = &v.as_array().unwrap()[1];
+        assert_eq!(b1["ts"], serde_json::json!(60_000));
 
         let b0 = &v.as_array().unwrap()[0];
         for k in ["ts", "rate", "error_rate", "p50", "p90", "p99", "apdex"] {

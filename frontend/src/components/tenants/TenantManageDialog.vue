@@ -31,6 +31,8 @@ const uiUrl = ref('')
 // and can't set it remotely). This picker exists for discoverability: it drives the generated
 // snippet below so users learn both modes exist.
 const mode = ref<'summary' | 'full' | 'full-traces'>('summary')
+// Field teams deploy with `PHOTON_*` env vars (docker compose), not a toml file — offer both.
+const snippetFormat = ref<'toml' | 'env'>('env')
 const mintedToken = ref<string | null>(null)
 const mintedFor = ref('')
 
@@ -43,6 +45,7 @@ watch(
       name.value = props.tenant?.name ?? ''
       uiUrl.value = props.tenant?.ui_url ?? ''
       mode.value = 'summary'
+      snippetFormat.value = 'env'
     } else {
       mintedToken.value = null
       mintedFor.value = ''
@@ -78,9 +81,24 @@ async function rotate() {
 // central's OTLP *ingest* base URL (`:4318` by default) — NOT this UI's origin, which serves the
 // SPA and would swallow pushes with a 200 — so emit a placeholder host + the default ingest port.
 function fedSnippet(token: string): string {
+  const endpoint = `${location.protocol}//${location.hostname}:4318`
+  if (snippetFormat.value === 'env') {
+    const lines = [
+      "# central's OTLP ingest URL, not the UI origin",
+      `PHOTON_FEDERATION_ENDPOINT=${endpoint}`,
+      `PHOTON_FEDERATION_TOKEN=${token}`,
+    ]
+    if (mode.value === 'summary') {
+      lines.push('PHOTON_FEDERATION_MODE=summary')
+    } else {
+      lines.push('PHOTON_FEDERATION_MODE=full')
+      if (mode.value === 'full-traces') lines.push('PHOTON_FEDERATION_SIGNALS=traces')
+    }
+    return lines.join('\n')
+  }
   const lines = [
     '[federation]',
-    `endpoint = "${location.protocol}//${location.hostname}:4318"   # central's OTLP ingest URL, not the UI origin`,
+    `endpoint = "${endpoint}"   # central's OTLP ingest URL, not the UI origin`,
     `token = "${token}"`,
   ]
   if (mode.value === 'summary') {
@@ -166,7 +184,11 @@ function fedSnippet(token: string): string {
           <p class="text-xs font-medium text-foreground">
             Token for <span class="font-mono">{{ mintedFor }}</span> (shown once — copy it now):
           </p>
-          <div class="flex shrink-0 gap-1">
+          <div class="flex shrink-0 items-center gap-1">
+            <Segmented v-model="snippetFormat" data-testid="tenant-snippet-format" class="h-7">
+              <SegmentedItem value="env" class="px-2 text-xs">Env</SegmentedItem>
+              <SegmentedItem value="toml" class="px-2 text-xs">TOML</SegmentedItem>
+            </Segmented>
             <Button
               type="button"
               variant="outline"

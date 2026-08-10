@@ -117,6 +117,10 @@ everything is UI/SQLite-managed, wired via `photon-server`'s `spawn_alerts`.
 
 ### Data-freshness caveat (accepted for v1)
 
+RUM conditions evaluate **local data only** — `EngineConditionSource` appends a `-tenant:*` filter,
+so mirrored tenant rows never leak into a local app's series even when names collide (RUM rule
+targets come from the local registry).
+
 Metrics/logs/traces/RUM conditions are evaluated by the **query engines**, which read **compacted
 Parquet** — data becomes queryable only after its WAL segment closes and compacts (seconds to
 ~1–2 minutes depending on cadence). These alerts are therefore **near-real-time, not instant**,

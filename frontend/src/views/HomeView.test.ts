@@ -135,6 +135,26 @@ describe('HomeView', () => {
     expect(router.currentRoute.value.path).toBe('/logs')
   })
 
+  // The Frontend/RUM tile follows the active tenant: apps come from the tenant-derived list and
+  // vitals are scoped via the tenant grammar term. The Uptime tile is deliberately untouched.
+  it('scopes the RUM tile to the active tenant', async () => {
+    setTenant('globex')
+    ;(api.rumApps as ReturnType<typeof vi.fn>).mockClear()
+    ;(api.rumVitals as ReturnType<typeof vi.fn>).mockClear()
+    router.push('/home')
+    await router.isReady()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+    const w = mount(
+      { components: { HomeView, TooltipProvider }, template: '<TooltipProvider><HomeView/></TooltipProvider>' },
+      { global: { plugins: [router, [VueQueryPlugin, { queryClient }]] }, attachTo: document.body },
+    )
+    await flushPromises()
+    expect((api.rumApps as ReturnType<typeof vi.fn>).mock.calls[0][1]).toBe('globex')
+    expect((api.rumVitals as ReturnType<typeof vi.fn>).mock.calls[0][4]).toBe('tenant:globex')
+    w.unmount()
+    clearTenant()
+  })
+
   // A subset-mirroring tenant (`full:traces`) deliberately ships no logs — drilling into /logs
   // would land on an empty view, so the card routes to the first signal it actually mirrors.
   it('clicking a full:traces tenant card drills into Traces, not Logs', async () => {

@@ -447,20 +447,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // additionally tees every accepted OTLP batch to central. Absent `[federation]` = fully inert.
     let mut federation_stats_dropped = None;
     let mut federation_rx = None;
+    let mut rum_tee = None;
     if let Some(fed) = cfg
         .federation
         .as_ref()
         .filter(|f| f.mode == FederationMode::Full)
     {
-        // `[federation].signals` narrows what full mode mirrors; absent → all three.
+        // `[federation].signals` narrows what full mode mirrors; absent → all four.
         let tee_signals: Vec<TeeSignal> = match fed.signals.as_deref() {
-            None => vec![TeeSignal::Logs, TeeSignal::Traces, TeeSignal::Metrics],
+            None => vec![
+                TeeSignal::Logs,
+                TeeSignal::Traces,
+                TeeSignal::Metrics,
+                TeeSignal::RumVitals,
+                TeeSignal::RumErrors,
+            ],
             Some(sigs) => sigs
                 .iter()
-                .map(|s| match s {
-                    photon_core::config::FederationSignal::Logs => TeeSignal::Logs,
-                    photon_core::config::FederationSignal::Traces => TeeSignal::Traces,
-                    photon_core::config::FederationSignal::Metrics => TeeSignal::Metrics,
+                .flat_map(|s| match s {
+                    photon_core::config::FederationSignal::Logs => vec![TeeSignal::Logs],
+                    photon_core::config::FederationSignal::Traces => vec![TeeSignal::Traces],
+                    photon_core::config::FederationSignal::Metrics => vec![TeeSignal::Metrics],
+                    photon_core::config::FederationSignal::Rum => {
+                        vec![TeeSignal::RumVitals, TeeSignal::RumErrors]
+                    }
                 })
                 .collect(),
         };
@@ -468,6 +478,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The tee's own drop counter IS the stats counter, so `/api/federation/status` reports
         // queue-full drops and forwarder give-ups as one number.
         federation_stats_dropped = Some(tee.dropped.clone());
+        // The beacon path bypasses OTLP ingest, so RUM mirroring wraps the sink below instead.
+        if tee_signals.contains(&TeeSignal::RumVitals) {
+            rum_tee = Some(tee.clone());
+        }
         ingest.federation_tee = Some(tee);
         federation_rx = Some(rx);
     }
@@ -508,7 +522,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     FederationMode::Full => "full".to_string(),
                 },
                 endpoint: cfg.endpoint.clone(),
-                last_push_ms: stats.last_push_ms.load(std::sync::atomic::Ordering::Relaxed),
+                last_push_ms: stats
+                    .last_push_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 last_error: stats.last_error.lock().unwrap().clone(),
                 pushed: stats.pushed.load(std::sync::atomic::Ordering::Relaxed),
                 dropped: stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
@@ -551,13 +567,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rum_store: Arc<dyn photon_api::rum_apps::RumAppStore> = Arc::new(
             photon_api::rum_apps::SqliteRumAppStore::open(&cfg.storage.db_path)?,
         );
-        let sink: Arc<dyn photon_api::RumSink> = Arc::new(RumWalSink {
+        let mut sink: Arc<dyn photon_api::RumSink> = Arc::new(RumWalSink {
             metrics_wal: metrics_wal.clone(),
             logs_wal: wal.clone(),
             metric_schema: metric_schema.clone(),
             log_schema: schema.clone(),
             counters: counters.clone(),
         });
+        if let Some(tee) = rum_tee.take() {
+            sink = Arc::new(federation::TeeingRumSink { inner: sink, tee });
+        }
         Some(photon_api::RumApi::new(rum_store, sink).await)
     };
 

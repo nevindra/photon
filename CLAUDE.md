@@ -87,7 +87,7 @@ shadcn-vue equivalent) and Lucide icons; package manager is **bun** (never npm �
 lockfile). It is deliberately lean — **Vue Router for top-level routes, but no Pinia** (server state
 lives in **TanStack Query**, a request cache). Time range + federation tenant are **global**,
 module-singleton state in `lib/core/context.ts` (`tenantQueryTerm()` feeds the logs/traces/metrics
-composables' `q`; there is no entity-scope dimension anymore — it was removed as decorative-only),
+— and RUM — composables' `q`; there is no entity-scope dimension anymore — it was removed as decorative-only),
 surfaced by one `ContextBar` mounted once in `AppShell`
 (not per-view, and no longer on `TopBar`); within-view filters (`svc`/`sev`/`q`, plus per-view extras like traces'
 `sort`/`mode`) live in URL params via `lib/core/useUrlState.ts`, which merge-preserves the context
@@ -96,7 +96,8 @@ keys — and a detail view's back button pops to the list's own history entry
 the cross-signal landing dashboard), `/logs`, `/traces` (+ `/traces/:traceId` waterfall), `/services`
 (+ `/services/:service` APM detail), `/metrics` (+ `/metrics/catalog`), `/rum` (+ app-scoped
 sub-routes: `/rum/:appId` vitals, `/pages[/:route]`, `/errors` (search bar + fixed facet panel), and
-`/errors/:fingerprint` issue detail), `/uptime`, `/infra` (+ `/infra/:host` host detail — host/GPU
+`/errors/:fingerprint` issue detail; with a federation tenant active, central's `/rum` becomes a
+read-only tenant lens — apps derived from mirrored data via `?tenant=`, manage UI hidden), `/uptime`, `/infra` (+ `/infra/:host` host detail — host/GPU
 resource monitoring), `/data`, `/alerts` (the cross-signal webhook alert engine — rules over
 metrics/logs/traces/RUM, incidents, notification channels (channels are typed presets: Generic
 Webhook, Discord, Telegram), plus a "Browse templates" quick-setup on-ramp: target-first
@@ -181,6 +182,10 @@ photon-api      axum REST + session auth (argon2, signed cookies) + embedded Vue
 photon-server   the binary: config load, wiring, background-task supervision (3 compactor loops, the
                 alert-engine scheduler, etc.). Optional `federation/` module spawns the summary pusher
                 and full-mode forwarder — both tenant-side; central runs nothing from this module.
+                `[federation].signals` covers four signals (logs/traces/metrics/rum; omit = all
+                four): RUM bypasses the OTLP tee, so the module's `TeeingRumSink` wraps the local
+                RumSink and, per beacon after a successful local write, synthesizes OTLP
+                (vitals→/v1/metrics, errors→/v1/logs) for the same forwarder.
 photon-loadgen  dev-only OTLP/HTTP logs+traces+metrics load generator (its own binary).
 photon-agent    standalone host/GPU resource-metrics agent (its own binary, like photon-loadgen):
                 samples host (sysinfo) + NVIDIA GPU (nvml-wrapper, default-on `gpu` feature), POSTs

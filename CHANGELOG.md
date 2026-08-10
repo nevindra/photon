@@ -30,11 +30,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Fleet UI**: a tenant board on Home fed by the curated `GET /api/tenants/summary` (status:
     up ≤ 2 min since the last summary, stale ≤ 10 min, down after; ingest sparkline, incidents,
     disk, mode badge), a `/tenants` registry view, and a manage dialog that emits a copy-paste
-    `[federation]` snippet (summary / full / traces-only presets). `GET /api/federation/status`
+    `[federation]` snippet (summary / full / traces-only presets, as TOML or `PHOTON_FEDERATION_*`
+    env vars). `GET /api/federation/status`
     exposes pusher/forwarder health in the tenant's own UI.
   - The global context is now **time + federation tenant** — the entity-scope dimension was
     removed as decorative-only. Picking a tenant filters logs/traces/metrics and the curated
     services/RED/infra endpoints via the query grammar (`tenant:<id>`).
+  - **RUM federation**: RUM is its own federation signal — `signals` may include `"rum"`, and
+    **omitting `signals` in full mode now mirrors all four signals** (logs, traces, metrics, rum;
+    previously all three — set an explicit subset to keep the old behavior). The browser beacon
+    bypasses the OTLP tee, so the tenant side wraps the local RUM write path (`TeeingRumSink`):
+    after each successful local write it synthesizes OTLP protobuf per beacon (no batching) and
+    offers it to the existing tee — vitals to `/v1/metrics`, errors to `/v1/logs` — encoded in the
+    summary mode attribute (`full:traces,rum`). Central derives tenant apps from the mirrored data
+    (`GET /api/rum/apps?tenant=` — distinct `service.name` among `web_vitals.*`; deliberately no
+    registry sync), and its `/rum` views become a read-only tenant lens when the tenant context is
+    active: the RUM read endpoints gain an optional `q` grammar filter carrying `tenant:<id>`, and
+    app management is hidden under the lens. Uptime remains local-only. Mirrored error records
+    keep their `trace_id`/`span_id` (log→trace correlation works on central when traces are
+    mirrored too), RUM alert rules evaluate over local data only (`-tenant:*`), and
+    `?tenant=<name>` 404s a tenant that isn't in the registry.
+
+### Fixed
+
+- **Home "Traffic & errors" / "Latency" charts (and the Service detail charts) rendered empty**
+  while their corner sparklines showed data: `GET /api/services/:service/timeseries` emitted each
+  bucket's `ts` as a nanosecond *string*, but the UI plots it raw as an epoch-ms number, so every
+  point landed far outside the chart's x-window. The endpoint now serves `ts` as an epoch-ms
+  number (present since v1.0.0).
 
 ## [1.5.0] - 2026-08-04
 

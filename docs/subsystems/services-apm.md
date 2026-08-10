@@ -21,7 +21,7 @@ from trace spans** — there is no separate storage; the computation is in `Span
 | Route | Purpose |
 |---|---|
 | `GET /api/red` | RED table (per service / operation) |
-| `GET /api/services/:service/timeseries` | per-service RED time series + Apdex bands |
+| `GET /api/services/:service/timeseries` | per-service RED time series + Apdex bands — each bucket's `ts` is an epoch-**ms** number (the UI plots it raw); percentiles stay ns strings |
 | `GET /api/services/:service/dependencies` | downstream DB/external rollups |
 | `GET/PUT/DELETE /api/services/:service/settings` | per-service Apdex threshold override |
 

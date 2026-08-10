@@ -8,7 +8,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
-import { startNs, endNs, customRange, setTimeRange } from '@/lib/core/context'
+import { startNs, endNs, customRange, setTimeRange, setTenant, clearTenant } from '@/lib/core/context'
 import RumAppsView from './RumAppsView.vue'
 
 const t = ([goodMax, poorMin]: [number, number]) => ({ good_max: goodMax, poor_min: poorMin })
@@ -88,6 +88,7 @@ describe('RumAppsView (executive summary)', () => {
     window.history.replaceState(null, '', '/')
     customRange.value = null
     setTimeRange('30m')
+    clearTenant()
   })
 
   it('mounts, shows the KPI strip, and ranks one row per app', async () => {
@@ -127,6 +128,27 @@ describe('RumAppsView (executive summary)', () => {
     expect(push).toHaveBeenCalledWith(expect.stringContaining('/rum/web-storefront'))
     expect(push).toHaveBeenCalledWith(expect.stringContaining('range=30m'))
     wrapper.unmount()
+  })
+
+  // Central-side tenant lens: apps are derived from mirrored data (names-only), every read query
+  // is tenant-scoped via the grammar `q`, and all manage affordances disappear.
+  describe('tenant lens (read-only)', () => {
+    it('fetches apps with the tenant param, scopes reads via q, and hides manage', async () => {
+      const { api } = await import('@/lib/core/api')
+      setTenant('globex')
+      vi.mocked(api.rumApps).mockClear()
+      vi.mocked(api.rumVitals).mockClear()
+      const { wrapper } = await mountSummary()
+      await flushPromises()
+      expect(vi.mocked(api.rumApps).mock.calls[0][1]).toBe('globex')
+      // Every fan-out read carries the tenant grammar term as `q`.
+      expect(vi.mocked(api.rumVitals).mock.calls[0][4]).toBe('tenant:globex')
+      // Read-only lens: no manage entry point, a hint instead.
+      expect(wrapper.text()).not.toContain('Manage apps')
+      expect(wrapper.get('[data-testid="rum-tenant-hint"]').text()).toContain('viewing tenant globex')
+      wrapper.unmount()
+      clearTenant()
+    })
   })
 
   // The service → "RUM app" pivot (`/rum?app=<service>`). RUM apps and backend services share no

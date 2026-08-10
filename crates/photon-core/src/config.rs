@@ -267,7 +267,7 @@ pub struct FederationConfig {
     pub token: String,
     #[serde(default)]
     pub mode: FederationMode,
-    /// Which signals full mode mirrors. `None` → all three. Only valid with `mode = "full"` —
+    /// Which signals full mode mirrors. `None` → all four. Only valid with `mode = "full"` —
     /// summary mirrors nothing, so `signals` under summary is a config error, not a silent no-op.
     #[serde(default)]
     pub signals: Option<Vec<FederationSignal>>,
@@ -292,19 +292,22 @@ pub enum FederationSignal {
     Logs,
     Traces,
     Metrics,
+    Rum,
 }
 
 impl FederationSignal {
-    pub const ALL: [FederationSignal; 3] = [
+    pub const ALL: [FederationSignal; 4] = [
         FederationSignal::Logs,
         FederationSignal::Traces,
         FederationSignal::Metrics,
+        FederationSignal::Rum,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
             FederationSignal::Logs => "logs",
             FederationSignal::Traces => "traces",
             FederationSignal::Metrics => "metrics",
+            FederationSignal::Rum => "rum",
         }
     }
 }
@@ -422,8 +425,7 @@ impl Config {
         // Federation: presence of the endpoint is the toggle, same pattern as
         // `[storage.durable]` above. token is then required (env, or inherited from a base
         // file's `[federation]`); mode/interval/queue_batches are optional overrides.
-        if let Some(endpoint) = get("PHOTON_FEDERATION_ENDPOINT").filter(|e| !e.trim().is_empty())
-        {
+        if let Some(endpoint) = get("PHOTON_FEDERATION_ENDPOINT").filter(|e| !e.trim().is_empty()) {
             let existing = self.federation.as_ref();
             let token = get("PHOTON_FEDERATION_TOKEN")
                 .or_else(|| existing.map(|f| f.token.clone()))
@@ -466,6 +468,7 @@ impl Config {
                             "logs" => Ok(FederationSignal::Logs),
                             "traces" => Ok(FederationSignal::Traces),
                             "metrics" => Ok(FederationSignal::Metrics),
+                            "rum" => Ok(FederationSignal::Rum),
                             other => Err(PhotonError::Config(format!(
                                 "invalid value in PHOTON_FEDERATION_SIGNALS: {other:?}"
                             ))),
@@ -999,8 +1002,7 @@ session_secret = "a-long-random-session-signing-secret"
 
     #[test]
     fn federation_rejects_empty_endpoint() {
-        let with_federation =
-            format!("{VALID}\n[federation]\nendpoint = \"\"\ntoken = \"t\"\n");
+        let with_federation = format!("{VALID}\n[federation]\nendpoint = \"\"\ntoken = \"t\"\n");
         let err = Config::from_toml_str(&with_federation).unwrap_err();
         assert!(err.to_string().contains("federation"));
     }
@@ -1008,10 +1010,13 @@ session_secret = "a-long-random-session-signing-secret"
     #[test]
     fn federation_signals_subset_parses_under_full() {
         let toml = format!(
-            "{VALID}\n[federation]\nendpoint = \"https://c\"\ntoken = \"tk\"\nmode = \"full\"\nsignals = [\"traces\"]\n"
+            "{VALID}\n[federation]\nendpoint = \"https://c\"\ntoken = \"tk\"\nmode = \"full\"\nsignals = [\"traces\", \"rum\"]\n"
         );
         let f = Config::from_toml_str(&toml).unwrap().federation.unwrap();
-        assert_eq!(f.signals, Some(vec![FederationSignal::Traces]));
+        assert_eq!(
+            f.signals,
+            Some(vec![FederationSignal::Traces, FederationSignal::Rum])
+        );
     }
 
     #[test]
@@ -1028,11 +1033,24 @@ session_secret = "a-long-random-session-signing-secret"
         let empty = format!(
             "{VALID}\n[federation]\nendpoint = \"https://c\"\ntoken = \"tk\"\nmode = \"full\"\nsignals = []\n"
         );
-        assert!(Config::from_toml_str(&empty).unwrap_err().to_string().contains("must not be empty"));
+        assert!(Config::from_toml_str(&empty)
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
         let dup = format!(
             "{VALID}\n[federation]\nendpoint = \"https://c\"\ntoken = \"tk\"\nmode = \"full\"\nsignals = [\"traces\", \"traces\"]\n"
         );
-        assert!(Config::from_toml_str(&dup).unwrap_err().to_string().contains("duplicate"));
+        assert!(Config::from_toml_str(&dup)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+        let dup_rum = format!(
+            "{VALID}\n[federation]\nendpoint = \"https://c\"\ntoken = \"tk\"\nmode = \"full\"\nsignals = [\"rum\", \"rum\"]\n"
+        );
+        assert!(Config::from_toml_str(&dup_rum)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
     }
 
     #[test]
@@ -1042,12 +1060,16 @@ session_secret = "a-long-random-session-signing-secret"
             ("PHOTON_FEDERATION_ENDPOINT", "https://c"),
             ("PHOTON_FEDERATION_TOKEN", "tk"),
             ("PHOTON_FEDERATION_MODE", "full"),
-            ("PHOTON_FEDERATION_SIGNALS", "traces, metrics"),
+            ("PHOTON_FEDERATION_SIGNALS", "traces, metrics, rum"),
         ]);
         cfg.apply_env_overrides(&env).unwrap();
         assert_eq!(
             cfg.federation.unwrap().signals,
-            Some(vec![FederationSignal::Traces, FederationSignal::Metrics])
+            Some(vec![
+                FederationSignal::Traces,
+                FederationSignal::Metrics,
+                FederationSignal::Rum
+            ])
         );
     }
 

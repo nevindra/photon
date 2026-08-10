@@ -16,6 +16,7 @@ use datafusion::functions_aggregate::expr_fn::{approx_percentile_cont, avg, coun
 use datafusion::prelude::{col, lit, when, Expr};
 
 use photon_core::metric_schema;
+use photon_core::query::MetricResolvedQuery;
 use photon_core::rum::{
     thresholds, ATTR_LCP_ELEMENT, ATTR_ROUTE, ATTR_SERVICE, METRIC_LCP_ELEMENT_RENDER_DELAY,
     METRIC_LCP_RESOURCE_LOAD_DELAY, METRIC_LCP_RESOURCE_LOAD_TIME, METRIC_LCP_TTFB,
@@ -136,12 +137,15 @@ fn attribution_predicate(req: &MetricRequest, service: &str, route: Option<&str>
 impl MetricsQueryEngine {
     /// Per-vital p75 + good/needs/poor rating distribution for `service` over `[start_ns, end_ns]`.
     /// One global aggregate per vital name; vitals with no samples in the window are omitted (as
-    /// they already are once pruning drops files whose bloom lacks the metric).
+    /// they already are once pruning drops files whose bloom lacks the metric). `filter`, when
+    /// `Some`, is a resolved metrics-grammar query ANDed on top (e.g. the central tenant lens's
+    /// `tenant:<name>`) via `metric_base_predicate`.
     pub async fn rum_vitals(
         &self,
         service: &str,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<Vec<VitalSummary>, PhotonError> {
         let mut out = Vec::new();
         for name in VITALS {
@@ -151,7 +155,7 @@ impl MetricsQueryEngine {
                 metric: name.to_string(),
                 start_ts_nanos: start_ns,
                 end_ts_nanos: end_ns,
-                filter: None,
+                filter: filter.cloned(),
                 host: None,
             };
             let Some(df) = self.survivors_df(&req).await? else {
@@ -219,7 +223,8 @@ impl MetricsQueryEngine {
     ///
     /// `route`, when `Some(r)`, scopes every group to rows whose `browser.route` attribute equals
     /// `r` — used by the page-detail view to break a single page down by another dimension (e.g.
-    /// device). `None` leaves the breakdown app-wide.
+    /// device). `None` leaves the breakdown app-wide. `filter` is ANDed on top like
+    /// [`Self::rum_vitals`]'s.
     pub async fn rum_breakdown(
         &self,
         service: &str,
@@ -227,6 +232,7 @@ impl MetricsQueryEngine {
         start_ns: i64,
         end_ns: i64,
         route: Option<&str>,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<Vec<BreakdownRow>, PhotonError> {
         // Resolve the single grouping dimension to a column Expr (promoted col or attributes[key]).
         let dim = self
@@ -252,7 +258,7 @@ impl MetricsQueryEngine {
                 metric: name.to_string(),
                 start_ts_nanos: start_ns,
                 end_ts_nanos: end_ns,
-                filter: None,
+                filter: filter.cloned(),
                 host: None,
             };
             let Some(df) = self.survivors_df(&req).await? else {
@@ -345,10 +351,11 @@ impl MetricsQueryEngine {
         route: Option<&str>,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<LcpAttribution, PhotonError> {
         Ok(LcpAttribution {
             ttfb: self
-                .avg_lcp_subpart(METRIC_LCP_TTFB, service, route, start_ns, end_ns)
+                .avg_lcp_subpart(METRIC_LCP_TTFB, service, route, start_ns, end_ns, filter)
                 .await?,
             resource_load_delay: self
                 .avg_lcp_subpart(
@@ -357,6 +364,7 @@ impl MetricsQueryEngine {
                     route,
                     start_ns,
                     end_ns,
+                    filter,
                 )
                 .await?,
             resource_load_time: self
@@ -366,6 +374,7 @@ impl MetricsQueryEngine {
                     route,
                     start_ns,
                     end_ns,
+                    filter,
                 )
                 .await?,
             element_render_delay: self
@@ -375,12 +384,58 @@ impl MetricsQueryEngine {
                     route,
                     start_ns,
                     end_ns,
+                    filter,
                 )
                 .await?,
             top_element: self
-                .top_lcp_element(service, route, start_ns, end_ns)
+                .top_lcp_element(service, route, start_ns, end_ns, filter)
                 .await?,
         })
+    }
+
+    /// Distinct `service.name` values among the web-vitals gauges matching `filter` over the
+    /// window — derives a tenant's app list from mirrored data (the central tenant lens has no
+    /// registry sync; `filter` is typically `tenant:<name>`). Sorted, deduped across all vitals.
+    pub async fn rum_app_names(
+        &self,
+        filter: Option<&MetricResolvedQuery>,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Vec<String>, PhotonError> {
+        let mut names = std::collections::BTreeSet::new();
+        for name in VITALS {
+            let req = MetricRequest {
+                metric: name.to_string(),
+                start_ts_nanos: start_ns,
+                end_ts_nanos: end_ns,
+                filter: filter.cloned(),
+                host: None,
+            };
+            let Some(df) = self.survivors_df(&req).await? else {
+                continue;
+            };
+            let batches = df
+                .filter(metric_base_predicate(&req))
+                .map_err(|e| PhotonError::Query(format!("rum_app_names filter: {e}")))?
+                .aggregate(vec![col_ref(ATTR_SERVICE).alias("s")], vec![])
+                .map_err(|e| PhotonError::Query(format!("rum_app_names aggregate: {e}")))?
+                .collect()
+                .await
+                .map_err(|e| PhotonError::Query(format!("rum_app_names collect: {e}")))?;
+            for b in &batches {
+                let svcs = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| PhotonError::Query("rum_app_names: service not Utf8".into()))?;
+                for i in 0..b.num_rows() {
+                    if !svcs.is_null(i) {
+                        names.insert(svcs.value(i).to_string());
+                    }
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
     }
 
     /// AVG of one LCP sub-part gauge (`metric`) for `service` (+ optional `route`). `None` when the
@@ -392,12 +447,13 @@ impl MetricsQueryEngine {
         route: Option<&str>,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<Option<f64>, PhotonError> {
         let req = MetricRequest {
             metric: metric.to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: None,
         };
         let Some(df) = self.survivors_df(&req).await? else {
@@ -431,12 +487,13 @@ impl MetricsQueryEngine {
         route: Option<&str>,
         start_ns: i64,
         end_ns: i64,
+        filter: Option<&MetricResolvedQuery>,
     ) -> Result<Option<String>, PhotonError> {
         let req = MetricRequest {
             metric: "web_vitals.lcp".to_string(),
             start_ts_nanos: start_ns,
             end_ts_nanos: end_ns,
-            filter: None,
+            filter: filter.cloned(),
             host: None,
         };
         let Some(df) = self.survivors_df(&req).await? else {
@@ -521,7 +578,7 @@ mod tests {
             vp("web_vitals.lcp", "web", "desktop", 3000.0),
             vp("web_vitals.lcp", "web", "mobile", 4300.0),
         ]);
-        let out = engine.rum_vitals("web", 0, i64::MAX).await.unwrap();
+        let out = engine.rum_vitals("web", 0, i64::MAX, None).await.unwrap();
         let lcp = out.iter().find(|v| v.metric == "web_vitals.lcp").unwrap();
         // p75 is a t-digest approximation over 4 points; assert it lands in the upper region of
         // the distribution (pulled up past 3000 by the 4300 tail) rather than pinning an exact
@@ -550,7 +607,7 @@ mod tests {
             vp("web_vitals.route_change", "web", "mobile", 800.0),
             vp("web_vitals.route_change", "web", "mobile", 2500.0),
         ]);
-        let out = engine.rum_vitals("web", 0, i64::MAX).await.unwrap();
+        let out = engine.rum_vitals("web", 0, i64::MAX, None).await.unwrap();
         let rc = out
             .iter()
             .find(|v| v.metric == "web_vitals.route_change")
@@ -570,7 +627,7 @@ mod tests {
             vp("web_vitals.lcp", "web", "desktop", 2000.0),
         ]);
         let rows = engine
-            .rum_breakdown("web", "device.type", 0, i64::MAX, None)
+            .rum_breakdown("web", "device.type", 0, i64::MAX, None, None)
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
@@ -602,7 +659,7 @@ mod tests {
         ]);
         // No route filter: both pages' devices show up (mobile appears on both routes).
         let all = engine
-            .rum_breakdown("web", "device.type", 0, i64::MAX, None)
+            .rum_breakdown("web", "device.type", 0, i64::MAX, None, None)
             .await
             .unwrap();
         let mobile_all = all.iter().find(|r| r.key == "mobile").unwrap();
@@ -610,7 +667,7 @@ mod tests {
 
         // Scoped to `/checkout`: only its two rows are counted; /home's mobile row is excluded.
         let scoped = engine
-            .rum_breakdown("web", "device.type", 0, i64::MAX, Some("/checkout"))
+            .rum_breakdown("web", "device.type", 0, i64::MAX, Some("/checkout"), None)
             .await
             .unwrap();
         assert_eq!(scoped.len(), 2); // mobile + desktop, both on /checkout
@@ -651,7 +708,7 @@ mod tests {
             ),
         ]);
         let rows = engine
-            .rum_breakdown("web", "browser.route", 0, i64::MAX, None)
+            .rum_breakdown("web", "browser.route", 0, i64::MAX, None, None)
             .await
             .unwrap();
 
@@ -669,6 +726,58 @@ mod tests {
         let home = rows.iter().find(|r| r.key == "/home").unwrap();
         assert_eq!(home.pageviews, 1);
         assert!(home.lcp_p75.is_some());
+    }
+
+    /// Resolve a metrics-grammar string against the test schema (`service.name` promoted).
+    fn metric_filter(q: &str) -> MetricResolvedQuery {
+        use photon_core::query::{parse, MetricFieldResolver};
+        MetricFieldResolver::new(&["service.name".to_string()])
+            .resolve(&parse(q).unwrap())
+            .unwrap()
+    }
+
+    /// A web-vitals point stamped with a `tenant` attribute (as the federation forwarder does).
+    fn vp_tenant(name: &str, service: &str, tenant: &str, value: f64) -> MetricPoint {
+        let mut p = vp(name, service, "mobile", value);
+        p.attributes
+            .insert("tenant".to_string(), tenant.to_string());
+        p
+    }
+
+    #[tokio::test]
+    async fn vitals_filter_scopes_to_tenant_attribute() {
+        // Same app name on two tenants — the filter is what disambiguates.
+        let engine = engine_with_points(vec![
+            vp_tenant("web_vitals.lcp", "web", "acme", 2000.0),
+            vp_tenant("web_vitals.lcp", "web", "acme", 2100.0),
+            vp_tenant("web_vitals.lcp", "web", "initech", 5000.0),
+        ]);
+        let f = metric_filter("tenant:acme");
+        let out = engine
+            .rum_vitals("web", 0, i64::MAX, Some(&f))
+            .await
+            .unwrap();
+        let lcp = out.iter().find(|v| v.metric == "web_vitals.lcp").unwrap();
+        assert_eq!(lcp.count, 2); // initech's 5000 excluded
+        assert_eq!(lcp.poor, 0);
+
+        // Unfiltered, all three rows count.
+        let all = engine.rum_vitals("web", 0, i64::MAX, None).await.unwrap();
+        assert_eq!(all[0].count, 3);
+    }
+
+    #[tokio::test]
+    async fn rum_app_names_derives_distinct_services_for_tenant() {
+        let engine = engine_with_points(vec![
+            vp_tenant("web_vitals.lcp", "storefront", "acme", 2000.0),
+            vp_tenant("web_vitals.cls", "storefront", "acme", 0.05),
+            vp_tenant("web_vitals.lcp", "admin", "acme", 2000.0),
+            vp_tenant("web_vitals.lcp", "other-app", "initech", 2000.0),
+            vp("web_vitals.lcp", "local-app", "mobile", 2000.0), // no tenant attr
+        ]);
+        let f = metric_filter("tenant:acme");
+        let names = engine.rum_app_names(Some(&f), 0, i64::MAX).await.unwrap();
+        assert_eq!(names, vec!["admin".to_string(), "storefront".to_string()]);
     }
 
     // ---- Task F2: LCP attribution ---------------------------------------------------------
@@ -710,7 +819,7 @@ mod tests {
             mp("web_vitals.lcp.element_render_delay", "web", 50.0, &[]),
         ]);
         let a = engine
-            .rum_lcp_attribution("web", None, 0, i64::MAX)
+            .rum_lcp_attribution("web", None, 0, i64::MAX, None)
             .await
             .unwrap();
         assert_eq!(a.ttfb, Some(150.0));
@@ -725,7 +834,7 @@ mod tests {
         // Only a main LCP point (no `lcp.element`, no sub-part gauges) → all sub-parts + element None.
         let engine = engine_with_points(vec![mp("web_vitals.lcp", "web", 3000.0, &[])]);
         let a = engine
-            .rum_lcp_attribution("web", None, 0, i64::MAX)
+            .rum_lcp_attribution("web", None, 0, i64::MAX, None)
             .await
             .unwrap();
         assert_eq!(a, LcpAttribution::default());
@@ -774,7 +883,7 @@ mod tests {
             ),
         ]);
         let a = engine
-            .rum_lcp_attribution("web", Some("/checkout"), 0, i64::MAX)
+            .rum_lcp_attribution("web", Some("/checkout"), 0, i64::MAX, None)
             .await
             .unwrap();
         assert_eq!(a.ttfb, Some(200.0)); // only /checkout's {100,300}, not /home's 20

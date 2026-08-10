@@ -54,7 +54,16 @@ describe('DataTenants', () => {
     form.dispatchEvent(new Event('submit', { cancelable: true }))
     await flushPromises()
 
+    // Default snippet format is env vars (field teams deploy with docker compose, not toml).
     expect(document.body.textContent).toContain('tk_tenant_mock_divtik')
+    expect(document.body.textContent).toContain('PHOTON_FEDERATION_ENDPOINT=')
+    expect(document.body.textContent).toContain('PHOTON_FEDERATION_MODE=summary')
+    expect(document.body.textContent).not.toContain('[federation]')
+
+    // The TOML toggle re-renders the snippet as a `[federation]` block.
+    const fmt = Array.from(document.body.querySelectorAll('[data-testid="tenant-snippet-format"] button'))
+    ;(fmt.find((b) => b.textContent?.trim() === 'TOML') as HTMLButtonElement).click()
+    await flushPromises()
     expect(document.body.textContent).toContain('[federation]')
     expect(document.body.textContent).toContain(':4318')
     expect(document.body.textContent).toContain('mode = "summary"')
@@ -69,6 +78,15 @@ describe('DataTenants', () => {
     ;(segs.find((b) => b.textContent?.includes('Traces only')) as HTMLButtonElement).click()
     await flushPromises()
     expect(document.body.textContent).toContain('signals = ["traces"]')
+
+    // Env format follows the mode picker too (still traces-only here).
+    ;(fmt.find((b) => b.textContent?.trim() === 'Env') as HTMLButtonElement).click()
+    await flushPromises()
+    expect(document.body.textContent).toContain('PHOTON_FEDERATION_TOKEN=tk_tenant_mock_divtik')
+    expect(document.body.textContent).toContain('PHOTON_FEDERATION_MODE=full')
+    expect(document.body.textContent).toContain('PHOTON_FEDERATION_SIGNALS=traces')
+    ;(fmt.find((b) => b.textContent?.trim() === 'TOML') as HTMLButtonElement).click()
+    await flushPromises()
 
     // Copy buttons on the minted panel put the secret / snippet on the clipboard.
     const writeText = vi.fn().mockResolvedValue(undefined)
@@ -134,6 +152,6 @@ describe('DataTenants', () => {
     ;(document.body.querySelector('[data-testid="tenant-rotate"]') as HTMLButtonElement).click()
     await flushPromises()
     expect(document.body.textContent).toContain('tk_tenant_rotated')
-    expect(document.body.textContent).toContain('[federation]')
+    expect(document.body.textContent).toContain('PHOTON_FEDERATION_TOKEN=tk_tenant_rotated')
   })
 })

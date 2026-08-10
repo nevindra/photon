@@ -260,8 +260,11 @@ backend can't be silently replaced with demo data.
   `GET /api/infra/hosts/:host/timeseries?resource=cpu\|memory\|disk\|network\|gpu\|gpu_memory\|gpu_temp\|gpu_power\|load`
   — see [`subsystems/infra.md`](subsystems/infra.md).
 - **RUM (read):** `GET /api/rum/apps|vitals|vitals/breakdown|pages|pages/detail|errors|errors/facets|errors/:fingerprint`
-  (`errors` and `errors/facets` accept an optional `q` log-grammar filter, same syntax as Logs search;
-  `GET /api/rum/apps` now returns the full app registry records, including the public `key`).
+  (all read endpoints accept an optional `q` grammar filter — log grammar on the error routes,
+  metrics grammar on the vitals/breakdown/pages routes; the UI's federation tenant filter.
+  `GET /api/rum/apps` returns the full app registry records, including the public `key`; with
+  `?tenant=<name>` it instead derives a names-only app list from mirrored `web_vitals.*` data —
+  central's read-only tenant lens, no registry sync).
 - **RUM (app registry, session-authed):** `POST /api/rum/apps` (register; server mints the key),
   `PATCH /api/rum/apps/:name` (update origins/sampling/rate limit), `POST
   /api/rum/apps/:name/rotate-key` (mint a fresh key), `DELETE /api/rum/apps/:name` (unregister).
