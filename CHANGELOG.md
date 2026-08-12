@@ -5,7 +5,20 @@ All notable changes to Photon are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.6.0] - 2026-08-12
+
+A **federation release**: satellite Photon instances now report into one central Photon. Nothing
+about the single-binary model changes — no clustering, no consensus, no new storage engine;
+federation is opt-in from the tenant side and rides the OTLP ingest path that was already there.
+Summary mode (the default) pushes a periodic health snapshot as OTLP metrics; full mode additionally
+mirrors accepted batches — logs, traces, metrics, RUM, or any subset — through a bounded queue that
+drops under backpressure rather than ever touching the ack path, so central being down cannot affect
+a tenant's own ingest or UI. Central gains a tenant registry with per-tenant ingest tokens and
+**server-side tenant stamping** (tenants can't spoof each other), a fleet board on Home, a
+`/tenants` view, and a read-only tenant lens over `/rum`. The global context is now **time +
+tenant** — the entity-scope dimension, decorative since it shipped, is gone. Also fixed: the Home
+and Service-detail charts that had been rendering empty since v1.0.0. Fully backward compatible —
+federation stays off unless configured; no migration, no format change.
 
 ### Added
 
@@ -534,6 +547,7 @@ operator-facing knobs. Fully backward compatible — no config or API breaking c
 - **Cached metric probe metadata** per engine (manifest-pointer invalidated), dropping a
   redundant prune + Parquet open per chart panel.
 
+[1.6.0]: https://github.com/nevindra/photon/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/nevindra/photon/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/nevindra/photon/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/nevindra/photon/compare/v1.2.0...v1.3.0
