@@ -41,6 +41,11 @@ swatches), `rounded-md` 10px (controls — buttons, inputs, toolbar triggers), `
 `rounded-2xl` 18px (dialogs, the login card). Pills — badges, status pills, entity chips — use
 `rounded-full` and sit outside the scale. Pick by *what the thing is*, not by eye.
 
+**`AppShell`'s `timePicker` prop:** every view keeps the one global `TimeRangePicker` in the
+ContextBar, except `/home`, which passes `:time-picker="false"` and puts its own bounded Watch Range
+picker in the `actions` slot. Two time controls in one header would be two sources of truth; see
+[`adr/0001`](adr/0001-landing-page-is-an-attention-board.md).
+
 **Canvas vs sheet (`AppShell`'s `surface` prop):** dashboards (`/home`, `/infra`, `/alerts`, `/data`,
 `/rum`, `/services`, `/uptime`) stay on the default `surface="canvas"` — the grey canvas is what makes
 their white cards read as cards, so **every table on a canvas view must own a panel**
@@ -90,7 +95,7 @@ corpus (`lib/core/mock.ts`) on a **network** failure, while still surfacing real
 
 | Path | View | Section |
 |---|---|---|
-| `/` → `/home` | `HomeView.vue` | Home dashboard (landing, with conditional tenant board when federation enabled) |
+| `/` → `/home` | `HomeView.vue` | The **Attention Board** (landing) — see [`adr/0001`](adr/0001-landing-page-is-an-attention-board.md) |
 | `/logs` | `LogsView.vue` | Logs explorer |
 | `/traces` · `/traces/:traceId` | `TracesExplorer.vue` · `TraceDetailView.vue` | Traces + waterfall |
 | `/services` · `/services/:service` | `ServicesListView.vue` · `ServiceDetailView.vue` | APM |
@@ -100,7 +105,7 @@ corpus (`lib/core/mock.ts`) on a **network** failure, while still surfacing real
 | `/infra` · `/infra/:host` | `InfraHostsView.vue` · `InfraHostDetailView.vue` | Infrastructure (host/GPU resource monitoring) |
 | `/data` | `DataView.vue` | Usage / storage / retention |
 | `/alerts` | `AlertsView.vue` | Alerts (webhook rules, incidents, channels) |
-| `/tenants` | `TenantsView.vue` | Federation tenant registry (central-side) |
+| `/tenants` | `TenantsView.vue` | Federation: live fleet-health board + tenant registry (central-side) |
 | `/login` · `/onboarding` | `LoginView.vue` · `OnboardingView.vue` | Auth (public) |
 
 `router/index.js` has a global `beforeEach` guard: cached `hydrate()` auth probe, onboarding-first
@@ -121,6 +126,40 @@ derives which group to
 highlight from the route via a `ROUTE_GROUP` map (e.g.
 `/rum` → `frontend`, `/infra` → `infra`) and the inverse `LANDING` map picks the route a NavRail click
 pushes to.
+
+## The Attention Board (`/home`)
+
+The landing page answers ONE question: **is anything wrong, and where?** It shows judgments, not
+readings. The decisions behind it — and the alternatives that were rejected — are in
+[`adr/0001-landing-page-is-an-attention-board.md`](adr/0001-landing-page-is-an-attention-board.md);
+the vocabulary (Subject, Attention Level, Silence, Watch Range, Spread, Unattributed Incident, Site,
+Central) is in [`../CONTEXT.md`](../CONTEXT.md). What matters for the code:
+
+- **One axis.** Every watched thing becomes a `Subject` at one of five levels — **Down** (not
+  answering) / **Critical** / **Warning** / **OK**, plus **Unknown**, which is the *absence* of a
+  judgment and never a colour. `attention.ts` adds no fourth opinion about what "bad" means: it maps
+  `serviceHealth.ts`, `hostStats.ts`, the API's own Web-Vital `rating` and the tenants API's own
+  up/stale/down onto that axis, and keeps each kind's native word verbatim in the reason line.
+- **The Watch Range is not the Window.** `watchRange.ts` owns a bounded 5m/15m/1h/6h lookback and
+  the `watch` URL key. Drilling out calls `applyWatchRangeToWindow()` *before* `correlate()`, so the
+  destination shows the same slice of time.
+- **Silence is Down.** A Subject that reported and then stopped is Down; one that never reported is
+  Unknown. Detected client-side against the previous equal-length range (`InfraHost.lastSeenNs`
+  gives hosts a finer signal). This is what stops a service falling to zero traffic from reading as
+  `idle` and disappearing.
+- **The roll-up cards are the filter.** No tabs. Each card always shows its World's full tallies and
+  toggles `?world=<key>` in place.
+- **Merging across Sites is Services-only.** `RedRow.tenant` is populated for `group=service`, so
+  same-named service rows merge into one Subject carrying a **Spread** (`2 of 3 sites`). Hosts and
+  monitors never merge. RUM apps could not merge without one query per Site, so they do not.
+- **A tenant filter is a lens, and the board narrows honestly.** Services, RUM apps and hosts carry
+  the tenant dimension; uptime and the alert engine do not, so under a lens the **Ops** world is
+  dropped rather than mislabelled as the Site's, and incidents that resolve to another Site's
+  Subject stay out of the Unattributed banner. Per-row Site labelling (the Site badge, the Spread
+  chip, the `central` marker) also switches off — the board spans one place and the breadcrumb
+  already names it. `useAttentionBoard` exposes this as `showSites`, which is `hasSites && !lensed`,
+  NOT `hasSites`: a row the backend never stamped with a `tenant` would otherwise read `central`
+  while sitting under a `divtik` filter.
 
 ## Component groups (`src/components/`)
 
@@ -152,8 +191,9 @@ pushes to.
   (`service.name`) on the host, built on `ui/table` + `EmptyState`, click-to-sort columns defaulting
   to CPU descending with nulls last; see
   [`subsystems/infra.md`](subsystems/infra.md)). `tenants/` (federation central registry):
-  `TenantCard.vue` (the Home board tenant card — health status, sparkline, mode badge, open-UI link for
-  summary-mode), `TenantManageDialog.vue` (add/edit dialog with rotate + minted-token panel; delete is a row action in `data/DataTenants.vue`), see
+  `TenantCard.vue` (the `/tenants` fleet-health card — health status, sparkline, mode badge, open-UI link
+  for summary-mode; it lived on `/home` until that page became the Attention Board, which judges Sites
+  into the same ranked list as every other Subject), `TenantManageDialog.vue` (add/edit dialog with rotate + minted-token panel; delete is a row action in `data/DataTenants.vue`), see
   [`subsystems/federation.md`](subsystems/federation.md). `alerts/` (the webhook alert engine, cross-signal):
   `AlertStatBand`, `AlertRulesTable`/`AlertRuleRow` (its "Browse templates" button + empty-state link
   open the quick-setup picker), `AlertRuleDialog`/`ConditionBuilder` (the plain-English condition
@@ -163,6 +203,11 @@ pushes to.
   Customize into a `:seed`-ed `AlertRuleDialog`; templates come from `lib/alertTemplates.ts`),
   `IncidentsTable`, `ChannelsGrid`/`ChannelCard`/`ChannelDialog` — see
   [`subsystems/alerts.md`](subsystems/alerts.md).
+- **`home/`** (the Attention Board) — `WatchRangePicker.vue` (the bounded 5m/15m/1h/6h Segmented that
+  replaces the global time picker on `/home`), `WorldRollupCard.vue` (one World's tallies, and the
+  page's filter control — the card IS the filter), `SubjectRow.vue` (one Subject that needs
+  attention: severity rail, Attention Level pill, name + kind, Site badge / Spread chip, incident
+  badge, reason line, age), `VitalSigns.vue`, `UnattributedBanner.vue`, `AttentionLegend.vue`.
 - **`ui/`** — the shared primitive library (below).
 
 ## The `ui/` primitive library
@@ -189,7 +234,7 @@ flat/instant density rule above.
 | `nav-tabs` | sub-navigation tab bar (route sub-nav) | JS |
 | `stat-tile` | KPI card: a header row (`#icon` in a soft rounded tile, label, `#action`), the headline value with its `secondary`/`delta` reading, an optional `sub` caption, a `#spark` slot, and an optional hairline-separated `#footer`. Static — no hover lift. `data-slot="label"`/`"value"` are the stable test hooks | TS |
 | `sparkline` | inline-SVG polyline sparkline with last-point dot | JS |
-| `status-dot` / `status-pill` | small tone-colored dot / pill label | TS |
+| `status-dot` / `status-pill` | small tone-colored dot / pill label. `StatusPill` also takes `solid` — the full-strength tone with reversed text, spent on the ONE state per screen that must not be mistaken for a milder neighbour (`/home` gives it to **Down**); two solid pills side by side cancel each other out | TS |
 | `peek-drawer` | Sheet-based side drawer with prev/next stepping through a list | JS |
 | `meter` | horizontal 0–1 proportion bar, tone-colored | TS |
 | `select-menu` | compact toolbar dropdown-select on Popover (jsdom-testable, unlike Reka Select); recessed field | JS |
@@ -218,7 +263,8 @@ cross-cutting. Imports use the extensionless alias form `@/lib/<folder>/<name>`.
   `range`/`from`/`to`/`tenant` URL keys; `tenantQueryTerm()` is what the logs/traces/metrics
   composables append to `q`, picked via the ContextBar dropdown or a Home tenant card),
   `useUrlState.ts` (per-view `svc`/`sev`/`q`; merge-preserves
-  every other key, including the context ones), `historyUrl.ts` (`replaceSearch()` — the **only**
+  every other key, including the context ones — plus `useUrlParam(key, ref)`, its one-key counterpart
+  for views owning a single param, e.g. `/home`'s `?world=`), `historyUrl.ts` (`replaceSearch()` — the **only**
   sanctioned way to rewrite the query string without navigating; preserves vue-router's entry state
   and keeps its `current` in step, see [conventions](conventions.md)), `useCorrelate.ts` (`correlate()` builds a same-app
   link that always carries the current time+tenant; `relatedFor()` is the per-entity-kind
@@ -254,6 +300,11 @@ follow the same contract) plus its signal-specific helpers:
   `hostStats.ts` (pure last-point/worst-series/threshold helpers for the glance tiles).
 - **`tenants/`** (federation central only) — `tenantsQueries.ts` (`useTenants`/`useTenantsSummary` +
   mutations for create/update/rotate/delete, all with mutation side-effects: invalidate + toast).
+- **`home/`** (the Attention Board, cross-signal) — `attention.ts` (the pure, table-tested domain
+  model: Attention Level, Subject builders per kind, Silence, incident resolution, roll-up and
+  ordering), `watchRange.ts` (the bounded lookback `/home` judges over — its own module singleton,
+  sole owner of the `watch` URL key, NOT the global Window), `useAttentionBoard.ts` (the fan-out that
+  wires every signal's existing composable into Subjects + the vital-signs strip).
 
 **Cross-signal:**
 - `alertsQueries.ts` (root `lib/`, not a per-signal folder — the alert engine spans metrics/logs/

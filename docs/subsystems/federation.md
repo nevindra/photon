@@ -1,6 +1,10 @@
 # Federation
 
-One central Photon monitors many customer Photon installs (tenants) that push telemetry to it, egress-only via OTLP. **No new storage engine** — federated data flows through the existing logs/traces/metrics WAL and storage pipeline; this doc covers what's specific to federation: the config, token flow, server-side tenant stamping, the summary/full modes, and the curated management UI.
+One central Photon monitors many Photon installs **of your own** (tenants) that push telemetry to it, egress-only via OTLP. **No new storage engine** — federated data flows through the existing logs/traces/metrics WAL and storage pipeline; this doc covers what's specific to federation: the config, token flow, server-side tenant stamping, the summary/full modes, and the curated management UI.
+
+> **Vocabulary.** Code and config say **tenant** (the `tenants` table, `?tenant=`, the `tenant` resource attribute, `[federation]`), and that name is not going to change. In prose we say **Site**, because "tenant" reads as *customer* — and these are not customers. A Site is another deployment of ours, in another region / cluster / environment; when one goes quiet, that is our outage, which is why `/home` ranks Sites in the same attention list as a service or a host. The install they push to is **Central**. Central is not a different product: same binary, same UI, same landing page — the difference is only in the data. See [`../../CONTEXT.md`](../../CONTEXT.md).
+>
+> This is **not clustering**. Nothing is shared: no cluster state, no consensus, no node serving another's data. A Site is a whole Photon that runs standalone and happens to also egress to Central.
 
 > Shared plumbing and invariants: [`../architecture.md`](../architecture.md).
 

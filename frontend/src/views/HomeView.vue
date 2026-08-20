@@ -1,366 +1,183 @@
 <script setup lang="ts">
-// Overview dashboard (`/home`) — the cross-signal landing page (Task 13). One glance across the
-// three "worlds": a KPI strip fusing backend RED + frontend RUM vitals + infra uptime, two headline
-// trend charts, and three per-world panels. Everything is bound to the app-wide time window
-// (`lib/context`, driven by the ContextBar in AppShell) and every tile/row drills out via
-// `correlate()`, so the selected range + entity scope ride along on every navigation hop.
-import { computed } from 'vue'
+// `/home` — the Attention Board. The landing page answers ONE question: is anything wrong, and
+// where? Every watched thing is judged into a single ranked Attention Level (Down / Critical /
+// Warning / OK, plus Unknown for the absence of a judgment), and the page leads with whatever
+// failed the judgment. See docs/adr/0001-landing-page-is-an-attention-board.md for why, and
+// CONTEXT.md for the vocabulary (Subject, Silence, Watch Range, Spread, Unattributed Incident).
+//
+// This view is the same code on Central and on a Site install. The difference is only in the data:
+// on Central every Subject carries a Site and a fifth World (Sites) appears; on a Site install
+// none do. There is no role check anywhere — scoping falls out of what the data already is.
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { Check, ArrowRight, X } from 'lucide-vue-next'
 import AppShell from '@/components/common/AppShell.vue'
-import ChartPanel from '@/components/charts/ChartPanel.vue'
-import LineChart from '@/components/charts/LineChart.vue'
-import RedTable from '@/components/metrics/RedTable.vue'
-import TenantCard from '@/components/tenants/TenantCard.vue'
-import { StatTile } from '@/components/ui/stat-tile'
-import { Sparkline } from '@/components/ui/sparkline'
-import { StatusDot } from '@/components/ui/status-dot'
-import { EmptyState } from '@/components/ui/empty-state'
+import WatchRangePicker from '@/components/home/WatchRangePicker.vue'
+import WorldRollupCard from '@/components/home/WorldRollupCard.vue'
+import SubjectRow from '@/components/home/SubjectRow.vue'
+import VitalSigns from '@/components/home/VitalSigns.vue'
+import UnattributedBanner from '@/components/home/UnattributedBanner.vue'
+import AttentionLegend from '@/components/home/AttentionLegend.vue'
+import { Skeleton } from '@/components/ui/skeleton'
 import { api } from '@/lib/core/api'
-import { startNs, endNs, startMs, endMs } from '@/lib/core/context'
+import { tenant as activeTenant } from '@/lib/core/context'
 import { correlate } from '@/lib/core/useCorrelate'
-import { useServicesList, useServiceTimeseries } from '@/lib/services/servicesQueries'
-import { useRumApps, useRumVitals } from '@/lib/rum/rumQueries'
-import { useMonitors } from '@/lib/uptime/uptimeQueries'
-import { useTenantsSummary, type TenantSummary } from '@/lib/tenants/tenantsQueries'
-import { tenant as activeTenant, setTenant } from '@/lib/core/context'
-import { formatDuration, formatNumber } from '@/lib/core/format'
+import { useUrlParam } from '@/lib/core/useUrlState'
+import { boardWorlds, type Subject, type WorldKey } from '@/lib/home/attention'
+import { useAttentionBoard } from '@/lib/home/useAttentionBoard'
+import { applyWatchRangeToWindow, useWatchRange, watchNowMs, watchRange } from '@/lib/home/watchRange'
 
 const router = useRouter()
 
-// The `api.*` methods (untyped JS) resolve to `unknown`, so the query rows/vitals/monitors are
-// treated as `any[]` here — the annotation makes every `.reduce/.map/.filter/.find` callback param
-// explicitly `any` (satisfying `noImplicitAny`) without pretending we have real row types.
-type Accent = 'success' | 'error' | 'warning' | 'info' | 'neutral'
+useWatchRange()
+// Destructured so the template sees top-level refs (Vue only auto-unwraps those, not refs
+// reached through a plain object).
+const { subjects, rollups, unattributed, totalWatched, showSites, loading, attention: attentionFor, vitals: vitalsFor } =
+  useAttentionBoard()
 
-// --- Backend world: RED grouped by service (whole fleet, no filter) ---
-const servicesQuery = useServicesList(() => '', startNs, endNs)
-const rows = computed<any[]>(() => servicesQuery.data.value ?? [])
-const servicesLoading = computed(() => servicesQuery.isFetching.value)
+// The roll-up cards ARE the filter — click one to narrow the list and the vital signs, click it
+// again to release. Kept in the URL so a narrowed board is shareable.
+const worldParam = ref<string | null>(null)
+useUrlParam('world', worldParam, { valid: (v) => boardWorlds({ sites: true }).some((w) => w.key === v) })
 
-// --- Frontend world: RUM Core Web Vitals for the first registered app ---
-const rumAppsQuery = useRumApps()
-const apps = computed<any[]>(() => rumAppsQuery.data.value?.apps ?? [])
-const firstApp = computed<string>(() => apps.value[0]?.name ?? '')
-const vitalsQuery = useRumVitals(firstApp, startNs, endNs)
-const vitals = computed<any[]>(() => vitalsQuery.data.value?.vitals ?? [])
+// A world this install does not show (`?world=sites` on a non-federated install, or `?world=ops`
+// under a tenant lens) filters to nothing — fall back to the whole board rather than an empty page.
+const activeWorld = computed(() => rollups.value.find((r) => r.world.key === worldParam.value) ?? null)
+const world = computed<WorldKey | null>(() => activeWorld.value?.world.key ?? null)
+const attention = attentionFor(world)
+const vitals = vitalsFor(world)
 
-// --- Infra world: uptime monitors ---
-const monitorsQuery = useMonitors()
-const monitors = computed<any[]>(() => monitorsQuery.data.value ?? [])
-
-const tenantsSummaryQuery = useTenantsSummary()
-const allTenants = computed<TenantSummary[]>(() => tenantsSummaryQuery.data.value ?? [])
-// With a tenant filter active the board narrows to that tenant's card — a health header for the
-// tenant being inspected — instead of repeating the whole fleet under filtered tiles.
-const tenants = computed<TenantSummary[]>(() =>
-  activeTenant.value ? allTenants.value.filter((t) => t.name === activeTenant.value) : allTenants.value,
-)
-// Column count follows the card count (capped at 4/row) so a small fleet fills the row instead of
-// leaving grid whitespace. Literal class strings — Tailwind can't see computed names.
-const TENANT_COLS: Record<number, string> = {
-  1: 'grid-cols-1',
-  2: 'grid-cols-1 sm:grid-cols-2',
-  3: 'grid-cols-1 sm:grid-cols-2 xl:grid-cols-3',
-  4: 'grid-cols-1 sm:grid-cols-2 xl:grid-cols-4',
-}
-const tenantGridClass = computed(() =>
-  activeTenant.value
-    ? 'flex flex-col gap-2'
-    : `grid gap-4 ${TENANT_COLS[Math.min(tenants.value.length, 4)]}`,
-)
-
-// --- Headline-service timeseries feeds both trend charts (busiest service by request rate) ---
-const topService = computed<string>(() => {
-  const list = rows.value
-  if (!list.length) return ''
-  return [...list].sort((a, b) => (b.rate ?? 0) - (a.rate ?? 0))[0].service
-})
-const timeseries = useServiceTimeseries(topService, startNs, endNs, 48)
-const buckets = computed<any[]>(() => timeseries.data.value ?? [])
-const chartsLoading = computed(() => timeseries.isFetching.value)
-
-// --- KPI derivation (cross-world) ---
-// Fleet request rate = Σ per-service rate. Fleet error rate = rate-weighted mean of per-service
-// error rates (no `count` needed — proxies volume by rate). Latency headline = worst service p99.
-const requestRate = computed(() => rows.value.reduce((s, r) => s + (r.rate ?? 0), 0))
-const errorRate = computed(() => {
-  const total = requestRate.value
-  if (!total) return 0
-  return rows.value.reduce((s, r) => s + (r.rate ?? 0) * (r.error_rate ?? 0), 0) / total
-})
-const worstP99 = computed(() => rows.value.reduce((m, r) => Math.max(m, Number(r.p99 ?? 0)), 0))
-const lcpVital = computed(() => vitals.value.find((v) => v.metric === 'web_vitals.lcp'))
-const monitorsUp = computed(() => monitors.value.filter((m) => m.last_state === 'up').length)
-
-// req/s: whole numbers at scale, one decimal when small (mirrors RedTable.fmtRate).
-function fmtRate(r: number) {
-  const n = r ?? 0
-  return (n >= 100 ? formatNumber(Math.round(n)) : n.toFixed(1)) + '/s'
-}
-// A Web-Vital duration in MILLISECONDS → "2.8s" / "620ms".
-function fmtMs(ms: number | null | undefined) {
-  if (ms == null) return '—'
-  return ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : Math.round(ms) + 'ms'
-}
-// Chart value formatter for the latency series (already ms Numbers).
-function fmtMsChart(v: number) {
-  return Math.round(v) + 'ms'
+function toggleWorld(key: string): void {
+  worldParam.value = worldParam.value === key ? null : key
 }
 
-// Web-Vital rating → StatTile/StatusDot tone. Ratings arrive as 'good' | 'needs'(-improvement) |
-// 'poor' — the client never hardcodes cutoffs, it colours whatever rating the API returned.
-function vitalTone(rating: string | undefined): Accent {
-  if (!rating) return 'neutral'
-  if (rating.startsWith('good')) return 'success'
-  if (rating.startsWith('poor')) return 'error'
-  return 'warning'
-}
-function monitorTone(m: any): Accent {
-  if (m.last_state === 'up') return 'success'
-  if (m.last_state === 'down') return 'error'
-  return 'neutral'
-}
-
-const VITAL_LABELS: Record<string, string> = {
-  'web_vitals.lcp': 'LCP',
-  'web_vitals.inp': 'INP',
-  'web_vitals.cls': 'CLS',
-  'web_vitals.fcp': 'FCP',
-  'web_vitals.ttfb': 'TTFB',
-}
-function vitalLabel(metric: string) {
-  return VITAL_LABELS[metric] ?? metric
-}
-// CLS is unit-less; the rest are milliseconds.
-function vitalValue(v: any) {
-  return v.metric === 'web_vitals.cls' ? String(v.p75) : fmtMs(v.p75)
-}
-
-// Where each RUM/uptime tile drills. Backend tiles go to the services list.
-const rumDest = computed<string>(() => (firstApp.value ? '/rum/' + encodeURIComponent(firstApp.value) : '/rum'))
-
-interface Kpi {
-  label: string
-  value: string
-  accent: Accent
-  to: string
-}
-const kpis = computed<Kpi[]>(() => [
-  { label: 'Request rate', value: fmtRate(requestRate.value), accent: 'info', to: '/services' },
-  {
-    label: 'Error rate',
-    value: (errorRate.value * 100).toFixed(2) + '%',
-    accent: errorRate.value >= 0.05 ? 'error' : errorRate.value > 0 ? 'warning' : 'success',
-    to: '/services',
-  },
-  { label: 'p99 latency', value: formatDuration(worstP99.value), accent: 'neutral', to: '/services' },
-  {
-    label: 'LCP · p75',
-    value: lcpVital.value ? fmtMs(lcpVital.value.p75) : '—',
-    accent: vitalTone(lcpVital.value?.rating),
-    to: rumDest.value,
-  },
-  {
-    label: 'Monitors up',
-    value: `${monitorsUp.value}/${monitors.value.length}`,
-    accent: !monitors.value.length ? 'neutral' : monitorsUp.value === monitors.value.length ? 'success' : 'error',
-    to: '/uptime',
-  },
-  { label: 'Services', value: formatNumber(rows.value.length), accent: 'neutral', to: '/services' },
-])
-
-// --- Chart series (all derived from the one headline-service timeseries) ---
-// `ts` is an epoch-ms Number; percentiles are decimal-ns strings → ms via Number(p)/1e6.
-const trafficSeries = computed(() => {
-  if (!buckets.value.length) return []
-  return [
-    { key: 'rate', label: 'req/s', points: buckets.value.map((b) => ({ t: b.ts, v: b.rate ?? 0 })) },
-    {
-      key: 'errors',
-      label: 'errors/s',
-      points: buckets.value.map((b) => ({ t: b.ts, v: (b.rate ?? 0) * (b.error_rate ?? 0) })),
-    },
-  ]
-})
-const latencySeries = computed(() => {
-  if (!buckets.value.length) return []
-  return ['p50', 'p99'].map((k) => ({
-    key: k,
-    label: k,
-    points: buckets.value.map((b) => ({ t: b.ts, v: b[k] != null ? Number(b[k]) / 1e6 : null })),
-  }))
-})
-const rateSpark = computed(() => buckets.value.map((b) => b.rate ?? 0))
-const p99Spark = computed(() => buckets.value.map((b) => Number(b.p99 ?? 0) / 1e6))
-
-// --- drilldowns (every hop carries the time window + scope via correlate) ---
-function go(path: string) {
+// Every hop hands the Watch Range to the app-wide Window FIRST, so the page you land on shows the
+// same slice of time — `correlate()` reads the global context.
+function go(path: string): void {
+  applyWatchRangeToWindow()
   router.push(correlate({ path }))
 }
-function openService(service: string) {
-  if (service) go('/services/' + encodeURIComponent(service))
-}
-function onOpenExemplars({ service }: { service: string }) {
-  openService(service)
+function openSubject(subject: Subject): void {
+  go(subject.dest)
 }
 
-// Full-mode tenants mirror raw telemetry, so their data is queryable here via the tenant
-// context dimension — drill into the first signal they actually mirror (`full:traces` mirrors no
-// logs, so /logs would be empty). Summary-mode tenants only ever push synthetic health metrics,
-// so there's nothing to browse locally; they link out to the tenant's own UI.
-function openTenant(tenant: TenantSummary) {
-  if (tenant.mode === 'summary') {
-    // No ui_url registered → nothing to open; a '#' tab would just be a blank page.
-    if (tenant.ui_url) window.open(tenant.ui_url, '_blank')
-    return
-  }
-  setTenant(tenant.name)
-  // mode is `full` (all three) or `full:<csv>` — e.g. `full:traces,metrics`.
-  const signals = tenant.mode?.includes(':') ? tenant.mode.slice(tenant.mode.indexOf(':') + 1).split(',') : null
-  const path = !signals || signals.includes('logs') ? '/logs' : signals.includes('traces') ? '/traces' : '/metrics'
-  router.push(correlate({ path }))
-}
+const crumb = computed(() => (activeTenant.value ? `${activeTenant.value} · Home` : 'Home · Overview'))
+const attentionNote = computed(() => {
+  const shown = attention.value.length
+  const w = activeWorld.value
+  if (w) return `${shown} of ${subjects.value.filter((s) => s.world === w.world.key).length} · filtered to ${w.world.name}`
+  return shown ? `${shown} subject${shown > 1 ? 's' : ''} · worst first` : 'across every world'
+})
+const allClearNote = computed(() => {
+  const w = activeWorld.value
+  if (w) return `All ${w.total} ${w.world.noun} inside their thresholds for the last ${watchRange.value}.`
+  return `${totalWatched.value} subjects watched, all inside their thresholds for the last ${watchRange.value}.`
+})
 </script>
 
 <template>
-  <AppShell active="home" :mock="api.mock" crumb="Home · Overview">
+  <AppShell active="home" :mock="api.mock" :crumb="crumb" :time-picker="false">
+    <template #actions><WatchRangePicker /></template>
+
     <main class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4" data-testid="home">
-      <!-- Tenants (federation board) -->
-      <section v-if="tenants.length" data-testid="home-tenants" class="flex flex-col gap-2">
-        <div class="flex items-center justify-between">
-          <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Tenants{{ activeTenant ? ` · ${activeTenant}` : '' }}
-          </h3>
-          <span v-if="activeTenant && allTenants.length > 1" class="text-[11px] text-muted-foreground">
-            {{ allTenants.length - 1 }} more hidden by the tenant filter
+      <UnattributedBanner
+        v-if="unattributed.length"
+        :items="unattributed"
+        @open="go('/alerts')"
+      />
+
+      <!-- Every world, always fully populated — the proof that N subjects are watched, which is
+           what makes an empty attention list believable. -->
+      <section>
+        <header class="mb-2 flex items-baseline gap-2.5">
+          <h2 class="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">All components</h2>
+          <span class="text-[11px] text-muted-foreground/80">
+            {{ totalWatched }} subjects watched · click a card to filter
           </span>
-        </div>
-        <!-- Filtered → one full-width strip (a lone grid card leaves 2/3 dead space); else a grid
-             whose column count tracks the card count (max 4/row). -->
-        <div :class="tenantGridClass">
-          <TenantCard v-for="t in tenants" :key="t.name" :tenant="t" :compact="!!activeTenant" @select="openTenant" />
-        </div>
-      </section>
-
-      <!-- Cross-world KPI strip -->
-      <section class="grid grid-cols-2 gap-3 md:grid-cols-6">
-        <StatTile
-          v-for="k in kpis"
-          :key="k.label"
-          :label="k.label"
-          :value="k.value"
-          :accent="k.accent"
-          class="cursor-pointer"
-          role="button"
-          tabindex="0"
-          @click="go(k.to)"
-          @keydown.enter="go(k.to)"
-        />
-      </section>
-
-      <!-- Headline trend charts -->
-      <section class="grid grid-cols-1 gap-3 lg:grid-cols-3">
-        <ChartPanel title="Traffic &amp; errors" subtitle="requests/s · busiest service" class="lg:col-span-2">
-          <template #summary>
-            <div class="flex items-center gap-2">
-              <span class="font-mono text-xs tabular-nums text-foreground">{{ fmtRate(requestRate) }}</span>
-              <Sparkline :points="rateSpark" class="text-primary" />
-            </div>
-          </template>
-          <LineChart :series="trafficSeries" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" area />
-        </ChartPanel>
-        <ChartPanel title="Latency" subtitle="p50 · p99">
-          <template #summary>
-            <div class="flex items-center gap-2">
-              <span class="font-mono text-xs tabular-nums text-foreground">{{ formatDuration(worstP99) }}</span>
-              <Sparkline :points="p99Spark" class="text-primary" />
-            </div>
-          </template>
-          <LineChart
-            :series="latencySeries"
-            :start-ms="startMs"
-            :end-ms="endMs"
-            :format-value="fmtMsChart"
-            :loading="chartsLoading"
+        </header>
+        <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4" data-testid="world-rollup">
+          <WorldRollupCard
+            v-for="rollup in rollups"
+            :key="rollup.world.key"
+            :rollup="rollup"
+            :active="world === rollup.world.key"
+            @toggle="toggleWorld"
           />
-        </ChartPanel>
+        </div>
       </section>
 
-      <!-- Three worlds -->
-      <section class="grid grid-cols-1 gap-3 lg:grid-cols-3">
-        <!-- Frontend · RUM Web Vitals -->
-        <div class="flex flex-col rounded-xl border border-border bg-surface-1 p-3">
-          <header class="mb-2 flex items-center justify-between gap-2">
-            <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Frontend · Web Vitals</h3>
+      <section>
+        <header class="mb-2 flex items-baseline gap-2.5">
+          <h2 class="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Needs attention</h2>
+          <span class="text-[11px] text-muted-foreground/80">{{ attentionNote }}</span>
+          <span v-if="activeWorld" class="ml-auto flex items-center gap-3">
             <button
               type="button"
-              class="text-[11px] text-primary hover:underline"
-              @click="go(rumDest)"
+              class="inline-flex items-center gap-1 rounded-sm text-xs font-medium text-brand hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              @click="worldParam = null"
             >
-              {{ firstApp || 'RUM' }}
+              <X class="size-3" />
+              clear filter
             </button>
-          </header>
-          <button
-            v-for="v in vitals"
-            :key="v.metric"
-            type="button"
-            class="flex items-center gap-2 rounded px-1 py-1 font-mono text-xs hover:bg-muted"
-            @click="go(rumDest)"
-          >
-            <StatusDot :tone="vitalTone(v.rating)" />
-            <span class="text-foreground">{{ vitalLabel(v.metric) }}</span>
-            <span class="ml-auto tabular-nums text-muted-foreground">{{ vitalValue(v) }}</span>
-          </button>
-          <EmptyState
-            v-if="!vitals.length"
-            title="No RUM data"
-            description="Instrument an app with the @photon/rum SDK."
-            class="h-auto flex-1 py-6"
-          />
-        </div>
-
-        <!-- Backend · Services (RED) -->
-        <div class="flex flex-col rounded-xl border border-border bg-surface-1 p-3">
-          <header class="mb-2 flex items-center justify-between gap-2">
-            <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Backend · Services</h3>
-            <button type="button" class="text-[11px] text-primary hover:underline" @click="go('/services')">
-              {{ formatNumber(rows.length) }} services
-            </button>
-          </header>
-          <RedTable :rows="rows" group="service" :loading="servicesLoading" @open-exemplars="onOpenExemplars" />
-        </div>
-
-        <!-- Ops · Uptime -->
-        <div class="flex flex-col rounded-xl border border-border bg-surface-1 p-3">
-          <header class="mb-2 flex items-center justify-between gap-2">
-            <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Ops · Uptime</h3>
-            <button type="button" class="text-[11px] text-primary hover:underline" @click="go('/uptime')">
-              {{ monitorsUp }}/{{ monitors.length }} up
-            </button>
-          </header>
-          <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
             <button
-              v-for="m in monitors"
-              :key="m.id"
               type="button"
-              class="flex items-center gap-2 rounded border border-border/60 px-2 py-1.5 text-xs hover:bg-muted"
-              @click="go('/uptime')"
+              class="inline-flex items-center gap-1 rounded-sm text-xs font-medium text-brand hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              @click="go(activeWorld.world.dest)"
             >
-              <StatusDot :tone="monitorTone(m)" />
-              <span class="truncate text-foreground">{{ m.name }}</span>
-              <span v-if="m.last_latency_ms != null" class="ml-auto tabular-nums text-muted-foreground">
-                {{ m.last_latency_ms }}ms
-              </span>
+              Open {{ activeWorld.world.name }}
+              <ArrowRight class="size-3" />
             </button>
-          </div>
-          <EmptyState
-            v-if="!monitors.length"
-            title="No monitors"
-            description="Add an uptime check in Ops."
-            class="h-auto flex-1 py-6"
+          </span>
+        </header>
+
+        <div
+          v-if="attention.length"
+          class="overflow-hidden rounded-xl border border-border bg-card shadow-1"
+          data-testid="attention-list"
+        >
+          <SubjectRow
+            v-for="subject in attention"
+            :key="subject.id"
+            :subject="subject"
+            :now-ms="watchNowMs"
+            :show-sites="showSites"
+            @open="openSubject"
           />
+        </div>
+        <div
+          v-else-if="loading"
+          class="flex flex-col gap-2 rounded-xl border border-border bg-card p-4 shadow-1"
+        >
+          <Skeleton v-for="i in 3" :key="i" class="h-10 w-full" />
+        </div>
+        <div
+          v-else
+          class="rounded-xl border border-border bg-card px-5 py-10 text-center shadow-1"
+          data-testid="all-clear"
+        >
+          <span class="mx-auto mb-3 flex size-10 items-center justify-center rounded-full bg-success-soft text-success">
+            <Check class="size-5" />
+          </span>
+          <p class="text-sm font-semibold text-foreground">Nothing needs attention</p>
+          <p class="mt-1 text-xs text-muted-foreground">{{ allClearNote }}</p>
         </div>
       </section>
+
+      <!-- Thresholds can all hold while the fleet quietly loses most of its traffic. This is where
+           that shows up. -->
+      <section>
+        <header class="mb-2 flex items-baseline gap-2.5">
+          <h2 class="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Vital signs{{ activeWorld ? ` · ${activeWorld.world.name}` : '' }}
+          </h2>
+          <span class="text-[11px] text-muted-foreground/80">
+            last {{ watchRange }} vs the {{ watchRange }} before it
+          </span>
+        </header>
+        <VitalSigns :vitals="vitals" />
+      </section>
+
+      <AttentionLegend />
     </main>
   </AppShell>
 </template>

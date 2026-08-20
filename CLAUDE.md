@@ -8,7 +8,11 @@ A fast, lightweight, OTEL-native observability platform — a self-hosted altern
 Datadog, Sentry, and Grafana, shipped as a **single Rust binary** with an embedded Vue 3 UI. It
 carries **five signals** — logs, traces (spans), metrics, uptime monitoring, and RUM (Real-User
 Monitoring) — plus data usage/retention management. Single node, single implicit auth role (no RBAC
-yet); RBAC/multi-tenancy/clustering are deliberately out of scope until there's demand.
+yet); RBAC and multi-tenancy are deliberately out of scope until there's demand. It does **federate**,
+though: a **Central** install aggregates many **Site** installs *of our own* (other regions, clusters,
+environments) that push telemetry to it — see [`docs/subsystems/federation.md`](docs/subsystems/federation.md).
+That is fleet aggregation, not clustering: there is still no shared cluster state, no consensus, and no
+node that can serve another's data.
 
 **The `docs/` directory is the project knowledge base — read it to gather context fast:**
 - [`docs/architecture.md`](docs/architecture.md) — crate graph, per-signal write/read data flow,
@@ -18,6 +22,8 @@ yet); RBAC/multi-tenancy/clustering are deliberately out of scope until there's 
   resource monitoring), `federation` (tenant egress + central aggregation), `data`, `auth` — each with its key files, endpoints, and UI.
 - [`docs/frontend.md`](docs/frontend.md) — the Vue app: routes/views, the `ui/` primitives, `lib/`.
 - [`docs/conventions.md`](docs/conventions.md) — conventions & gotchas.
+- [`docs/adr/`](docs/adr/) — decisions that would otherwise get "fixed" by the next reader.
+- [`CONTEXT.md`](CONTEXT.md) — the ubiquitous language (glossary only, no implementation detail).
 - [`README.md`](README.md) — the public-facing overview and positioning.
 
 > **Keep the docs in sync with the code.** Whenever you change the codebase (`crates/`,
@@ -92,8 +98,15 @@ surfaced by one `ContextBar` mounted once in `AppShell`
 (not per-view, and no longer on `TopBar`); within-view filters (`svc`/`sev`/`q`, plus per-view extras like traces'
 `sort`/`mode`) live in URL params via `lib/core/useUrlState.ts`, which merge-preserves the context
 keys — and a detail view's back button pops to the list's own history entry
-(`lib/core/useBackTo.ts`) so those filters survive a drill-in → back round trip. Routes: `/` → `/home` (`HomeView`,
-the cross-signal landing dashboard), `/logs`, `/traces` (+ `/traces/:traceId` waterfall), `/services`
+(`lib/core/useBackTo.ts`) so those filters survive a drill-in → back round trip. Routes: `/` → `/home` (`HomeView`, the
+**Attention Board** — the cross-signal landing page, which shows *judgments* rather than readings:
+every watched thing becomes a **Subject** at one ranked **Attention Level** (Down / Critical /
+Warning / OK, plus Unknown for the absence of a judgment), the World roll-up cards double as the
+page's filter (`?world=`, no tabs), and it judges over its own bounded **Watch Range**
+(5m/15m/1h/6h, `?watch=`) rather than the app-wide time Window — so it passes
+`:time-picker="false"` to `AppShell` and renders its own picker. Silence (reported, then stopped) is
+Down; never-reported is Unknown. See
+[`docs/adr/0001`](docs/adr/0001-landing-page-is-an-attention-board.md)), `/logs`, `/traces` (+ `/traces/:traceId` waterfall), `/services`
 (+ `/services/:service` APM detail), `/metrics` (+ `/metrics/catalog`), `/rum` (+ app-scoped
 sub-routes: `/rum/:appId` vitals, `/pages[/:route]`, `/errors` (search bar + fixed facet panel), and
 `/errors/:fingerprint` issue detail; with a federation tenant active, central's `/rum` becomes a
@@ -101,8 +114,8 @@ read-only tenant lens — apps derived from mirrored data via `?tenant=`, manage
 resource monitoring), `/data`, `/alerts` (the cross-signal webhook alert engine — rules over
 metrics/logs/traces/RUM, incidents, notification channels (channels are typed presets: Generic
 Webhook, Discord, Telegram), plus a "Browse templates" quick-setup on-ramp: target-first
-Apply/Customize over a frontend-only, 23-template seed catalog), `/tenants` (the federation
-tenant registry, central-side), plus `/login`
+Apply/Customize over a frontend-only, 23-template seed catalog), `/tenants` (federation, central-side: the live
+fleet-health board plus the tenant registry), plus `/login`
 and `/onboarding`, behind a `beforeEach` auth guard
 (`router/index.js`) gated on reactive flags (`lib/core/auth.ts`). The `@photon/rum` browser SDK
 (`sdk/rum/`) behind `/rum` auto-detects SPA client-side navigation (History API —

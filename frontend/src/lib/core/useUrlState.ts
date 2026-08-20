@@ -104,3 +104,25 @@ export function useUrlState(refs: UrlStateRefs): void {
     { deep: true },
   )
 }
+
+// One URL key <-> one ref, merge-preserving. The narrow counterpart to `useUrlState` for views that
+// own a single param (`/home`'s `?world=`): seeds the ref from location.search on setup, then
+// rewrites ONLY that key whenever the ref changes, leaving context.ts's range/from/to/tenant and
+// every other view key untouched. A value equal to `fallback` is omitted so a clean URL stays clean.
+export function useUrlParam(
+  key: string,
+  value: Ref<string | null>,
+  { valid, fallback = null }: { valid?: (v: string) => boolean; fallback?: string | null } = {},
+): void {
+  if (typeof window === 'undefined') return
+
+  const initial = new URLSearchParams(window.location.search).get(key)
+  if (initial && (!valid || valid(initial))) value.value = initial
+
+  watch(value, () => {
+    const p = new URLSearchParams(window.location.search)
+    p.delete(key)
+    if (value.value != null && value.value !== fallback) p.set(key, value.value)
+    replaceSearch(p)
+  })
+}

@@ -21,6 +21,9 @@ const props = defineProps({
   // own; on the canvas they'd be a grey table. A view that puts every table in a panel should
   // stay on 'canvas'.
   surface: { type: String, default: 'canvas' },
+  // Forwarded to ContextBar. `/home` sets it false — the Attention Board owns its own bounded
+  // Watch Range and renders that picker in the `actions` slot instead.
+  timePicker: { type: Boolean, default: true },
 })
 defineEmits(['update:liveMode', 'refresh'])
 
@@ -88,6 +91,7 @@ async function onLogout() {
         :live="live"
         :live-mode="liveMode"
         :live-status="liveStatus"
+        :time-picker="timePicker"
         @update:live-mode="$emit('update:liveMode', $event)"
         @refresh="$emit('refresh')"
       >

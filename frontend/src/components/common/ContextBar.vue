@@ -38,6 +38,9 @@ interface Props {
   liveStatus?: string
   /** Show the LiveControl at all. */
   live?: boolean
+  /** Show the global time picker. `/home` turns it off: the Attention Board judges over its own
+   *  bounded Watch Range, and two time controls in one header would be two sources of truth. */
+  timePicker?: boolean
 }
 
 withDefaults(defineProps<Props>(), {
@@ -45,6 +48,7 @@ withDefaults(defineProps<Props>(), {
   liveMode: 'manual',
   liveStatus: 'idle',
   live: false,
+  timePicker: true,
 })
 
 defineEmits<{
@@ -110,6 +114,7 @@ function onTenantPick(v: unknown): void {
         @refresh="$emit('refresh')"
       />
       <TimeRangePicker
+        v-if="timePicker"
         :model-value="timeRange"
         :custom-range="customRange ?? undefined"
         @update:model-value="setTimeRange"
