@@ -118,7 +118,7 @@ function durationLabel(ms: number): string {
       title="No incidents"
       description="Nothing has triggered recently."
     />
-    <div v-else class="overflow-hidden rounded-lg border border-border bg-card shadow-1">
+    <div v-else class="overflow-hidden rounded-xl border border-border bg-card shadow-1">
       <div
         class="flex items-center gap-1.5 border-b border-border bg-muted/40 px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
         data-testid="incidents-group-triggered"

@@ -30,14 +30,14 @@ const SPARK = '0,12 14,9 28,11 42,7 56,10 70,8'
 <template>
   <div class="overflow-hidden rounded-xl border border-border bg-card">
     <div class="flex items-center gap-2 border-b border-border p-2.5">
-      <div class="flex h-8 flex-1 items-center gap-2 rounded-lg border border-border px-2.5 focus-within:border-foreground/40">
+      <div class="flex h-8 flex-1 items-center gap-2 rounded-md border border-border px-2.5 focus-within:border-foreground/40">
         <Search class="size-3.5 text-muted-foreground" />
         <input
           v-model="search" data-testid="catalog-search" placeholder="filter metrics by name / unit / type…"
           class="w-full bg-transparent text-[13px] outline-none placeholder:text-muted-foreground"
         />
       </div>
-      <select v-model="typeFilter" class="h-8 rounded-lg border border-border bg-background px-2 font-mono text-[12px]">
+      <select v-model="typeFilter" class="h-8 rounded-md border border-border bg-surface-1 px-2 font-mono text-[12px]">
         <option value="">type: all</option>
         <option v-for="t in TYPES" :key="t" :value="t">{{ t }}</option>
       </select>

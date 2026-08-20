@@ -151,7 +151,7 @@ function applySelection(): void {
       <input
         v-model="specificInput"
         type="date"
-        class="w-full rounded-md border border-input bg-background px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        class="w-full rounded-md border border-input bg-surface-1 px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
         @input="clearPendingPreset"
       />
 

@@ -38,7 +38,7 @@ function choose(value) {
       :aria-label="ariaLabel || prefix || 'Select'"
       :class="
         cn(
-          'pk inline-flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md border border-input bg-surface-1 px-2.5 text-xs font-medium text-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring data-[state=open]:bg-muted',
+          'inline-flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-surface-1 px-2.5 text-xs font-medium text-foreground shadow-1 transition-[background-color,border-color] duration-150 ease-out hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring data-[state=open]:bg-muted',
         )
       "
     >

@@ -17,7 +17,7 @@ defineProps({
 </script>
 
 <template>
-  <div class="rounded-lg border border-border bg-popover px-2.5 py-2 font-mono text-popover-foreground shadow-lg">
+  <div class="rounded-lg border border-border bg-popover px-2.5 py-2 font-mono text-popover-foreground shadow-2">
     <div v-if="title" class="whitespace-nowrap text-[10px] text-muted-foreground">{{ title }}</div>
     <div
       v-if="total"

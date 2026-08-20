@@ -21,30 +21,50 @@ the look; primitives and chrome consume it rather than hardcoding color/shadow/r
 base carries one **Photon Cyan** brand ramp (`--brand`/`--brand-strong`/`--brand-foreground`/
 `--brand-soft`, ~190°) spent on a **Reserved** reach: active-nav (`NavRail`), the focus ring
 (`--ring`), links, selection, key data highlights, single-series chart lines (`useChartTheme.js`), and
-an explicit `variant="brand"` button. `--surface-1` (cards/panels) and `--surface-2`
-(popovers/drawers/sheets) lift off `--background`; `--card`/`--popover` map onto them. Dark mode sits
-on a faintly-cool near-black (`240 8% 7%`, not pure black) so elevation reads. Elevation is
-`--shadow-1`/`--shadow-2` (the `--hi` top-highlight is baked in) plus `--sink` for recessed chrome
-(inputs, `SearchBar`), exposed as Tailwind `shadow-1`/`shadow-2`/`shadow-sink`/`shadow-hi`. Radius is
-Tight (`--radius: 0.5rem`). Tactile hover-lift/press-recess transforms live behind Tailwind's
-`motion-safe:` variant, so `prefers-reduced-motion` disables them outright. A `success`/`success-soft`
-token (theme-aware green) is the positive counterpart to severity — "healthy/up/good" — while `sev-*`
-stays reserved for warn/error/fatal only.
+an explicit `variant="brand"` button. Dark mode sits on a faintly-cool near-black (`240 8% 7%`, not
+pure black). A `success`/`success-soft` token (theme-aware green) is the positive counterpart to
+severity — "healthy/up/good" — while `sev-*` stays reserved for warn/error/fatal only.
+
+**Separation comes from the canvas, not from shadow (load-bearing).** `--background` is a visibly
+grey sheet (`235 16% 96.5%`) and `--surface-1` is pure white on top of it, so a card reads as a card
+with nothing but a hairline `--border` and a 1px ambient shadow. Do **not** lighten `--background`
+back toward white — the whole flat elevation ramp depends on that ~3.5% gap. `--card` maps to
+`--surface-1`; `--popover` maps to `--surface-2` (popovers / drawers / dialogs), the only layer that
+carries real depth. Elevation is exactly three steps, exposed as Tailwind `shadow-1`/`shadow-2`/
+`shadow-sink`: `--shadow-1` is a hairline ambient that only stops white dissolving into the canvas,
+`--shadow-2` is the one real float, `--sink` is the pressed-in state. There is no `--hi`
+top-highlight and no `shadow-hi` utility any more.
+
+**Radius is one family derived from `--radius` (0.75rem):** `rounded-sm` 6px (menu rows, checkboxes,
+swatches), `rounded-md` 10px (controls — buttons, inputs, toolbar triggers), `rounded-lg` 12px
+(panels, segmented/tab tracks), `rounded-xl` 14px (cards, tables-in-a-panel, alerts, toasts),
+`rounded-2xl` 18px (dialogs, the login card). Pills — badges, status pills, entity chips — use
+`rounded-full` and sit outside the scale. Pick by *what the thing is*, not by eye.
+
+**Canvas vs sheet (`AppShell`'s `surface` prop):** dashboards (`/home`, `/infra`, `/alerts`, `/data`,
+`/rum`, `/services`, `/uptime`) stay on the default `surface="canvas"` — the grey canvas is what makes
+their white cards read as cards, so **every table on a canvas view must own a panel**
+(`overflow-hidden rounded-xl border border-border bg-card shadow-1`, as `ServicesTable`/
+`RumBreakdownTable`/`DependencyTable` do). The dense explorers (`/logs`, `/traces`, `/traces/:id`,
+`/metrics`) pass `surface="sheet"` for one edge-to-edge white working surface, because their tables
+are full-bleed and own no panel.
 
 **Physicality budget (density rule — load-bearing):** chrome — buttons, cards, tiles, panels,
-overlays, nav — gets elevation plus hover-lift / press-recess / recessed inputs. Dense **data** rows
-(tables, log/span rows, waterfall bars) stay **flat and instant**: no shadow, no transform, just
-`hover:bg-muted` and a cyan `bg-brand-soft` selection with an inset left border. Don't add shadows or
-transforms to a table/row component — it breaks the density contract and can regress virtualized-
-scroll perf.
+overlays, nav — carries the hairline + ambient shadow. Dense **data** rows (tables, log/span rows,
+waterfall bars) stay **flat and instant**: no shadow, no transform, just `hover:bg-muted/60` and a
+cyan `bg-brand-soft` selection with an inset left border. Don't add shadows or transforms to a
+table/row component — it breaks the density contract and can regress virtualized-scroll perf.
 
-**Tactile "physical key" (`.pk`, `base.css`):** pressable chrome — the solid `button` variants and the
-`select-menu` trigger — sits on a hard bottom "lip" that grows on hover and collapses as the control
-presses **down** on `:active` (theme-aware; add `.pk-brand` alongside `.pk` for the cyan lip). `.pk`
-owns its own shadow/transform/transition, so don't pair it with `shadow-*`/manual `translate`
-utilities. Toggles read as lifted **keycaps**: `switch` (thumb taller than the track), `checkbox`
-(recessed → lifted cyan keycap with check), and `toggle-group`/`tabs` active items (raised pill,
-theme-correct in dark). `.pk` is for button-sized keys only — never data rows.
+**Pressable chrome (`.pk`, `base.css`):** the solid `button` variants and the `select-menu` trigger
+sit FLAT on the surface (`--shadow-1`, nothing more) and sink 1px on `:active` (`--sink`). No bevel,
+no bottom lip, no hover lift — depth is spent on things that actually float. The transform lives
+behind Tailwind's `motion-safe:`/`prefers-reduced-motion` guard. `.pk` owns its own
+shadow/transform/transition, so don't pair it with `shadow-*`/manual `translate` utilities, and don't
+put it on `outline`/`ghost` variants (flat by definition) or on data rows. Toggles are flat too:
+`switch` is a pill track with a plain circular thumb inside it, `checkbox` is a 6px-radius box that
+fills with brand, and `segmented`/`nav-tabs`/`tabs`/`toggle-group` active items are a white pill on a
+`bg-muted` track — `bg-surface-1` + `shadow-1` + `ring-1 ring-inset ring-border` (and `bg-secondary`
+in dark). All four switchers share that one look; what differs is what they drive.
 
 ## Build & embed
 
@@ -153,11 +173,13 @@ Each folder has an `index.js` barrel. **Reka-UI/shadcn ports use `<script setup 
 **shadcn-vue ports (TS):** `alert`, `badge`, `button`, `card`, `checkbox`, `dialog`, `dropdown-menu`,
 `form-field`, `input`, `label`, `popover`, `scroll-area`, `select`, `separator`, `sheet`, `skeleton`,
 `spinner`, `switch`, `table`, `tabs`, `toast` (+ `Toaster.vue`, `useToast.ts`), `toggle-group`,
-`tooltip`. Several picked up the elevation treatment above: `button` adds a `variant="brand"` tactile
-CTA (elevation, hover-lift, press-recess — spent sparingly); `card` adds an additive `interactive`
-prop that adds hover-lift for clickable cards; `input` is recessed (`shadow-sink`); `dialog`/
-`popover`/`sheet` sit on `--surface-2` + `shadow-2`; `table` rows follow the flat/instant density
-rule above.
+`tooltip`. Several carry Photon-specific additions: `button` adds a `variant="brand"` CTA (spent
+sparingly) and its `ghost` variant defaults to muted text; `badge` adds the soft tonal pills
+(`success`/`warning`/`error`/`brand`) plus `outline` as the neutral entity chip; `card` adds an
+additive `interactive` prop (hairline darkens + `shadow-2` on hover) for clickable cards; `input`,
+`select` and `SearchBar` share one flat field look (hairline + `focus:ring-2 ring-ring/20`, no inset
+shadow); `dialog`/`popover`/`sheet` sit on `--surface-2` + `shadow-2`; `table` rows follow the
+flat/instant density rule above.
 
 **Photon-authored primitives:**
 
@@ -165,7 +187,7 @@ rule above.
 |---|---|---|
 | `segmented` | segmented control on Reka ToggleGroup (traces/spans, table/cards); active item gets the raised pill | TS |
 | `nav-tabs` | sub-navigation tab bar (route sub-nav) | JS |
-| `stat-tile` | KPI tile: label + value + delta-arrow trend, optional `sub` caption + a `#spark` slot for an inline sparkline; raised, hover-lifts | TS |
+| `stat-tile` | KPI card: a header row (`#icon` in a soft rounded tile, label, `#action`), the headline value with its `secondary`/`delta` reading, an optional `sub` caption, a `#spark` slot, and an optional hairline-separated `#footer`. Static — no hover lift. `data-slot="label"`/`"value"` are the stable test hooks | TS |
 | `sparkline` | inline-SVG polyline sparkline with last-point dot | JS |
 | `status-dot` / `status-pill` | small tone-colored dot / pill label | TS |
 | `peek-drawer` | Sheet-based side drawer with prev/next stepping through a list | JS |

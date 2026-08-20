@@ -59,7 +59,7 @@ const availableVizIds = computed(() => availableViz({ type: props.metricType, se
       <!-- aggregation -->
       <DropdownMenu>
         <DropdownMenuTrigger as-child>
-          <button type="button" data-testid="agg-trigger" class="flex h-[34px] items-center gap-1.5 rounded-lg border border-border px-2.5 text-[13px] transition-colors hover:border-foreground/40">
+          <button type="button" data-testid="agg-trigger" class="flex h-[34px] items-center gap-1.5 rounded-md border border-border px-2.5 text-[13px] transition-colors hover:border-foreground/40">
             <span class="text-[11px] text-muted-foreground">agg</span>
             <span class="font-mono text-foreground">{{ effectiveAgg }}</span>
             <span v-if="agg == null" data-testid="agg-auto-badge" class="rounded border border-border bg-muted px-1 py-0.5 font-mono text-[9px] font-medium uppercase tracking-[0.08em] text-muted-foreground">auto</span>
@@ -74,7 +74,7 @@ const availableVizIds = computed(() => availableViz({ type: props.metricType, se
 
       <!-- group by (native select for testability; disabled for summary — quantiles aren't re-aggregatable) -->
       <label
-        class="flex h-[34px] items-center gap-1.5 rounded-lg border border-border px-2.5 text-[13px]"
+        class="flex h-[34px] items-center gap-1.5 rounded-md border border-border px-2.5 text-[13px]"
         :class="groupDisabled ? 'opacity-50' : ''"
         :title="groupDisabled ? 'Summary quantiles can’t be re-aggregated across series' : ''"
         data-testid="groupby-trigger"

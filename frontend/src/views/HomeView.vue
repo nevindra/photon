@@ -289,7 +289,7 @@ function openTenant(tenant: TenantSummary) {
       <!-- Three worlds -->
       <section class="grid grid-cols-1 gap-3 lg:grid-cols-3">
         <!-- Frontend · RUM Web Vitals -->
-        <div class="flex flex-col rounded-lg border border-border bg-surface-1 p-3">
+        <div class="flex flex-col rounded-xl border border-border bg-surface-1 p-3">
           <header class="mb-2 flex items-center justify-between gap-2">
             <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Frontend · Web Vitals</h3>
             <button
@@ -320,7 +320,7 @@ function openTenant(tenant: TenantSummary) {
         </div>
 
         <!-- Backend · Services (RED) -->
-        <div class="flex flex-col rounded-lg border border-border bg-surface-1 p-3">
+        <div class="flex flex-col rounded-xl border border-border bg-surface-1 p-3">
           <header class="mb-2 flex items-center justify-between gap-2">
             <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Backend · Services</h3>
             <button type="button" class="text-[11px] text-primary hover:underline" @click="go('/services')">
@@ -331,7 +331,7 @@ function openTenant(tenant: TenantSummary) {
         </div>
 
         <!-- Ops · Uptime -->
-        <div class="flex flex-col rounded-lg border border-border bg-surface-1 p-3">
+        <div class="flex flex-col rounded-xl border border-border bg-surface-1 p-3">
           <header class="mb-2 flex items-center justify-between gap-2">
             <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Ops · Uptime</h3>
             <button type="button" class="text-[11px] text-primary hover:underline" @click="go('/uptime')">

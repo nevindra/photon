@@ -4,7 +4,15 @@ import { cn } from '@/lib/core/utils'
 import { badgeVariants } from '.'
 
 const props = defineProps<{
-  variant?: 'default' | 'secondary' | 'destructive' | 'outline'
+  variant?:
+    | 'default'
+    | 'secondary'
+    | 'destructive'
+    | 'outline'
+    | 'success'
+    | 'warning'
+    | 'error'
+    | 'brand'
   class?: HTMLAttributes['class']
 }>()
 </script>

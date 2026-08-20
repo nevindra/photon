@@ -74,7 +74,7 @@ function fmtCount(v: number | null): string {
       <span class="font-mono tabular-nums">{{ formatNumber(processes.length) }}</span>
     </div>
 
-    <div class="flex flex-col rounded-lg border border-border bg-card shadow-1">
+    <div class="flex flex-col rounded-xl border border-border bg-card shadow-1">
       <Table container-class="overflow-x-auto" class="text-sm">
         <TableHeader>
           <TableRow class="text-[10px] font-medium uppercase tracking-wider text-muted-foreground hover:bg-transparent">

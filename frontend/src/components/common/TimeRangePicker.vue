@@ -147,7 +147,7 @@ function applySelection() {
           <input
             v-model="fromInput"
             type="datetime-local"
-            class="rounded-md border border-input bg-background px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            class="rounded-md border border-input bg-surface-1 px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
             @input="clearPendingPreset"
           />
         </label>
@@ -156,7 +156,7 @@ function applySelection() {
           <input
             v-model="toInput"
             type="datetime-local"
-            class="rounded-md border border-input bg-background px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            class="rounded-md border border-input bg-surface-1 px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
             @input="clearPendingPreset"
           />
         </label>

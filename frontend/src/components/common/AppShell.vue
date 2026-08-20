@@ -14,6 +14,13 @@ const props = defineProps({
   live: { type: Boolean, default: false },
   liveMode: { type: String, default: 'manual' },
   liveStatus: { type: String, default: 'idle' },
+  // What the view's content sits on. 'canvas' (default) is the grey app canvas — right for
+  // dashboards, where every block is its own white card and the grey is what makes the cards
+  // read as cards. 'sheet' is one white working surface edge-to-edge — right for the dense
+  // explorers (logs / traces / metrics), whose tables are full-bleed and own no panel of their
+  // own; on the canvas they'd be a grey table. A view that puts every table in a panel should
+  // stay on 'canvas'.
+  surface: { type: String, default: 'canvas' },
 })
 defineEmits(['update:liveMode', 'refresh'])
 
@@ -72,7 +79,10 @@ async function onLogout() {
 <template>
   <div class="flex h-full min-h-0">
     <NavRail :active="active" :mock="mock" @select="onSelect" @logout="onLogout" />
-    <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+    <div
+      class="flex min-h-0 min-w-0 flex-1 flex-col"
+      :class="surface === 'sheet' ? 'bg-surface-1' : 'bg-background'"
+    >
       <ContextBar
         :crumb="crumb"
         :live="live"

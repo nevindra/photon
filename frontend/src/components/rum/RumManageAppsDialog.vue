@@ -128,7 +128,7 @@ watch(
               rows="2"
               data-testid="app-origins"
               :value="app.allowed_origins.join('\n')"
-              class="flex w-full rounded-md border border-input bg-background px-3 py-1.5 font-mono text-xs shadow-sink transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              class="flex w-full rounded-md border border-input bg-surface-1 px-3 py-1.5 font-mono text-xs transition-[border-color,box-shadow] duration-150 ease-out placeholder:text-muted-foreground hover:border-foreground/15 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/20"
               @change="editOrigins(app, ($event.target as HTMLTextAreaElement).value)"
             />
           </div>
@@ -159,7 +159,7 @@ watch(
             data-testid="new-app-origins"
             rows="2"
             placeholder="https://app.example.com"
-            class="flex w-full rounded-md border border-input bg-background px-3 py-1.5 font-mono text-xs shadow-sink transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            class="flex w-full rounded-md border border-input bg-surface-1 px-3 py-1.5 font-mono text-xs transition-[border-color,box-shadow] duration-150 ease-out placeholder:text-muted-foreground hover:border-foreground/15 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/20"
           />
         </FormField>
         <Button type="submit" :disabled="createMut.isPending.value">

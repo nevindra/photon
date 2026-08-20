@@ -460,7 +460,7 @@ if (typeof window !== 'undefined') {
 </script>
 
 <template>
-  <AppShell active="traces" :mock="api.mock" crumb="Traces">
+  <AppShell active="traces" :mock="api.mock" crumb="Traces" surface="sheet">
     <template #toolbar>
       <SearchBar
         :model-value="text"

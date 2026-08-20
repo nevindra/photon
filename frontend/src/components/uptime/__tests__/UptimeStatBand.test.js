@@ -19,11 +19,11 @@ describe('UptimeStatBand', () => {
     expect(text).toContain('Down')
     expect(text).toContain('Paused')
     // 5 total, 2 up, 1 down, 1 paused
-    expect(w.findAll('.text-2xl').map((n) => n.text())).toEqual(['5', '2', '1', '1'])
+    expect(w.findAll('[data-slot="value"]').map((n) => n.text())).toEqual(['5', '2', '1', '1'])
   })
 
   it('renders zero counts for an empty list', () => {
     const w = mount(UptimeStatBand, { props: { monitors: [] } })
-    expect(w.findAll('.text-2xl').map((n) => n.text())).toEqual(['0', '0', '0', '0'])
+    expect(w.findAll('[data-slot="value"]').map((n) => n.text())).toEqual(['0', '0', '0', '0'])
   })
 })

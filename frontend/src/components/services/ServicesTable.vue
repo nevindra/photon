@@ -99,9 +99,9 @@ const COLUMNS = [
 </script>
 
 <template>
-  <div class="flex flex-col rounded-lg border border-border bg-card shadow-1">
+  <div class="flex flex-col overflow-hidden rounded-xl border border-border bg-card shadow-1">
     <Table container-class="overflow-visible" class="border-collapse font-mono text-xs">
-      <TableHeader class="sticky top-0 z-10 rounded-t-lg bg-card">
+      <TableHeader class="sticky top-0 z-10 bg-card">
         <TableRow class="text-[10px] font-medium uppercase tracking-wider text-muted-foreground hover:bg-transparent">
           <TableHead
             v-for="col in COLUMNS"
@@ -136,7 +136,7 @@ const COLUMNS = [
           <TableCell class="py-1.5 text-foreground">
             <span class="inline-flex items-center gap-1.5">
               {{ row.service }}
-              <Badge v-if="row.tenant" data-testid="service-tenant-badge" class="rounded-full border-brand/35 bg-brand-soft px-1.5 py-0 text-[10px] text-brand">
+              <Badge v-if="row.tenant" variant="brand" data-testid="service-tenant-badge" class="px-1.5 py-0 text-[10px]">
                 {{ row.tenant }}
               </Badge>
             </span>

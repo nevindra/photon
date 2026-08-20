@@ -120,7 +120,7 @@ async function copyTraceId() {
 </script>
 
 <template>
-  <AppShell active="traces" :mock="api.mock" :crumb="crumb">
+  <AppShell active="traces" :mock="api.mock" :crumb="crumb" surface="sheet">
     <!-- The old header row (back button + Traces/root breadcrumb + trace-id chip + view-all-logs)
          folds into the one ContextBar: back button → lead slot, trace-id chip + view-all-logs →
          actions slot. The crumb already reads "Traces › <short id>"; the root op is still shown in

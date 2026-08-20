@@ -122,8 +122,13 @@ falls back to in-browser mocks on a network failure while surfacing real 400/404
 **TanStack Query** composables (`lib/*Queries.ts`) keyed off URL/filter state. Tables/waterfalls are
 row-windowed with **TanStack Virtual** on headless **TanStack Table**; charts use **uPlot**
 (`components/charts/`); **VueUse** supplies small composables. Visual design is token-driven
-(`styles/tokens.css`): a near-neutral base, a single reserved Photon Cyan brand accent, and layered
-`surface-1`/`surface-2` chrome — see [`docs/frontend.md`](docs/frontend.md).
+(`styles/tokens.css`): a near-neutral base, a single reserved Photon Cyan brand accent, and a **flat**
+elevation ramp — white `surface-1` paper on a visibly grey `--background` canvas, held by a hairline
+`--border`, with real depth (`shadow-2`) reserved for things that float. One radius family comes off
+`--radius` (0.75rem): sm 6 / md 10 / lg 12 / xl 14 / 2xl 18, pills use `rounded-full`. `AppShell`'s
+`surface` prop picks the working surface per view: `canvas` (grey, for card dashboards — every table
+there owns a panel) or `sheet` (one white sheet, for the `/logs`, `/traces`, `/metrics` explorers).
+See [`docs/frontend.md`](docs/frontend.md).
 
 ## Test, lint, format
 

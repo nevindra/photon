@@ -460,7 +460,7 @@ function onKeydown(e) {
 <template>
   <div class="relative w-full">
     <div
-      class="relative w-full rounded-md border border-input bg-background shadow-sink transition-shadow focus-within:ring-2 focus-within:ring-ring"
+      class="relative w-full rounded-md border border-input bg-surface-1 transition-[border-color,box-shadow] duration-150 ease-out hover:border-foreground/15 focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/20"
     >
       <!-- Overlay (behind): tokenized, styled, character-aligned, non-interactive. -->
       <div

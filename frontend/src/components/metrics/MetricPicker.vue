@@ -49,7 +49,7 @@ const isFav = (name) => props.favorites.includes(name)
         type="button"
         data-testid="metric-picker-trigger"
         :class="cn(
-          'flex h-[34px] items-center gap-2 rounded-lg border border-border bg-background px-2.5 text-[13px] font-medium transition-colors hover:border-foreground/40 data-[state=open]:border-foreground/40',
+          'flex h-[34px] items-center gap-2 rounded-md border border-border bg-surface-1 px-2.5 text-[13px] font-medium transition-colors hover:border-foreground/40 data-[state=open]:border-foreground/40',
           'min-w-[220px] max-w-[360px]',
         )"
       >

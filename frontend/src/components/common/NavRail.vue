@@ -92,7 +92,7 @@ function onSelect(item) {
 
 <template>
   <nav
-    class="flex h-full w-[74px] shrink-0 flex-col items-center gap-1 border-r border-border bg-muted/40 py-3"
+    class="flex h-full w-[74px] shrink-0 flex-col items-center gap-1 border-r border-border bg-surface-1 py-3"
   >
     <div class="relative">
       <PhotonMark :size="30" />
@@ -119,7 +119,7 @@ function onSelect(item) {
           :data-nav="item.key"
           :class="
             cn(
-              'relative flex w-[58px] flex-col items-center gap-1 rounded-md py-2 transition-colors',
+              'relative flex w-[58px] flex-col items-center gap-1 rounded-lg py-2 transition-colors',
               item.key === active
                 ? 'bg-brand-soft text-brand'
                 : 'text-muted-foreground hover:bg-muted hover:text-foreground',
@@ -155,7 +155,7 @@ function onSelect(item) {
 
       <button
         type="button"
-        class="flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+        class="flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
         aria-label="Settings"
         @click="settingsOpen = true"
       >

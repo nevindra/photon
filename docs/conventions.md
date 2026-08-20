@@ -99,6 +99,15 @@ public API, adding a dependency, or touching the query/chart data path.
 - **`ui/` primitives are `<script setup lang="ts">`; views and domain components are, by default,
   plain JS `<script setup>`.** The only plain-JS files under `ui/` are the Photon-authored composites
   (`facet/`, `nav-tabs/`, `peek-drawer/`, `select-menu/`, `sparkline/`).
+- **Style comes from the tokens, never from eyeballed utilities.** Colour, elevation and radius live
+  in `styles/tokens.css` + `tailwind.config.js`; components consume them. Elevation is three steps
+  only — `shadow-1` (hairline ambient on chrome), `shadow-2` (things that actually float: popovers,
+  drawers, dialogs, tooltips), `shadow-sink` (pressed) — so don't reach for stock Tailwind
+  `shadow-sm`/`md`/`lg`. Radius is one family off `--radius`: `rounded-sm` 6 (menu rows, checkboxes),
+  `rounded-md` 10 (controls), `rounded-lg` 12 (panels, switcher tracks), `rounded-xl` 14 (cards),
+  `rounded-2xl` 18 (dialogs); pills use `rounded-full`. Pick by what the thing *is*. Separation comes
+  from white paper on a grey canvas, so a table on a `surface="canvas"` view must own a panel
+  (`rounded-xl border border-border bg-card shadow-1`) — see `docs/frontend.md`.
 - **TypeScript adoption is new-files-only.** Every *new* frontend file — new `lib/` modules, new
   components, new test files — is authored in TypeScript: `.ts` for plain modules
   (`lib/context.ts`, `lib/useCorrelate.ts`), `<script setup lang="ts">` for new components

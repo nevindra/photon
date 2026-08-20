@@ -13,7 +13,7 @@ const sevTone = computed(() => (props.template.severity === 'critical' ? 'error'
 </script>
 
 <template>
-  <div class="flex items-center justify-between gap-4 rounded-lg border border-border bg-card px-4 py-3">
+  <div class="flex items-center justify-between gap-4 rounded-xl border border-border bg-card px-4 py-3">
     <div class="min-w-0">
       <div class="flex items-center gap-2">
         <span class="text-sm font-medium text-foreground">{{ template.name }}</span>

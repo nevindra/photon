@@ -55,7 +55,7 @@ const createdAt = (ms: number): string => formatFull(BigInt(ms) * 1_000_000n)
       </button>
     </EmptyState>
 
-    <div v-else data-testid="tenants-table" class="overflow-x-auto rounded-lg border border-border">
+    <div v-else data-testid="tenants-table" class="overflow-x-auto rounded-xl border border-border">
       <table class="w-full border-collapse text-sm">
         <thead>
           <tr class="border-b border-border text-[10px] uppercase tracking-wide text-muted-foreground">

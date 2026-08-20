@@ -246,7 +246,11 @@ function onOpenDependencyTraces() {
         <span class="font-mono">{{ customRange ? 'custom range' : `last ${timeRange}` }}</span>
         <Spinner v-if="keyOpsLoading" size="sm">loading…</Spinner>
       </div>
-      <RedTable :rows="keyOps" group="operation" :loading="keyOpsLoading" @open-exemplars="onOpenExemplars" />
+      <div class="px-5">
+        <div class="overflow-hidden rounded-xl border border-border bg-card shadow-1">
+          <RedTable :rows="keyOps" group="operation" :loading="keyOpsLoading" @open-exemplars="onOpenExemplars" />
+        </div>
+      </div>
 
       <!-- Dependencies (clickable → traces) -->
       <div class="grid grid-cols-1 gap-4 px-5 py-5 lg:grid-cols-2">

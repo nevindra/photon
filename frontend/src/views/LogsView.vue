@@ -428,7 +428,7 @@ const aggregatesAsOfSec = computed(() =>
 </script>
 
 <template>
-    <AppShell :mock="api.mock" crumb="Logs">
+    <AppShell :mock="api.mock" crumb="Logs" surface="sheet">
         <template #toolbar>
             <SearchBar
                 :model-value="text"
