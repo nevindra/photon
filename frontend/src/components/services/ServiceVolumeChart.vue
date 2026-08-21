@@ -9,10 +9,11 @@ import { useChartTheme } from '@/components/charts/useChartTheme.js'
 import { formatNumber } from '@/lib/core/format'
 
 const props = defineProps({
-  buckets: { type: Array, default: () => [] }, // [{ ts: nsString, count, error_count }]
+  buckets: { type: Array, default: () => [] }, // [{ ts: epoch ms, count, error_count }]
   startMs: { type: Number, required: true },
   endMs: { type: Number, required: true },
   loading: { type: Boolean, default: false },
+  markers: { type: Array, default: () => [] }, // [{ xMs, label, color }] — deploy lines
 })
 
 // Resolve tokens to concrete colours for the canvas, re-resolving on a light↔dark flip.
@@ -28,13 +29,16 @@ const colors = computed(() => {
   }
 })
 
-const NS = 1_000_000n
+// `/api/services/:service/timeseries` sends `ts` as an epoch-MILLISECOND number
+// (`crates/photon-api/src/services.rs`), and `BarChart` plots milliseconds. This used to divide by
+// 1e6, from back when the route sent nanosecond strings — which put every bar around epoch 1970,
+// outside `[startMs, endMs]`, and drew an empty chart.
 const chartBuckets = computed(() =>
   props.buckets.map((b) => {
     const total = Number(b?.count ?? 0)
     const err = Number(b?.error_count ?? 0)
     return {
-      t: Number(BigInt(b?.ts ?? 0) / NS),
+      t: Number(b?.ts ?? 0),
       segments: [
         { key: 'ok', label: 'Ok', color: colors.value.ok, value: Math.max(0, total - err) },
         { key: 'error', label: 'Error', color: colors.value.error, value: err },
@@ -45,5 +49,5 @@ const chartBuckets = computed(() =>
 </script>
 
 <template>
-  <BarChart :buckets="chartBuckets" :start-ms="startMs" :end-ms="endMs" :stacked="true" :format-value="formatNumber" :loading="loading" />
+  <BarChart :markers="markers" :buckets="chartBuckets" :start-ms="startMs" :end-ms="endMs" :stacked="true" :format-value="formatNumber" :loading="loading" />
 </template>

@@ -124,23 +124,25 @@ describe('attention levels', () => {
 })
 
 describe('serviceSubjects', () => {
-  it('maps serviceHealth bands onto the shared axis and keeps the native word', () => {
+  it('takes serviceHealth’s judgment as-is, one clause per crossed threshold', () => {
     const [critical] = serviceSubjects([{ service: 'payments-api', count: 500, error_rate: 0.082, apdex: 0.62 }])
     expect(critical.level).toBe('critical')
     expect(critical.reasons[0]).toEqual({ label: 'Error rate', value: '8.2%', note: 'critical' })
 
-    const [degraded] = serviceSubjects([{ service: 'auth-api', count: 500, error_rate: 0.002, apdex: 0.81 }])
-    // "degraded" is serviceHealth's word; on the board it ranks as Warning.
-    expect(degraded.level).toBe('warning')
-    expect(degraded.reasons[0].note).toBe('degraded')
+    // serviceHealth speaks the shared vocabulary now, so the note is "warning" — the old
+    // "degraded" band word is retired along with `idle`.
+    const [warning] = serviceSubjects([{ service: 'auth-api', count: 500, error_rate: 0.002, apdex: 0.81 }])
+    expect(warning.level).toBe('warning')
+    expect(warning.reasons[0]).toEqual({ label: 'Apdex', value: '0.81', note: 'warning' })
 
     const [healthy] = serviceSubjects([{ service: 'search', count: 500, error_rate: 0, apdex: 0.99 }])
     expect(healthy.level).toBe('ok')
     expect(healthy.reasons).toEqual([])
   })
 
-  // The hole this closes: serviceStatus() returns `idle` for zero traffic, so a service falling
-  // from thousands of req/s to nothing used to disappear exactly when it mattered.
+  // The hole this closes: zero traffic used to be a level of its own (`idle`), so a service falling
+  // from thousands of req/s to nothing disappeared exactly when it mattered. It is Down now, and
+  // the rule lives in serviceHealth.ts where every page reads it.
   it('calls a service that reported and then stopped Down, not idle', () => {
     const subjects = serviceSubjects([], [{ service: 'ledger-worker', count: 3400, rate: 340 }])
     expect(subjects).toHaveLength(1)

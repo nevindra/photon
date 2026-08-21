@@ -1,5 +1,5 @@
 <script setup>
-// SearchBar — model A′ (spec §2/§3 of docs/superpowers/specs/2026-07-02-search-ux-revamp-design.md).
+// SearchBar — the query-grammar input. Grammar: docs/subsystems/logs.md; UI: docs/frontend.md.
 //
 // Technique: a colored, pointer-events-none overlay <div> sits BEHIND a transparent real
 // <input>. The input owns the text/caret/selection (100% normal text editing); the overlay

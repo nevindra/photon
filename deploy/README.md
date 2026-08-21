@@ -278,9 +278,13 @@ with `PHOTON_CONFIG=/etc/photon/photon.toml`); env vars override individual fiel
 | `PHOTON_STORAGE_HOT_DIR` | | `/var/lib/photon/hot` | Hot tier (WAL + Parquet + index) |
 | `PHOTON_STORAGE_DB_PATH` | | `/var/lib/photon/photon.db` | Control-plane SQLite db |
 | `PHOTON_RETENTION_DAYS` | | `30` | Log retention (days, > 0) |
-| `PHOTON_PROMOTED_ATTRIBUTES` | | `service.name,host.name` | Comma-separated promoted columns (must include `service.name`) |
+| `PHOTON_PROMOTED_ATTRIBUTES` | | `service.name,host.name,deployment.environment` | Comma-separated promoted columns (must include `service.name`) |
 | `PHOTON_UPTIME_ENABLED` | | `false` | Enable the uptime subsystem with defaults |
 | `PHOTON_APM_DEFAULT_APDEX_THRESHOLD_MS` | | `500` | Default Apdex T (ms) |
+| `PHOTON_ROLLUP_ENABLED` | | `true` | Publish `photon.service.*` / `photon.operation.*` from spans ([rollup.md](../docs/subsystems/rollup.md)) |
+| `PHOTON_ROLLUP_INTERVAL_SECS` | | `60` | How often a rollup pass runs (floored at 15) |
+| `PHOTON_ROLLUP_LAG_SECS` | | `600` | How long a 60s bucket stays open for late spans before it is published once |
+| `PHOTON_ROLLUP_TOP_OPERATIONS` | | `50` | Operation series kept per (service, environment); the tail sums into `__other__` |
 | `PHOTON_DURABLE_ENDPOINT` | | — | S3 endpoint; **presence enables durable replication** |
 | `PHOTON_DURABLE_BUCKET` | when durable | — | S3 bucket |
 | `PHOTON_DURABLE_REGION` | when durable | — | S3 region |

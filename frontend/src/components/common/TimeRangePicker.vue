@@ -1,7 +1,6 @@
 <script setup>
 // Header time-range control — compact, preset-first popover with a custom
-// absolute-range escape hatch. See docs/superpowers/specs/
-// 2026-07-02-search-ux-revamp-design.md §5 "Time-range picker (model A)".
+// absolute-range escape hatch. See docs/frontend.md.
 //
 // Presets and custom range are mutually exclusive: picking a preset clears
 // the parent's customRange, applying a custom range clears the parent's

@@ -1,9 +1,8 @@
 <script setup lang="ts">
 // The sentence-style condition builder used inside AlertRuleDialog (Task 14). A signal segmented
 // control (Metrics/Logs/Traces/RUM) swaps the field set; the rest reads as plain English with the
-// blanks as dropdowns/inputs, mirroring the approved mockup
-// (.superpowers/brainstorm/37613-1784341076/content/alerts-final.html). `for` (sustained-breach
-// duration) is deliberately NOT here — per the design doc §5, `for_secs` is a column of
+// blanks as dropdowns/inputs, mirroring the approved mockup. `for` (sustained-breach
+// duration) is deliberately NOT here — `for_secs` is a column of
 // `alert_rules`, not part of the per-signal `condition` JSON, so AlertRuleDialog owns that field.
 //
 // Ownership model: this component seeds its local `form`/`signal` state ONCE from the initial

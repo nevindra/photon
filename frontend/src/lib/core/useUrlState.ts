@@ -1,7 +1,8 @@
 // URL <-> filter-state sync for the logs view. Query keys are short so the URL stays
 // shareable: `svc` / `sev` (comma-joined lists), `q` (free-text search).
-// `range`/`from`/`to`/`scope` are owned solely by context.ts and are preserved as-is —
-// this module never reads or deletes them.
+// `range`/`from`/`to`/`tenant`/`env` are owned solely by context.ts and are preserved as-is —
+// this module never reads or deletes them, so a drill-in → back round trip keeps the global
+// context alongside the view's own filters.
 //
 // `parseQuery` / `buildQuery` are pure and round-trip stable — the same object comes back
 // out of `parseQuery(buildQuery(state))` (modulo array order/dedupe, which callers control).
@@ -79,7 +80,7 @@ export function useUrlState(refs: UrlStateRefs): void {
 
   const OWNED = ['svc', 'sev', 'q']
   const sync = () => {
-    const p = new URLSearchParams(window.location.search) // preserve range/from/to/scope (owned by context.ts)
+    const p = new URLSearchParams(window.location.search) // preserve range/from/to/tenant/env (owned by context.ts)
     OWNED.forEach((k) => p.delete(k))
     const built = new URLSearchParams(
       buildQuery({
@@ -107,8 +108,8 @@ export function useUrlState(refs: UrlStateRefs): void {
 
 // One URL key <-> one ref, merge-preserving. The narrow counterpart to `useUrlState` for views that
 // own a single param (`/home`'s `?world=`): seeds the ref from location.search on setup, then
-// rewrites ONLY that key whenever the ref changes, leaving context.ts's range/from/to/tenant and
-// every other view key untouched. A value equal to `fallback` is omitted so a clean URL stays clean.
+// rewrites ONLY that key whenever the ref changes, leaving context.ts's range/from/to/tenant/env
+// and every other view key untouched. A value equal to `fallback` is omitted so a clean URL stays clean.
 export function useUrlParam(
   key: string,
   value: Ref<string | null>,

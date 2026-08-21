@@ -68,7 +68,13 @@ days = 30
 # Attributes promoted to their own columns (indexed / fast to filter). Everything else is
 # stored in the long-tail attributes map. `service.name` is required (it is the primary sort
 # key) and each entry must be unique and must not collide with a reserved column name.
-promoted_attributes = ["service.name", "host.name"]
+#
+# `deployment.environment` is here because it is part of a subject's identity, not a label:
+# `payments-api` in prod and in staging are two deployments that fail independently, and averaging
+# them into one row hides real regressions. It is a global UI filter (the ContextBar's environment
+# picker), so it is read on every page and earns its own column. Removing it does not break
+# anything — the key still filters from the long-tail map, just without min/max pruning.
+promoted_attributes = ["service.name", "host.name", "deployment.environment"]
 
 # --- Write-ahead log ---------------------------------------------------------------------
 [wal]
@@ -109,6 +115,19 @@ worker_concurrency = 32
 # per-service override (set from the Services UI). tolerating = T..4T, frustrated = >4T.
 [apm]
 default_apdex_threshold_ms = 500
+
+# --- Service rollup (photon.service.* / photon.operation.* metrics) ------------------------
+# A background pass turns spans into per-service and per-operation RED, published as ordinary
+# metrics, so the Backend pages can read a wide window without re-scanning raw spans. Always on;
+# every key below is optional. Env: PHOTON_ROLLUP_ENABLED / _INTERVAL_SECS / _LAG_SECS /
+# _TOP_OPERATIONS. See docs/subsystems/rollup.md.
+[rollup]
+# enabled        = true   # false = never publish; the Backend pages then always scan raw spans
+# interval_secs  = 60     # how often a pass runs (floored at 15)
+# lag_secs       = 600    # how long a bucket stays open for late spans before it is published
+#                         # ONCE and never revisited. Spans later than this never reach the rollup.
+# top_operations = 50     # operation series kept per (service, environment); the tail is summed
+#                         # into a single `__other__` series. 0 = service level only.
 
 # --- Real-User Monitoring (RUM) -----------------------------------------------------------
 # RUM apps are managed in the UI (Frontend → Manage apps), not in config. On a fresh install

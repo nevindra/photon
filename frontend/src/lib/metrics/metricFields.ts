@@ -25,6 +25,14 @@ export interface MetricFieldDescriptor {
   values?: string[] | 'services'
 }
 
+// Descriptions for the label keys that are context dimensions rather than metric labels — they
+// arrive on the same `attributeKeys` list as everything else, so they'd otherwise read as a bare
+// "Label tenant" / "Label deployment.environment".
+const CONTEXT_LABEL_DESCRIPTIONS: Record<string, string> = {
+  tenant: 'Federated tenant (stamped by central)',
+  'deployment.environment': 'Deployment environment (prod / staging / …), as declared by the producer',
+}
+
 export function buildMetricCatalog(
   attributeKeys: string[] = [],
   _services: string[] = [],
@@ -33,9 +41,7 @@ export function buildMetricCatalog(
   return keys.map((name) =>
     name === 'service' || name === 'service.name'
       ? { name: 'service', description: 'Service name', kind: 'match', values: 'services' }
-      : name === 'tenant'
-        ? { name: 'tenant', description: 'Federated tenant (stamped by central)', kind: 'match' }
-        : { name, description: `Label ${name}`, kind: 'match' },
+      : { name, description: CONTEXT_LABEL_DESCRIPTIONS[name] ?? `Label ${name}`, kind: 'match' },
   )
 }
 

@@ -2966,6 +2966,7 @@ dependencies = [
  "photon-wal",
  "prost",
  "reqwest",
+ "rusqlite",
  "serde_json",
  "snap",
  "tempfile",

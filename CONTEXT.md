@@ -17,14 +17,18 @@ not a Subject. Deliberately NOT called Entity (taken: the "Related ▾" navigati
 (taken: Vue components), or Target (the alerts vocabulary for what a rule is *about* — that set
 lacks Monitor and includes `global`, which is the absence of a place).
 
-A Subject is identified by **(Site, kind, name)**, never by name alone. `payments-api` in `eu-west`
-and `payments-api` in `us-east` are two Subjects: same software, two deployments, two things that
-can fail independently. [[central]]'s own local Subjects carry no Site, and that absence is part of
-the identity rather than a missing value.
+A Subject is identified by **(Site, [[environment]], kind, name)**, never by name alone. `payments-api`
+in `eu-west` and `payments-api` in `us-east` are two Subjects, and so are `payments-api` in `prod` and
+in `staging` inside one Site: same software, different deployments, things that can fail
+independently. Merging any of them would average one deployment's failure into another's health.
+[[central]]'s own local Subjects carry no Site, and that absence is part of the identity rather than a
+missing value.
 
 **Spread** — on [[central]], how many Sites a Service or RUM app is unhealthy in, out of how many
 run it ("3 of 3", "1 of 3"). Spread is a *diagnosis*, not a count: unhealthy everywhere points at
-the software, unhealthy in one Site points at that Site. Only Services and RUM apps have a Spread,
+the software, unhealthy in one Site points at that Site. It is always read inside one
+[[environment]]: comparing one Site's `prod` against another's `staging` diagnoses nothing. Only
+Services and RUM apps have a Spread,
 because only they are one piece of software deployed many times. Hosts and Monitors never do —
 `web-03` in `eu-west` and `web-03` in `us-east` are two machines that happen to share a hostname,
 and merging them would invent a thing that does not exist.
@@ -42,19 +46,29 @@ because "tenant" reads as *customer* — which is exactly the drift that once ha
 `README.md` listing clustering as out of scope. All three now match this entry: federating a fleet
 of our own installs is not clustering, and it is not something we sell to a customer.
 
+**Environment** — which deployment of a piece of software a record belongs to: `prod`, `staging`, `dev`.
+Part of a [[subject]]'s identity for the same reason [[site]] is, and orthogonal to it: a Site is *where*
+software runs, an Environment is *which copy* of it. Photon reads the Environment a producer declares and
+never infers one; records that declare none belong to no Environment, which is a fact about the
+instrumentation rather than a default worth inventing. Prod is the Environment worth waking someone for,
+so it is what the UI selects when it is present, but the others are one click away rather than hidden.
+
 **Central** — the Photon a fleet of [[site]]s pushes to. Central is not a different product: it runs
 the same code and the same landing page. The difference is only in the data — on Central every
 Subject carries a Site, on a Site install none do. Readers split the same way: the central team
 reads Central, a site team reads their own Site's Photon. Nobody is *restricted* to a Site by
 Photon; there are no roles yet, so scoping is what the data already is, never an enforced boundary.
 
-**Attention Level** — the one severity axis the landing page ranks [[subject]]s on, so that a Host
+**Attention Level** — the one severity axis every page ranks [[subject]]s on, so that a Host
 and a Service can be compared at all. Four levels — **Down** (not answering), **Critical** (answering
 badly, user-visible), **Warning** (degraded, not yet breaking), **OK** — plus **Unknown**, which is
 not a level but the *absence* of a judgment (no traffic, paused, never reported). Each kind's native
 word (`degraded`, `poor`, `down`, `error`) survives verbatim in the Subject's reason line; only the
 ranking is unified. A slow Web Vital is Warning, never Critical — a page that cries wolf about
-latency stops being read.
+latency stops being read. There is no second severity vocabulary anywhere: the Backend world once had
+its own (`critical` / `degraded` / `healthy` / `idle`), which let one Service be called two different
+things on two pages in the same second. `idle` in particular was one word covering two unrelated
+facts, and is retired in favour of [[silence]] and Unknown.
 
 **Silence** — a Subject that reported inside the [[watch-range]] and then stopped for several
 expected intervals. Silence is **Down**, because the stopping is itself the news. A Subject that
@@ -74,19 +88,48 @@ the Backend world.
 
 **Operation** — one named span within a service (`name`). A service has many operations.
 
-**Service Health** — a Service's classification into `critical` / `degraded` / `healthy` / `idle`
-over the active time window, decided by error rate OR Apdex, whichever is worse. No traffic means
-`idle`, never a colour. Health is a *derived, window-scoped* judgment, not stored state.
+**Request** — one unit of work a Service was asked to do, counted from its **entry spans**: the spans
+where work crossed into the Service from outside. Everything else a Service emits is its own internal
+work, real but not a request. The distinction is load-bearing because a Service that instruments
+generously would otherwise look several times busier than one doing identical work, and the two sit in
+the same sorted table. A Service that emits no entry spans at all is still counted rather than
+disappearing, and the page says which rule produced the number.
 
-**Apdex** — a Service's satisfaction score over the window, from the share of spans that are
+Every judgment about a Service — its [[attention-level]], its error rate, its [[apdex]] — is made over
+Requests, so a downstream call that failed and was retried successfully never makes the Service look
+broken. Health is *derived and window-scoped*, never stored state.
+
+**Apdex** — a Service's satisfaction score over the window, from the share of [[request]]s that are
 satisfied (≤ T), tolerating (T..4T), or frustrated (> 4T). T is per-Service, overridable.
+
+**Objective** — a named promise about a Service, either availability (a share of [[request]]s that
+must succeed) or latency (a share that must land under a threshold), measured over a rolling window.
+A Service may have several, and one may be narrowed to a single [[operation]], because a checkout
+endpoint and an admin page in the same Service do not deserve the same promise. Apdex is a *reading*;
+an Objective is a *commitment*, and only the second one can be missed.
+
+**Error Budget** — how much of an [[objective]]'s allowed failure is still unspent. **Burn Rate** is
+how fast it is going, expressed against the rate that would exactly exhaust it over the window. Budget
+alone conveys no urgency: "40% left" reads the same whether it took a month or ten minutes. Burn rate
+is the number that tells someone whether to get up.
+
+**Deployment** — a moment when a Service began running a new version. Photon notices one by observing a
+version it has not seen before, so the record exists whether or not anyone wired up a pipeline; a build
+system may enrich that record with a commit and an author, but never has to create it. A Deployment is
+the first thing worth checking when a Service's numbers change shape, which is why it appears on the
+charts rather than only in a list.
 
 **Backend Issue** — a group of span errors sharing the same `(service, backend error fingerprint)`.
 Identity is the pair, not the fingerprint alone: the same exception in two Services is two Issues,
 because they have different owners and different fixes. Fingerprint is derived from the span's
 exception event (type + digit-masked message + top frame), falling back to `status_message` when
-the span carries no exception event. Compare [[rum-issue]] — the same idea on the Frontend world,
-already implemented.
+the span carries no exception event. Compare [[rum-issue]] — the same idea on the Frontend world;
+both use the same hash function (`photon_core::rum::fingerprint`), because two grouping rules for one
+concept is how "the same error" stops meaning the same thing.
+
+The fingerprint is computed at **ingest** and stored as the `error.fingerprint` span attribute, so
+spans ingested before it shipped carry none and never will. There is deliberately no backfill and no
+query-time fallback: one honest gap in the history beats two grouping rules for one concept.
 
 **RUM Issue** — a group of browser errors sharing a `rum.error.fingerprint`, scoped to a RUM app.
 The Frontend-world counterpart of a Backend Issue. Deliberately a separate concept: it is grouped
@@ -95,6 +138,16 @@ per app, not per Service, and its evidence is sessions rather than spans.
 **Dependency** — a downstream call a Service makes, split by kind: a Database dependency (a CLIENT
 span carrying `db.system`) or an External dependency (a CLIENT span naming a peer). A Dependency is
 *not* a Service, even when the peer happens to be one.
+
+**Caller** — a Service that sends work *to* another Service. The mirror of a [[dependency]], and a
+different question: a Dependency answers "what am I waiting on", a Caller answers "who is hurt when I
+break". Callers cannot be read off a Service's own spans the way Dependencies can, because the
+evidence lives in the *other* Service's spans; they are recovered by following span parentage across
+Services. A browser app instrumented for tracing appears as a Caller like any other.
+
+**Edge** — one Caller-to-Service pair over the window, carrying its own volume, error rate, and
+latency. The whole set of Edges is the fleet's shape. Read from one Service it is that Service's
+Callers and Dependencies; read across all Services it is the map.
 
 ## Time
 

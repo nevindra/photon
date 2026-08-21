@@ -72,7 +72,9 @@ fn status_slot(status: Option<i32>) -> usize {
     }
 }
 
-async fn histogram_over(
+/// `pub(crate)` so `crate::span_issues` can reuse the bucketing for an Issue's occurrence series
+/// (it keeps only `total`; every row there is already an error, so the status split is one bar).
+pub(crate) async fn histogram_over(
     df: DataFrame,
     predicate: Expr,
     start: i64,

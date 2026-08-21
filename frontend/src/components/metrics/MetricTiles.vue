@@ -1,4 +1,5 @@
 <script setup>
+import { computed } from 'vue'
 import { ArrowUp, ArrowDown, Minus } from 'lucide-vue-next'
 import { cn } from '@/lib/core/utils'
 
@@ -7,10 +8,21 @@ import { cn } from '@/lib/core/utils'
 // (error rate, latency) → up=red / down=green; `'up-good'` is the inverse (up=green / down=red, e.g.
 // Apdex); `'neutral'` shows the delta muted (rate, volume). `comparisonLabel` (optional) prints a
 // muted "vs prev …" line under the value.
-defineProps({
+// `cols` picks the widest breakpoint's column count. Literal class strings only — Tailwind's
+// scanner cannot see a computed `grid-cols-${n}`.
+const props = defineProps({
   tiles: { type: Array, default: () => [] },
   comparisonLabel: { type: String, default: '' },
+  cols: { type: Number, default: 4 },
 })
+
+const COLS = {
+  3: 'grid-cols-2 sm:grid-cols-3',
+  4: 'grid-cols-2 sm:grid-cols-4',
+  5: 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-5',
+  6: 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-6',
+}
+const gridClass = computed(() => COLS[props.cols] ?? COLS[4])
 
 // A fraction like 0.123 → "12%". Rounds to whole percent; tiny non-zero deltas floor at "0%".
 function fmtDelta(delta) {
@@ -36,7 +48,7 @@ function deltaBgClass(delta, tone) {
 </script>
 
 <template>
-  <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+  <div :class="cn('grid gap-3', gridClass)">
     <div
       v-for="tile in tiles"
       :key="tile.label"
@@ -65,6 +77,7 @@ function deltaBgClass(delta, tone) {
           {{ fmtDelta(tile.delta) }}
         </span>
       </div>
+      <span v-if="tile.sub" class="text-[11px] text-muted-foreground">{{ tile.sub }}</span>
       <span v-if="comparisonLabel" class="text-[10px] text-muted-foreground/70">{{ comparisonLabel }}</span>
     </div>
   </div>

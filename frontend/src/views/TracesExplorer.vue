@@ -43,7 +43,7 @@ import {
   startNs,
   endNs,
   setCustomRange,
-  tenantQueryTerm,
+  contextQueryTerm,
 } from '@/lib/core/context'
 import { correlate } from '@/lib/core/useCorrelate'
 
@@ -128,13 +128,14 @@ const traceAttrCols = ref([])
 // The search bar debounces at 180ms — only the settled text keys the query (and thus refetches).
 const debouncedText = refDebounced(text, 180)
 
-// The active tenant appends its grammar term to every backend request/self-fetching child below —
-// NEVER to `text` itself (that stays the literal, displayed SearchBar value) or the pinned
-// facet/histogram/latency composables would leak into ServicesListView/ServiceDetailView, which
-// also mount SpanVolumeHistogram/LatencyHistogram/TracesFilters but aren't tenant-scoped in v1.
-const scopedText = computed(() => [text.value, tenantQueryTerm()].filter(Boolean).join(' '))
+// The global context (Site + Environment) appends its grammar terms to every backend request/
+// self-fetching child below — NEVER to `text` itself (that stays the literal, displayed SearchBar
+// value) or the pinned facet/histogram/latency composables would leak into ServicesListView/
+// ServiceDetailView, which also mount SpanVolumeHistogram/LatencyHistogram/TracesFilters but
+// aren't context-scoped in v1.
+const scopedText = computed(() => [text.value, contextQueryTerm()].filter(Boolean).join(' '))
 const scopedDebouncedText = computed(() =>
-  [debouncedText.value.trim(), tenantQueryTerm()].filter(Boolean).join(' '),
+  [debouncedText.value.trim(), contextQueryTerm()].filter(Boolean).join(' '),
 )
 
 // Cache key = the RELATIVE search descriptor. It deliberately excludes the now-anchored absolute

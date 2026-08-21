@@ -8,7 +8,7 @@ import { computed, toValue } from 'vue'
 import type { MaybeRefOrGetter } from 'vue'
 import { useQuery, keepPreviousData } from '@tanstack/vue-query'
 import { api, type InfraHostsResult, type InfraHostDetail, type InfraSeriesResult, type InfraProcessesResult } from '@/lib/core/api'
-import { tenantQueryTerm } from '@/lib/core/context'
+import { contextQueryTerm } from '@/lib/core/context'
 
 export const infraHostsKey = (
   startNs: MaybeRefOrGetter<string>,
@@ -20,9 +20,9 @@ export function useInfraHosts(
   endNs: MaybeRefOrGetter<string>,
 ) {
   return useQuery({
-    queryKey: computed(() => [...infraHostsKey(startNs, endNs), tenantQueryTerm()]),
+    queryKey: computed(() => [...infraHostsKey(startNs, endNs), contextQueryTerm()]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<InfraHostsResult> =>
-      api.infraHosts(toValue(startNs), toValue(endNs), tenantQueryTerm() ?? undefined, { signal }),
+      api.infraHosts(toValue(startNs), toValue(endNs), contextQueryTerm() ?? undefined, { signal }),
     placeholderData: keepPreviousData,
     refetchInterval: 15_000,
   })
@@ -40,10 +40,10 @@ export function useInfraHost(
       toValue(host),
       String(toValue(startNs)),
       String(toValue(endNs)),
-      tenantQueryTerm(),
+      contextQueryTerm(),
     ]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<InfraHostDetail> =>
-      api.infraHost(toValue(host), toValue(startNs), toValue(endNs), tenantQueryTerm() ?? undefined, { signal }),
+      api.infraHost(toValue(host), toValue(startNs), toValue(endNs), contextQueryTerm() ?? undefined, { signal }),
     enabled: computed(() => !!toValue(host)),
     placeholderData: keepPreviousData,
   })
@@ -64,10 +64,10 @@ export function useInfraHostProcesses(
       toValue(host),
       String(toValue(startNs)),
       String(toValue(endNs)),
-      tenantQueryTerm(),
+      contextQueryTerm(),
     ]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<InfraProcessesResult> =>
-      api.infraHostProcesses(toValue(host), toValue(startNs), toValue(endNs), tenantQueryTerm() ?? undefined, { signal }),
+      api.infraHostProcesses(toValue(host), toValue(startNs), toValue(endNs), contextQueryTerm() ?? undefined, { signal }),
     enabled: computed(() => !!toValue(host)),
     placeholderData: keepPreviousData,
     refetchInterval: 15_000,
@@ -92,10 +92,10 @@ export function useInfraHostSeries(
       toValue(resource),
       String(toValue(startNs)),
       String(toValue(endNs)),
-      tenantQueryTerm(),
+      contextQueryTerm(),
     ]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<InfraSeriesResult> =>
-      api.infraHostSeries(toValue(host), toValue(resource), toValue(startNs), toValue(endNs), tenantQueryTerm() ?? undefined, { signal }),
+      api.infraHostSeries(toValue(host), toValue(resource), toValue(startNs), toValue(endNs), contextQueryTerm() ?? undefined, { signal }),
     enabled: computed(() => !!toValue(host) && !!toValue(enabled)),
     placeholderData: keepPreviousData,
     refetchInterval: 15_000,

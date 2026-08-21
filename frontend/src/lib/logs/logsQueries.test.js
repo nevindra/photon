@@ -11,7 +11,7 @@ vi.mock('@tanstack/vue-query', async (orig) => ({
 import { useFacet, useHistogram, useSearchLogs } from '@/lib/logs/logsQueries'
 import { keepPreviousData } from '@tanstack/vue-query'
 import { api } from '@/lib/core/api'
-import { setTenant, clearTenant } from '@/lib/core/context'
+import { setTenant, clearTenant, setEnvironment, clearEnvironment } from '@/lib/core/context'
 
 describe('logsQueries caching options', () => {
   beforeEach(() => useQueryMock.mockClear())
@@ -54,5 +54,42 @@ describe('logsQueries tenant filter', () => {
   it('adds no term when no tenant is set', () => {
     useSearchLogs('key', () => ({ start_ts_nanos: '0', end_ts_nanos: '1', query: 'level:error', limit: 10 }))
     expect(useQueryMock.mock.calls.at(-1)[0].queryKey.value.at(-1)).toBeNull()
+  })
+})
+
+// Environment is the third global dimension and rides the same rail as tenant — a page that
+// appended one but not the other would silently ignore the picker.
+describe('logsQueries environment filter', () => {
+  beforeEach(() => {
+    useQueryMock.mockClear()
+    clearTenant()
+    clearEnvironment()
+  })
+  afterEach(() => { clearTenant(); clearEnvironment() })
+
+  it('env_term_is_appended_to_the_query', async () => {
+    const spy = vi.spyOn(api, 'search').mockResolvedValue({ rows: [], matched_count: 0, elapsed_ms: 0 })
+    setEnvironment('prod')
+    useSearchLogs('key', () => ({ start_ts_nanos: '0', end_ts_nanos: '1', query: 'level:error', limit: 10 }))
+    const opts = useQueryMock.mock.calls.at(-1)[0]
+
+    expect(opts.queryKey.value).toContain('deployment.environment:prod')
+    await opts.queryFn({ signal: undefined })
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({ query: 'level:error deployment.environment:prod' }),
+      expect.anything(),
+    )
+  })
+
+  it('carries both dimensions at once', async () => {
+    const spy = vi.spyOn(api, 'histogram').mockResolvedValue([])
+    setTenant('divtik')
+    setEnvironment('prod')
+    useHistogram('level:error', '0', '1')
+    await useQueryMock.mock.calls.at(-1)[0].queryFn({ signal: undefined })
+    expect(spy).toHaveBeenCalledWith(
+      'level:error tenant:divtik deployment.environment:prod',
+      '0', '1', 48, expect.anything(),
+    )
   })
 })

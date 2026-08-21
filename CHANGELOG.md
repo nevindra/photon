@@ -5,6 +5,59 @@ All notable changes to Photon are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The **Backend (Services / APM) revamp** — in progress. See
+[`docs/plans/2026-08-21-backend-services-revamp.md`](docs/plans/2026-08-21-backend-services-revamp.md)
+and ADRs [0002](docs/adr/0002-red-rollups-are-published-as-metrics.md),
+[0003](docs/adr/0003-a-services-request-rate-is-its-entry-spans.md),
+[0004](docs/adr/0004-the-services-index-is-a-fleet-board.md).
+
+### Added
+
+- **HTTP status classes beside span status.** RED rows and buckets now carry `http_4xx` and
+  `http_5xx` alongside `error_count`. They sit *beside* it, never instead of it: `error_count` keeps
+  meaning `status_code == 2` exactly, so "error rate" continues to mean one thing, while an SDK that
+  never sets span status stops hiding real HTTP failures entirely.
+
+- **`deployment.environment` is a first-class dimension.** Promoted by default, picked in the
+  ContextBar next to the time range and the federation Site, and appended to every logs / traces /
+  metrics / RUM / services / infra query through one `withContext()` helper. Existing Parquet needs
+  no migration — an unpromoted older file simply reads the key from its attributes map.
+
+- **The service rollup.** A background pass turns spans into per-service `photon.service.*` and
+  per-operation `photon.operation.*` metrics, so the Backend pages can read a wide window without
+  re-scanning raw spans. It adds no storage engine: the points go through the existing metrics WAL
+  and are metrics like any other. 60-second buckets, each published exactly once; latency ships as a
+  real explicit-bucket histogram so any window can be re-quantized honestly. Tunable via `[rollup]`
+  (`interval_secs` / `lag_secs` / `top_operations`) or `PHOTON_ROLLUP_*`. Two things worth knowing
+  before you rely on it: a span arriving more than `lag_secs` after its bucket closed never reaches
+  the rollup, and per-service operation series are capped at `top_operations` with the tail summed
+  into a single `__other__` series. See
+  [`docs/subsystems/rollup.md`](docs/subsystems/rollup.md).
+
+### Changed
+
+- **A service's request rate is now its entry spans, not every span it emits.** RED counts, error
+  counts, latency percentiles, and Apdex bands are computed over SERVER and CONSUMER spans, falling
+  back to trace roots and then to all spans for services that emit neither (the rule that produced
+  the number travels with it as `basis`, and the UI badges the last case). Total span volume is kept
+  beside it as `span_count` rather than discarded.
+
+  **Upgrade note:** every rate and error rate on the Backend pages changes, in most cases downward.
+  This is a correction — a service that instrumented generously used to report several times the
+  throughput of one doing identical work, and a downstream call that failed and was retried
+  successfully used to count as that service's error. **Trace alert rules are rescaled by the same
+  correction** (`photon-server`'s `EngineConditionSource` reads the same RED rows), so thresholds
+  written against the old inflated counts need revisiting. There is no automatic migration for this.
+
+- **One severity vocabulary across the whole UI.** The Backend world's `critical` / `degraded` /
+  `healthy` / `idle` scale is retired in favour of the Attention Level the landing page already used:
+  **Down / Critical / Warning / OK**, plus **Unknown** for the absence of a judgment. `idle` was the
+  load-bearing bug — a service falling from thousands of requests per second to nothing rendered as
+  calm neutral grey. It now splits correctly: reported-then-silent is **Down**, never-reported is
+  **Unknown**.
+
 ## [1.6.0] - 2026-08-12
 
 A **federation release**: satellite Photon instances now report into one central Photon. Nothing

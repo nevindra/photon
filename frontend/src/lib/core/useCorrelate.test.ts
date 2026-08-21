@@ -1,8 +1,13 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { timeRange, customRange } from '@/lib/core/context'
+import { timeRange, customRange, tenant, environment } from '@/lib/core/context'
 import { correlate, relatedFor } from '@/lib/core/useCorrelate'
 
-beforeEach(() => { timeRange.value = '15m'; customRange.value = null })
+beforeEach(() => {
+  timeRange.value = '15m'
+  customRange.value = null
+  tenant.value = null
+  environment.value = null
+})
 
 describe('correlate() never drops context', () => {
   it('injects the active preset range', () => {
@@ -12,6 +17,11 @@ describe('correlate() never drops context', () => {
   it('injects a custom from/to window instead of range', () => {
     customRange.value = { startMs: 500, endMs: 800 }
     expect(correlate({ path: '/traces' })).toBe('/traces?from=500&to=800')
+  })
+  it('correlate_carries_the_active_environment', () => {
+    environment.value = 'prod'
+    tenant.value = 'divtik'
+    expect(correlate({ path: '/traces' })).toBe('/traces?range=15m&tenant=divtik&env=prod')
   })
 })
 
@@ -33,6 +43,19 @@ describe('relatedFor() builds the correct destination graph', () => {
     expect(without).not.toContain('trace')
     expect(without).toContain('logs')
   })
+  it('a Backend Issue links to its trace, its logs, its failing traces, and its service', () => {
+    const ids = relatedFor({ kind: 'backendIssue', fields: { service: 'api', traceId: 't7' } }).map((x) => x.id)
+    expect(ids).toEqual(expect.arrayContaining(['trace', 'logs', 'traces', 'service']))
+  })
+  it('a Backend Issue with no sample trace still offers logs and its service', () => {
+    const d = relatedFor({ kind: 'backendIssue', fields: { service: 'api' } })
+    const ids = d.map((x) => x.id)
+    expect(ids).not.toContain('trace')
+    expect(ids).toContain('logs')
+    // With no trace to pin to, the logs jump falls back to the whole service.
+    expect(d.find((x) => x.id === 'logs')!.dest.query).toEqual({ q: 'service.name:api' })
+  })
+
   it('a service links out to logs, metrics, RUM, and uptime (the filled gaps)', () => {
     const ids = relatedFor({ kind: 'service', fields: { service: 'checkout' } }).map((x) => x.id)
     expect(ids).toEqual(expect.arrayContaining(['traces', 'logs', 'metrics', 'rum-app', 'uptime']))

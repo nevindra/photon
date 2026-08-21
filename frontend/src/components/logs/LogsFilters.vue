@@ -5,7 +5,7 @@
 // adapter — the single-state model is unchanged: checked state derives purely from the `query`
 // prop via `facetChecked`, and this component owns no selection state of its own, it just emits
 // intent (`toggle-value` / `only-value` / `clear-field`) for LogsView to translate into query
-// edits. See .superpowers/sdd/facet-single-state-model.md and the unified-filter-panel design.
+// edits. The single-state facet model is described in docs/frontend.md.
 import { computed } from 'vue'
 import { FacetSection, FacetValueRow, FacetCatalog } from '@/components/ui/facet'
 import { SEVERITIES, severity, severityClasses } from '@/lib/core/format'

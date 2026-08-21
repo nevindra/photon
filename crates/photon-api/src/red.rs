@@ -11,9 +11,10 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use photon_query::{RedGroup, RedRow};
+use photon_query::{RedBasis, RedGroup, RedRow};
 
 use crate::query_params::build_span_query_request;
+use crate::services_rollup::RedSource;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -51,26 +52,24 @@ pub(crate) async fn red(State(state): State<AppState>, Query(p): Query<RedParams
         _ => RedGroup::Operation,
     };
 
-    use std::collections::HashMap;
-    let (thresholds, default_ms) = match &state.data {
-        Some(d) => (
-            d.settings.all_apdex_thresholds().await.unwrap_or_default(),
-            d.apdex_default_ms,
-        ),
-        None => (
-            HashMap::new(),
-            photon_core::config::DEFAULT_APDEX_THRESHOLD_MS,
-        ),
-    };
+    let (thresholds, default_ms) = crate::services::apdex_settings(&state).await;
 
-    match state
-        .span_query
-        .red_metrics(req, group, &thresholds, default_ms)
-        .await
+    // `None` resolution: this route returns window TOTALS, not a shape, so any rollup granularity
+    // serves. `red_rows` decides between the rollup and raw spans and says which it used.
+    match crate::services_rollup::red_rows(
+        &state,
+        &p.query,
+        req,
+        None,
+        group,
+        &thresholds,
+        default_ms,
+    )
+    .await
     {
-        Ok(rows) => Json(
+        Ok((rows, source)) => Json(
             rows.iter()
-                .map(|r| red_row_to_json(r, window_secs))
+                .map(|r| red_row_to_json(r, window_secs, source))
                 .collect::<Vec<_>>(),
         )
         .into_response(),
@@ -84,12 +83,26 @@ pub(crate) async fn red(State(state): State<AppState>, Query(p): Query<RedParams
 
 /// Window length in seconds, floored at 1ns → a tiny positive number, so the rate denominator is
 /// never zero (a degenerate `start >= end` window yields a large-but-finite rate rather than NaN).
-fn window_seconds(start_ns: i64, end_ns: i64) -> f64 {
+pub(crate) fn window_seconds(start_ns: i64, end_ns: i64) -> f64 {
     let span_ns = (end_ns - start_ns).max(1) as f64;
     span_ns / 1_000_000_000.0
 }
 
-fn red_row_to_json(r: &RedRow, window_secs: f64) -> Value {
+/// The wire spelling of the entry-set cascade rule that produced a row's `count` (ADR-0003). The
+/// UI badges `"all_spans"` as `span-based`; `services.rs` uses this too, so the mapping lives in
+/// one place.
+pub(crate) fn basis_str(basis: RedBasis) -> &'static str {
+    match basis {
+        RedBasis::Entry => "entry",
+        RedBasis::TraceRoot => "trace_root",
+        RedBasis::AllSpans => "all_spans",
+    }
+}
+
+/// One RED row as the UI reads it. `pub(crate)` because `services_overview` returns the same rows
+/// with sparklines attached — a second, hand-rolled copy of this shape is how `rate` and
+/// `error_rate` went missing from the index the first time.
+pub(crate) fn red_row_to_json(r: &RedRow, window_secs: f64, source: RedSource) -> Value {
     let error_rate = if r.count > 0 {
         r.error_count as f64 / r.count as f64
     } else {
@@ -104,15 +117,24 @@ fn red_row_to_json(r: &RedRow, window_secs: f64) -> Value {
     json!({
         "service": r.service,
         "tenant": r.tenant,                // null for local spans / group=operation
+        "environment": r.environment,      // deployment.environment; null for group=operation
         "operation": r.operation,          // null for group=service (serde maps Option::None → null)
-        "count": r.count,
+        "count": r.count,                  // requests: the group's ENTRY spans (ADR-0003)
         "rate": r.count as f64 / window_secs,
+        "span_count": r.span_count,        // every span, all kinds — the separate second number
+        "basis": basis_str(r.basis),       // which cascade rule produced `count`
         "error_count": r.error_count,
         "error_rate": error_rate,
+        "http_4xx": r.http_4xx,             // HTTP status class, beside error_count not instead
+        "http_5xx": r.http_5xx,             // of it — see RedRow::http_4xx's doc comment
         "p50": r.p50.to_string(),          // nanos as string (JS-safe), matches /api/traces/latency
         "p90": r.p90.to_string(),
         "p99": r.p99.to_string(),
         "apdex": apdex,
+        // Which read path produced this row. Additive and per-row, so the response stays the bare
+        // array the UI already parses — and so a rollup bug shows up as an attributable number
+        // rather than a mysterious one.
+        "source": source.as_str(),
     })
 }
 
@@ -187,5 +209,46 @@ mod tests {
         if let Some(row) = v.as_array().unwrap().first() {
             assert!(row.get("apdex").is_some(), "row must carry apdex");
         }
+    }
+
+    #[test]
+    fn every_basis_has_a_stable_wire_spelling() {
+        use photon_query::RedBasis;
+        assert_eq!(super::basis_str(RedBasis::Entry), "entry");
+        assert_eq!(super::basis_str(RedBasis::TraceRoot), "trace_root");
+        assert_eq!(super::basis_str(RedBasis::AllSpans), "all_spans");
+    }
+
+    #[test]
+    fn red_row_json_carries_the_span_total_and_rates_the_entry_count() {
+        use photon_query::{RedBasis, RedRow};
+        let row = RedRow {
+            environment: None,
+            service: "api".into(),
+            tenant: None,
+            operation: None,
+            count: 2,
+            span_count: 10,
+            basis: RedBasis::AllSpans,
+            error_count: 1,
+            p50: 1,
+            p90: 2,
+            p99: 3,
+            satisfied: 1,
+            tolerating: 1,
+            frustrated: 0,
+            http_4xx: 1,
+            http_5xx: 0,
+        };
+        let v = super::red_row_to_json(&row, 4.0, super::RedSource::RawSpans);
+        assert_eq!(v["count"], serde_json::json!(2));
+        assert_eq!(v["span_count"], serde_json::json!(10));
+        assert_eq!(v["basis"], serde_json::json!("all_spans"));
+        // `rate` is still count / window seconds — over the ENTRY count, not the span total.
+        assert_eq!(v["rate"], serde_json::json!(0.5));
+        assert_eq!(v["error_rate"], serde_json::json!(0.5));
+        // http_4xx/http_5xx sit beside error_count/error_rate, not instead of them.
+        assert_eq!(v["http_4xx"], serde_json::json!(1));
+        assert_eq!(v["http_5xx"], serde_json::json!(0));
     }
 }

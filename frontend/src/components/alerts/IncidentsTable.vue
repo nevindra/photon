@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // AlertsView's "incidents" tab body (Task 15). Reference layout: the approved "Variant 1" Incidents
-// mockup (.superpowers/brainstorm/…/alerts-final.html) — one card, a "Triggered now" group (red pill
+// mockup — one card, a "Triggered now" group (red pill
 // + a subtle left accent bar) above a "Resolved · 24h" group, no full-width banner, no Silence action
 // (v1 non-goal). Mirrors AlertRuleRow.vue's just-landed conventions (Task 13) for a consistent look
 // across the two tabs: `signalColor`/`StatusPill` for chips/pills, and the same svc:/app:/group_by

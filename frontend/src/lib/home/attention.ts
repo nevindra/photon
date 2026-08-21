@@ -7,12 +7,29 @@
 // `rating` the API already computed, Sites through the tenants API's own up/stale/down. All this
 // file does is map those native judgments onto the shared axis, keep the native word in the reason
 // line, and rank the result.
-import { serviceStatus, healthReasons, type ServiceHealthRow } from '@/lib/services/serviceHealth'
+//
+// The axis itself lives in `lib/services/serviceHealth.ts` — the Attention Level, its ranking, its
+// display metadata and the incident-severity mapping are all defined once, there, and re-exported
+// here so the board's own vocabulary keeps its home-shaped names. Services used to be judged twice,
+// once per module, which is how one service could read "Critical" here and "Degraded" on
+// `/services` in the same second.
+import {
+  INCIDENT_LEVEL,
+  LEVEL_RANK,
+  LEVELS,
+  needsAttention,
+  serviceLevel,
+  SILENCE_MIN_PREV_COUNT,
+  STATUS_META,
+  worstLevel,
+  type AttentionLevel,
+  type Reason,
+  type StatusMeta,
+} from '@/lib/services/serviceHealth'
 import { hostStatus, formatPct } from '@/lib/infra/hostStats'
 import type {
   AlertIncident,
   AlertRule,
-  AlertSeverity,
   InfraHost,
   Monitor,
   RumVitalRow,
@@ -24,51 +41,22 @@ import type {
 // Down = not answering. Critical = answering badly, user-visible. Warning = degraded, not yet
 // breaking. OK = inside every threshold. Unknown is NOT a level — it is the absence of a judgment
 // (no traffic, paused, never reported), which is why it ranks last and never colours a row.
-export type AttentionLevel = 'down' | 'critical' | 'warning' | 'ok' | 'unknown'
-
-export const LEVELS: AttentionLevel[] = ['down', 'critical', 'warning', 'ok', 'unknown']
-
-export const LEVEL_RANK: Record<AttentionLevel, number> = {
-  down: 0,
-  critical: 1,
-  warning: 2,
-  ok: 3,
-  unknown: 4,
+export {
+  INCIDENT_LEVEL,
+  LEVEL_RANK,
+  LEVELS,
+  needsAttention,
+  SILENCE_MIN_PREV_COUNT,
+  worstLevel,
+  type AttentionLevel,
+  type Reason,
 }
 
-export interface LevelMeta {
-  label: string
-  /** StatusPill tone. Down reuses the error tone but renders SOLID — see `solid`. */
-  tone: 'error' | 'warning' | 'success' | 'neutral'
-  /** Down is the only filled pill on the page, so "not answering" never reads as "a bit slow". */
-  solid: boolean
-  /** Literal class strings — Tailwind's scanner cannot see computed names. */
-  rail: string
-  dot: string
-}
-
-export const LEVEL_META: Record<AttentionLevel, LevelMeta> = {
-  down: { label: 'Down', tone: 'error', solid: true, rail: 'bg-sev-error', dot: 'bg-sev-error' },
-  critical: { label: 'Critical', tone: 'error', solid: false, rail: 'bg-sev-error', dot: 'bg-sev-error' },
-  warning: { label: 'Warning', tone: 'warning', solid: false, rail: 'bg-sev-warn', dot: 'bg-sev-warn' },
-  ok: { label: 'OK', tone: 'success', solid: false, rail: 'bg-success', dot: 'bg-success' },
-  unknown: { label: 'Unknown', tone: 'neutral', solid: false, rail: 'bg-muted-foreground/40', dot: 'bg-muted-foreground/60' },
-}
-
-/** Worst (lowest-ranked) of the given levels. `unknown` loses to every real judgment. */
-export function worstLevel(...levels: (AttentionLevel | null | undefined)[]): AttentionLevel {
-  let worst: AttentionLevel = 'unknown'
-  for (const l of levels) {
-    if (!l) continue
-    if (LEVEL_RANK[l] < LEVEL_RANK[worst]) worst = l
-  }
-  return worst
-}
-
-/** The three levels the attention list leads with. OK and Unknown are counted, never listed. */
-export function needsAttention(level: AttentionLevel): boolean {
-  return level === 'down' || level === 'critical' || level === 'warning'
-}
+// The board's name for the one display table. `StatusMeta` already carries the rail, the dot, the
+// StatusPill tone and the solid flag — a second table keyed by the same five words would be the
+// duplication this change exists to remove.
+export const LEVEL_META = STATUS_META
+export type LevelMeta = StatusMeta
 
 // --- Worlds & Subjects -------------------------------------------------------------------------
 
@@ -114,14 +102,6 @@ export const KIND_LABEL: Record<SubjectKind, string> = {
   site: 'Site',
 }
 
-// One clause of a reason line. Rendered as "Error rate **8.2%** (critical)" — the number is what
-// the reader scans for, the note is the kind's own word kept verbatim.
-export interface Reason {
-  label: string
-  value: string
-  note?: string
-}
-
 /** On Central: how many Sites a Service is unhealthy in, out of how many run it. */
 export interface Spread {
   bad: number
@@ -158,9 +138,9 @@ export interface Subject {
 // Detection compares against the PREVIOUS equal-length range, so a Subject that has been gone
 // longer than two Watch Ranges is absent from both and is not reported at all. That is the honest
 // limit of a bounded lookback; widen the Watch Range to see further back.
-
-/** Below this many events in the previous range, "it stopped" is noise, not news. */
-export const SILENCE_MIN_PREV_COUNT = 10
+//
+// The threshold (`SILENCE_MIN_PREV_COUNT`, re-exported above) and the service-side rule live in
+// `serviceHealth.ts`; hosts get the finer `lastSeenNs` signal below.
 
 /** A host reporting every 15s is Down after 5 minutes of quiet — 20 missed samples. */
 export const HOST_SILENCE_MS = 5 * 60_000
@@ -183,30 +163,6 @@ export type ServiceRedRow = {
   p99?: string | number | null
 }
 
-// serviceHealth's four bands onto the shared axis. `idle` is deliberately NOT mapped here — the
-// caller decides between Down (it stopped) and Unknown (it never started) using the previous range.
-const SERVICE_LEVEL: Record<string, AttentionLevel> = {
-  critical: 'critical',
-  degraded: 'warning',
-  healthy: 'ok',
-}
-
-function serviceReasons(row: ServiceHealthRow): Reason[] {
-  // healthReasons() returns "Error rate 8.2%" / "Apdex 0.62" — split the number back out so the
-  // row can weight it, and re-attach serviceHealth's own band word as the note.
-  const status = serviceStatus(row)
-  const note = status === 'critical' ? 'critical' : status === 'degraded' ? 'degraded' : undefined
-  return healthReasons(row).map((r) => {
-    const at = r.lastIndexOf(' ')
-    return { label: r.slice(0, at), value: r.slice(at + 1), note }
-  })
-}
-
-function rateText(rate: number | undefined): string {
-  const n = rate ?? 0
-  return (n >= 100 ? Math.round(n).toLocaleString('en-US') : n.toFixed(1)) + '/s'
-}
-
 /**
  * RED rows → Backend Subjects. Rows arrive already split per Site (`RedRow.tenant` is populated for
  * `group=service`), so same-named rows are merged into ONE Subject carrying a Spread: the same
@@ -214,33 +170,21 @@ function rateText(rate: number | undefined): string {
  */
 export function serviceSubjects(rows: ServiceRedRow[], prevRows: ServiceRedRow[] = []): Subject[] {
   const prevByKey = new Map<string, ServiceRedRow>()
-  for (const r of prevRows) prevByKey.set(`${r.service} ${r.tenant ?? ''}`, r)
+  for (const r of prevRows) prevByKey.set(`${r.service}\u0000${r.tenant ?? ''}`, r)
 
   // Every (service, site) pair seen in EITHER range — a site that went silent has no current row.
   const pairs = new Map<string, { service: string; site: string | null; row?: ServiceRedRow }>()
-  for (const r of rows) pairs.set(`${r.service} ${r.tenant ?? ''}`, { service: r.service, site: r.tenant ?? null, row: r })
+  for (const r of rows) pairs.set(`${r.service}\u0000${r.tenant ?? ''}`, { service: r.service, site: r.tenant ?? null, row: r })
   for (const r of prevRows) {
-    const k = `${r.service} ${r.tenant ?? ''}`
+    const k = `${r.service}\u0000${r.tenant ?? ''}`
     if (!pairs.has(k)) pairs.set(k, { service: r.service, site: r.tenant ?? null })
   }
 
   const merged = new Map<string, Subject>()
   for (const [key, { service, site, row }] of pairs) {
-    const prev = prevByKey.get(key)
-    const status = row ? serviceStatus(row) : 'idle'
-
-    let level: AttentionLevel
-    let reasons: Reason[]
-    if (!row || status === 'idle') {
-      const stopped = (prev?.count ?? 0) >= SILENCE_MIN_PREV_COUNT
-      level = stopped ? 'down' : 'unknown'
-      reasons = stopped
-        ? [{ label: 'No spans', value: rateText(prev?.rate), note: 'was' }]
-        : [{ label: 'No traffic', value: '—' }]
-    } else {
-      level = SERVICE_LEVEL[status] ?? 'unknown'
-      reasons = serviceReasons(row)
-    }
+    // One judgment, made in one place. A missing row is the same fact as a zero row (a Site that
+    // went quiet sends neither), so both go through `serviceLevel` with the previous range.
+    const { level, reasons } = serviceLevel(row ?? {}, { prev: prevByKey.get(key) })
 
     const existing = merged.get(service)
     const unhealthy = needsAttention(level)
@@ -498,14 +442,6 @@ export function parseSeriesKey(key: string | null | undefined): Record<string, s
 
 /** photon-server's uptime bridge synthesises `uptime:<monitor.id>` as the rule id. */
 export const UPTIME_RULE_PREFIX = 'uptime:'
-
-const INCIDENT_LEVEL: Record<AlertSeverity, AttentionLevel> = {
-  critical: 'critical',
-  // A triggered warning/info incident is still something a human asked to be told about, so it
-  // reaches the list — as Warning, so it can never outrank a real outage.
-  warning: 'warning',
-  info: 'warning',
-}
 
 export interface IncidentTarget {
   kind: SubjectKind

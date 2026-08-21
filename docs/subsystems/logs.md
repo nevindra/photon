@@ -49,13 +49,17 @@ DataFusion) and compiled two ways — to an in-memory predicate (`eval`) and to 
 | Syntax | Meaning |
 |---|---|
 | `field:value` | exact match |
-| `field:v1,v2` | OR-list |
+| `field:"a b"` | quoted value — the quotes are **grouping** and are stripped; the only way to express a value containing a space or a comma |
+| `field:v1,v2` | OR-list, split on commas **outside** quotes |
 | `field:*` | field exists |
 | `-field:v` | negate |
 | `field>=n` `>` `<` `<=` | numeric compare |
 | `"quoted text"` / bare words | case-sensitive **body** substring |
 
-Terms are **AND**-ed. Parse errors carry a byte `offset` so the UI can underline the bad token. Free-
+Terms are **AND**-ed. Parse errors carry a byte `offset` so the UI can underline the bad token.
+There is **no escape** for a `"` inside a value: a caller building a term from an arbitrary name
+should go through `photon-api`'s `grammar_term` (or the frontend's `grammarTerm`), which quotes when
+needed and yields nothing rather than a term that parses cleanly and matches nothing. Free-
 text is bloom-pruned then confirmed with a `strpos(body, text) > 0` substring scan — **no inverted
 index**. Because the row match is *substring*, only the **interior** tokens of the search string —
 those with a delimiter on **both** sides *within the query* (`photon_index::interior_tokens`, shared

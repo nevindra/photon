@@ -1,15 +1,17 @@
 <script setup lang="ts">
-// App-wide context bar (mounted once in AppShell). Owns the global time window and the tenant
-// picker. THE single header row for every view — no view renders a second bar. Layout,
-// left → right: an optional `lead` slot (e.g. a back button), the breadcrumb (+ tenant picker), an
+// App-wide context bar (mounted once in AppShell). Owns the global time window, the tenant (Site)
+// picker, and the environment picker. THE single header row for every view — no view renders a
+// second bar. Layout,
+// left → right: an optional `lead` slot (e.g. a back button), the breadcrumb (+ the tenant and
+// environment pickers, each of which hides when it has nothing to choose between), an
 // optional search region in the middle (the `search` slot — searchable views forward their
 // SearchBar here via AppShell's `toolbar` slot), then the right cluster: an optional `actions` slot
 // (view-specific controls), the optional LiveControl, and the time picker. When the middle `search`
 // slot is empty its `flex-1` container is just the spacer that pushes the right cluster over; the
 // `lead`/`actions` slots render nothing when empty (flexbox adds no gap around an absent child).
 // Bound to lib/context.ts (module-singleton state, NOT Pinia).
-import { computed } from 'vue'
-import { ChevronDown, Building2 } from 'lucide-vue-next'
+import { computed, watch } from 'vue'
+import { ChevronDown, Building2, Layers } from 'lucide-vue-next'
 import TimeRangePicker from '@/components/common/TimeRangePicker.vue'
 import LiveControl from '@/components/common/LiveControl.vue'
 import {
@@ -20,14 +22,21 @@ import {
   DropdownMenuRadioItem,
 } from '@/components/ui/dropdown-menu'
 import { useTenants } from '@/lib/tenants/tenantsQueries'
+import { useEnvironments } from '@/lib/core/environments'
 import {
   timeRange,
   customRange,
   tenant,
+  environment,
+  startNs,
+  endNs,
   setTimeRange,
   setCustomRange,
   setTenant,
   clearTenant,
+  setEnvironment,
+  clearEnvironment,
+  applyDefaultEnvironment,
 } from '@/lib/core/context'
 
 interface Props {
@@ -65,6 +74,22 @@ const tenantNames = computed<string[]>(
 function onTenantPick(v: unknown): void {
   typeof v === 'string' && v ? setTenant(v) : clearTenant()
 }
+
+// The environment picker renders only when there is a choice to make: two or more
+// `deployment.environment` values in the window. An install whose producers declare none, or all
+// declare the same one, gets no control — the same rule that hides the tenant picker on an empty
+// registry. A picker over a constant is a control that cannot change anything.
+const environmentsQuery = useEnvironments(startNs, endNs)
+const environmentNames = computed<string[]>(() => environmentsQuery.data.value ?? [])
+const showEnvironments = computed<boolean>(() => environmentNames.value.length >= 2)
+
+// First facet result that offers a real choice picks the default (`prod` when it exists) — see
+// applyDefaultEnvironment for why prod and why only once.
+watch(environmentNames, applyDefaultEnvironment, { immediate: true })
+
+function onEnvironmentPick(v: unknown): void {
+  typeof v === 'string' && v ? setEnvironment(v) : clearEnvironment()
+}
 </script>
 
 <template>
@@ -91,6 +116,28 @@ function onTenantPick(v: unknown): void {
         <DropdownMenuRadioGroup :model-value="tenant ?? ''" @update:model-value="onTenantPick">
           <DropdownMenuRadioItem value="">All tenants</DropdownMenuRadioItem>
           <DropdownMenuRadioItem v-for="name in tenantNames" :key="name" :value="name">
+            {{ name }}
+          </DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+
+    <DropdownMenu v-if="showEnvironments">
+      <DropdownMenuTrigger
+        data-testid="env-picker"
+        class="inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs"
+        :class="environment
+          ? 'border-brand/35 bg-brand-soft text-brand'
+          : 'border-border text-muted-foreground hover:text-foreground'"
+      >
+        <Layers class="size-3" />
+        {{ environment ?? 'All environments' }}
+        <ChevronDown class="size-3 opacity-70" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start">
+        <DropdownMenuRadioGroup :model-value="environment ?? ''" @update:model-value="onEnvironmentPick">
+          <DropdownMenuRadioItem value="">All environments</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem v-for="name in environmentNames" :key="name" :value="name">
             {{ name }}
           </DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>

@@ -1,7 +1,6 @@
 //! photon-storage: hot + durable object stores and the background replicator.
 //!
-//! Implemented per the `photon-storage` section of
-//! `docs/superpowers/plans/2026-07-01-photon-interface-contracts.md`.
+//! Its place in the crate graph is described in `docs/architecture.md`.
 //!
 //! - [`Storage`] wraps a hot (local disk) `object_store::ObjectStore` and an optional
 //!   durable (S3-compatible) one, plus the fixed object-path scheme for a segment's

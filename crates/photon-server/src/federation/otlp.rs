@@ -303,6 +303,7 @@ mod tests {
             signals: None,
             interval_secs: 30,
             queue_batches: 1024,
+            push_service_rollup: true,
         };
         assert_eq!(mode_label(&base), "full");
         let subset = FederationConfig {

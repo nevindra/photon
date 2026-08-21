@@ -1,16 +1,23 @@
 import { describe, it, expect, beforeEach } from 'vitest'
+import { nextTick, ref } from 'vue'
 import {
   timeRange, customRange, nowTick,
   startNs, endNs, prevStartNs, prevEndNs,
   setTimeRange, setCustomRange, RANGE_MS,
   tenant, setTenant, clearTenant, tenantQueryTerm,
+  environment, setEnvironment, clearEnvironment, envQueryTerm,
+  environmentDefaulted, applyDefaultEnvironment,
+  contextQueryTerm, withContext,
   parseContext, seedContextFromUrl, syncContextToUrl,
 } from '@/lib/core/context'
+import { useUrlState } from '@/lib/core/useUrlState'
 
 beforeEach(() => {
   // reset module singletons between tests
   customRange.value = null
   tenant.value = null
+  environment.value = null
+  environmentDefaulted.value = false
   nowTick.value = 1_000_000 // ms; deterministic "now"
   timeRange.value = '30m'
 })
@@ -62,8 +69,98 @@ describe('context time math', () => {
   })
 })
 
+// Environment is the third global dimension, alongside the time window and the Site (`tenant`).
+// It mirrors the tenant dimension exactly — same grammar-term contribution, same URL key
+// ownership, same shape guard on URL-supplied values.
+describe('context environment', () => {
+  it('env_term_is_appended_to_the_query', () => {
+    setEnvironment('prod')
+    expect(envQueryTerm()).toBe('deployment.environment:prod')
+    expect(withContext('level:error')).toBe('level:error deployment.environment:prod')
+    // Site + Environment ride together in one fragment, tenant first.
+    setTenant('divtik')
+    expect(contextQueryTerm()).toBe('tenant:divtik deployment.environment:prod')
+    expect(withContext('level:error')).toBe('level:error tenant:divtik deployment.environment:prod')
+  })
+
+  it('clearing_the_environment_removes_the_term_entirely', () => {
+    setEnvironment('prod')
+    clearEnvironment()
+    // Not `deployment.environment:*` (which would filter to records that DECLARE one) — no term
+    // at all, so records without an environment stay in the result set.
+    expect(envQueryTerm()).toBeNull()
+    expect(contextQueryTerm()).toBeNull()
+    expect(withContext('level:error')).toBe('level:error')
+  })
+
+  it('envQueryTerm ignores values outside the environment-name shape (URL-injected)', () => {
+    setEnvironment('a b')
+    expect(envQueryTerm()).toBeNull()
+    setEnvironment('a"quoted')
+    expect(envQueryTerm()).toBeNull()
+  })
+
+  it('prod_is_selected_when_present', () => {
+    applyDefaultEnvironment(['staging', 'prod', 'dev'])
+    expect(environment.value).toBe('prod')
+  })
+
+  it('nothing_is_selected_when_prod_is_absent', () => {
+    applyDefaultEnvironment(['staging', 'dev'])
+    expect(environment.value).toBeNull()
+  })
+
+  it('applies the default once, so clearing the picker sticks', () => {
+    applyDefaultEnvironment(['staging', 'prod'])
+    clearEnvironment()
+    applyDefaultEnvironment(['staging', 'prod'])
+    expect(environment.value).toBeNull()
+  })
+
+  it('an explicit ?env= wins over the prod default', () => {
+    setEnvironment('staging')
+    applyDefaultEnvironment(['staging', 'prod'])
+    expect(environment.value).toBe('staging')
+  })
+
+  it('selects nothing when the picker would be hidden (fewer than two values)', () => {
+    applyDefaultEnvironment(['prod'])
+    expect(environment.value).toBeNull()
+  })
+})
+
 describe('context URL', () => {
   beforeEach(() => { window.history.replaceState(null, '', '/') })
+
+  it('parseContext reads env', () => {
+    expect(parseContext('?range=15m&env=prod').environment).toBe('prod')
+  })
+
+  it('seedContextFromUrl hydrates the environment', () => {
+    window.history.replaceState(null, '', '/logs?env=staging')
+    seedContextFromUrl()
+    expect(environment.value).toBe('staging')
+  })
+
+  // The drill-in → back round trip: `env` is a context key, so it has to survive both halves.
+  // Going in, vue-router pushes a detail path with no query at all and router.afterEach's
+  // syncContextToUrl() has to re-stamp it. Coming back, the list view rewrites its OWN keys
+  // (svc/sev/q) through useUrlState, a merge-write that must leave `env` alone.
+  it('env_survives_a_drill_in_and_back', async () => {
+    setEnvironment('prod')
+    window.history.replaceState(null, '', '/traces/abc')
+    syncContextToUrl()
+    expect(new URLSearchParams(window.location.search).get('env')).toBe('prod')
+
+    const text = ref('')
+    useUrlState({ text })
+    text.value = 'db timeout'
+    await nextTick()
+
+    const p = new URLSearchParams(window.location.search)
+    expect(p.get('q')).toBe('db timeout')
+    expect(p.get('env')).toBe('prod')
+  })
 
   it('parseContext reads range + tenant', () => {
     const c = parseContext('?range=15m&tenant=divtik&q=foo')

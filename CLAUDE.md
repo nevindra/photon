@@ -18,11 +18,13 @@ node that can serve another's data.
 - [`docs/architecture.md`](docs/architecture.md) — crate graph, per-signal write/read data flow,
   storage/durability, the `/api/*` surface, and the load-bearing invariants.
 - [`docs/subsystems/`](docs/subsystems/) — **one doc per feature**: `logs`, `traces`,
-  `services-apm`, `metrics`, `rum` (incl. the `@photon/rum` SDK), `uptime`, `infra` (host/GPU
+  `services-apm`, `rollup` (spans → `photon.service.*` / `photon.operation.*` metrics),
+  `metrics`, `rum` (incl. the `@photon/rum` SDK), `uptime`, `infra` (host/GPU
   resource monitoring), `federation` (tenant egress + central aggregation), `data`, `auth` — each with its key files, endpoints, and UI.
 - [`docs/frontend.md`](docs/frontend.md) — the Vue app: routes/views, the `ui/` primitives, `lib/`.
 - [`docs/conventions.md`](docs/conventions.md) — conventions & gotchas.
 - [`docs/adr/`](docs/adr/) — decisions that would otherwise get "fixed" by the next reader.
+- [`docs/plans/`](docs/plans/) — accepted implementation plans, task-by-task, for work in flight.
 - [`CONTEXT.md`](CONTEXT.md) — the ubiquitous language (glossary only, no implementation detail).
 - [`README.md`](README.md) — the public-facing overview and positioning.
 
@@ -91,9 +93,15 @@ on `:8080` for `/api`).
 The frontend (`frontend/`) is **Vue 3 + Vite + Tailwind** with **Reka UI** headless components (the
 shadcn-vue equivalent) and Lucide icons; package manager is **bun** (never npm — `bun.lock` is the
 lockfile). It is deliberately lean — **Vue Router for top-level routes, but no Pinia** (server state
-lives in **TanStack Query**, a request cache). Time range + federation tenant are **global**,
-module-singleton state in `lib/core/context.ts` (`tenantQueryTerm()` feeds the logs/traces/metrics
-— and RUM — composables' `q`; there is no entity-scope dimension anymore — it was removed as decorative-only),
+lives in **TanStack Query**, a request cache). Time range + federation tenant + **deployment
+environment** are **global**, module-singleton state in `lib/core/context.ts`: `withContext(q)` appends
+the tenant and environment terms to every logs/traces/metrics/RUM/services/infra composable's `q`, so a
+new dimension is wired in one place instead of per module (`tenantQueryTerm()` and the five per-module
+`withTenant` helpers are gone; there is no entity-scope dimension anymore — it was removed as
+decorative-only). `deployment.environment` ships as a promoted column by default
+(`photon-core/src/default.toml`), and `lib/core/environments.ts` unions the logs and spans facets to
+fill the picker — applying the tenant term but deliberately **not** the environment term, since routing
+it through an ordinary composable would collapse the facet to the value just picked. All three are
 surfaced by one `ContextBar` mounted once in `AppShell`
 (not per-view, and no longer on `TopBar`); within-view filters (`svc`/`sev`/`q`, plus per-view extras like traces'
 `sort`/`mode`) live in URL params via `lib/core/useUrlState.ts`, which merge-preserves the context
@@ -106,12 +114,25 @@ page's filter (`?world=`, no tabs), and it judges over its own bounded **Watch R
 (5m/15m/1h/6h, `?watch=`) rather than the app-wide time Window — so it passes
 `:time-picker="false"` to `AppShell` and renders its own picker. Silence (reported, then stopped) is
 Down; never-reported is Unknown. See
-[`docs/adr/0001`](docs/adr/0001-landing-page-is-an-attention-board.md)), `/logs`, `/traces` (+ `/traces/:traceId` waterfall), `/services`
-(+ `/services/:service` APM detail), `/metrics` (+ `/metrics/catalog`), `/rum` (+ app-scoped
+[`docs/adr/0001`](docs/adr/0001-landing-page-is-an-attention-board.md)). **Attention Level is the one
+severity axis the whole app ranks on** — `lib/services/serviceHealth.ts` owns the model
+(`serviceLevel(row, ctx)` → `{ level, reasons }`, `LEVEL_RANK`, `worstLevel`, `STATUS_META`) and
+`lib/home/attention.ts` imports it rather than re-deriving its own. The Backend-only vocabulary it
+replaced (`serviceStatus()`, `critical`/`degraded`/`healthy`/`idle`) is gone; `idle` in particular was
+one word covering two different facts, a service with no traffic and a Site that stopped reporting.
+Then `/logs`, `/traces` (+ `/traces/:traceId` waterfall), `/services`
+(the fleet board; + the fleet-wide Backend Issues list at `/services/errors`, the fleet graph at
+`/services/map`, and the per-service
+**sub-routes** `/services/:service` Overview,
+`/services/:service/operations`, `/services/:service/operations/:operation`,
+`/services/:service/errors` (Issues) + `/services/:service/errors/:fingerprint`,
+`/services/:service/dependencies`, `/services/:service/deployments` — each tab owns its own
+queries, so Overview stays fast when Operations is expensive), `/metrics` (+ `/metrics/catalog`), `/rum` (+ app-scoped
 sub-routes: `/rum/:appId` vitals, `/pages[/:route]`, `/errors` (search bar + fixed facet panel), and
 `/errors/:fingerprint` issue detail; with a federation tenant active, central's `/rum` becomes a
 read-only tenant lens — apps derived from mirrored data via `?tenant=`, manage UI hidden), `/uptime`, `/infra` (+ `/infra/:host` host detail — host/GPU
-resource monitoring), `/data`, `/alerts` (the cross-signal webhook alert engine — rules over
+resource monitoring), `/data` (Overview / Storage / **Services** — per-service footprint attribution / Retention /
+Delete), `/alerts` (the cross-signal webhook alert engine — rules over
 metrics/logs/traces/RUM, incidents, notification channels (channels are typed presets: Generic
 Webhook, Discord, Telegram), plus a "Browse templates" quick-setup on-ramp: target-first
 Apply/Customize over a frontend-only, 23-template seed catalog), `/tenants` (federation, central-side: the live
@@ -134,7 +155,10 @@ always carries the active time+tenant. Components are grouped by signal under `s
 falls back to in-browser mocks on a network failure while surfacing real 400/404s) wrapped by
 **TanStack Query** composables (`lib/*Queries.ts`) keyed off URL/filter state. Tables/waterfalls are
 row-windowed with **TanStack Virtual** on headless **TanStack Table**; charts use **uPlot**
-(`components/charts/`); **VueUse** supplies small composables. Visual design is token-driven
+(`components/charts/`) — except the service Overview's Apdex band chart, the one shape rendered by
+**TanStack Charts** (`components/charts/tanstack/`, lazy-loaded into its own chunk because the
+engine costs ~34 kB gzipped against uPlot's 23 kB for *every other chart*; see
+[`docs/frontend.md`](docs/frontend.md)); **VueUse** supplies small composables. Visual design is token-driven
 (`styles/tokens.css`): a near-neutral base, a single reserved Photon Cyan brand accent, and a **flat**
 elevation ramp — white `surface-1` paper on a visibly grey `--background` canvas, held by a hairline
 `--border`, with real depth (`shadow-2`) reserved for things that float. One radius family comes off
@@ -180,8 +204,19 @@ photon-compact  three per-signal compactors (Compactor/SpanCompactor/MetricsComp
 photon-query    three engines: QueryEngine (logs), SpanQueryEngine (traces/APM/RED), MetricsQueryEngine
                 (metrics + RUM vitals). Reassembles Prometheus classic histograms (`le`-bucket →
                 quantile) at query time. Manifest + skip-index pruning, then DataFusion over survivors.
+                RED counts a service's ENTRY spans (SERVER/CONSUMER), falling back to root spans then
+                all spans — `RedBasis` on every `RedRow`/`RedBucket` records which was used, and
+                `span_count` keeps the old all-spans number beside `count`. Errors are `status_code = 2`
+                OR an HTTP 5xx, and `http_4xx`/`http_5xx` are carried separately so a caller can tell
+                a client's bad request from the service's own fault. See
+                [`docs/adr/0003`](docs/adr/0003-a-services-request-rate-is-its-entry-spans.md).
+                `latency_sli` answers "how many samples were at or below X" off an explicit-bucket
+                histogram (the latency-SLO read); it shares its accumulation with the quantile path
+                so two readers of one metric cannot drift on the cumulative-reset rule.
 photon-ingest   OTLP gRPC (tonic) + HTTP (axum) receivers for logs/traces/metrics, mapping, token auth
-                (local token + federated tenant tokens). + Prometheus remote-write 1.0 (/api/v1/write,
+                (local token + federated tenant tokens). Also DEPLOY DETECTION: `deployments.rs`
+                reads a trace batch's RESOURCE `service.version` and reports first sightings through
+                the sync `DeploymentWatcher` seam (photon-server implements it over SQLite). + Prometheus remote-write 1.0 (/api/v1/write,
                 snappy+protobuf → metrics WAL; rejects tenant tokens). Both front doors accept gzipped
                 requests (stock OTel Collector gzips by default) and share one `[ingest].max_body_bytes`
                 cap (~16 MiB) enforced on the *decompressed* size.
@@ -198,7 +233,12 @@ photon-api      axum REST + session auth (argon2, signed cookies) + embedded Vue
                 seams RumSink/RumAppStore/UserStore/UsageStore/ReplicationStatus/DataAdmin (photon-api
                 can't dep photon-wal).
 photon-server   the binary: config load, wiring, background-task supervision (3 compactor loops, the
-                alert-engine scheduler, etc.). Optional `federation/` module spawns the summary pusher
+                alert-engine scheduler, the service-rollup pass, etc.). `rollup/` turns spans into
+                per-service `photon.service.*` and per-operation `photon.operation.*` metrics —
+                60s buckets, each published EXACTLY ONCE behind a SQLite watermark (the metrics
+                reader sums a bucket, it does not de-duplicate, so re-emitting would multiply every
+                counter). Optional `[rollup]` tunes `interval_secs`/`lag_secs`/`top_operations`.
+                See [`docs/subsystems/rollup.md`](docs/subsystems/rollup.md). Optional `federation/` module spawns the summary pusher
                 and full-mode forwarder — both tenant-side; central runs nothing from this module.
                 `[federation].signals` covers four signals (logs/traces/metrics/rum; omit = all
                 four): RUM bypasses the OTLP tee, so the module's `TeeingRumSink` wraps the local
@@ -215,8 +255,11 @@ schema, compactor, and manifest object — a deliberate cost so adding a signal 
 logs path. RUM adds **no** storage engine (Web Vitals → gauge metrics, JS errors → logs); uptime is a
 self-contained SQLite vertical. RUM's own app registry (`rum_apps` — name/key/allowed_origins/
 sample_rate/rate_limit, UI-managed, no config surface) lives in the same shared control-plane SQLite
-DB as UI users and uptime monitors. The **alerts** engine (`photon-alerts`) is likewise no new storage
-engine — a strictly read-path consumer of the three query engines plus its own `alert_channels`/
+DB as UI users and uptime monitors — as do the `deployments` table behind the Deployments tab and
+the `service_slos` table behind error budgets. The **service rollup** (`photon-server/src/rollup/`) is likewise no new
+storage engine — a read-path consumer of the span engine that writes its output back through the
+existing metrics WAL as ordinary `photon.service.*` / `photon.operation.*` points. The **alerts**
+engine (`photon-alerts`) is no new storage engine either — a strictly read-path consumer of the three query engines plus its own `alert_channels`/
 `alert_rules`/`alert_incidents` tables in that same control-plane SQLite DB; uptime bridges its
 up/down transitions onto the shared alerts incident history + channels via a monitor's optional
 `channel_ids` (see [`docs/subsystems/alerts.md`](docs/subsystems/alerts.md) and
@@ -270,10 +313,15 @@ token bloom), and only then reads the surviving **local** Parquet with DataFusio
 The log search bar speaks a small query language defined **once** in `photon-core/src/query/`
 (`parse` → AST → `FieldResolver` → `eval`; pure, no DataFusion) and compiled two ways: to an
 in-memory predicate (`eval`) and to a DataFusion filter (in `photon-query`) — one source of truth for
-filter semantics. Syntax: `field:value` (exact), `field:v1,v2` (OR-list), `field:*` (exists),
+filter semantics. Syntax: `field:value` (exact), `field:"a b"` (quoted value — the only way to express a value containing
+a space or a comma; the quotes are grouping and are stripped), `field:v1,v2` (OR-list, split on
+commas OUTSIDE quotes), `field:*` (exists),
 `-field:v` (negate), `field>=n` / `>` / `<` / `<=` (numeric compare), and `"quoted text"` or bare
 words (case-sensitive body substring). Terms are AND-ed; parse errors carry a byte `offset` so the UI
-can underline the bad token. The frontend has a display-only mirror (`lib/core/queryLang.ts`).
+can underline the bad token. There is **no escape** for a `"` inside a value, so a caller building a
+term from an arbitrary name uses `photon-api`'s `grammar_term` (or the frontend's `grammarTerm`),
+which quotes when needed and returns `None` rather than emitting a term that would parse cleanly and
+match nothing. The frontend has a display-only mirror (`lib/core/queryLang.ts`).
 
 The full `/api/*` surface (every route except the open/beacon ones requires the signed
 `photon_session` cookie) is enumerated in [`docs/architecture.md`](docs/architecture.md#api-surface) —
@@ -284,7 +332,27 @@ including RUM's `GET /api/rum/errors` (now with an optional `q` log-grammar filt
 there is no `[[rum.apps]]` config anymore) — plus the curated Infrastructure vertical
 `GET /api/infra/hosts`, `GET /api/infra/hosts/:host`, `GET /api/infra/hosts/:host/processes`,
 `GET /api/infra/hosts/:host/timeseries` (see
-[`docs/subsystems/infra.md`](docs/subsystems/infra.md)) and the cross-signal alert engine
+[`docs/subsystems/infra.md`](docs/subsystems/infra.md)), the Backend (Services/APM) routes
+`GET /api/services/overview` (the whole fleet board in one request),
+`GET /api/services/:service/operations` (rows + per-row sparklines),
+`GET /api/services/:service/operations/:operation/heatmap` (the latency distribution **over time** —
+the one shape three percentile lines cannot draw) and the **Backend Issues** surface
+`GET /api/services/errors` (fleet-wide), `GET /api/services/:service/errors`,
+`GET /api/services/:service/errors/facets`, `GET /api/services/:service/errors/:fingerprint` —
+errored spans grouped by `error.fingerprint`, identity `(service, fingerprint)` and never the
+fingerprint alone — plus `GET /api/services/map` (the topology: one scan self-joins child
+`(trace_id, parent_span_id)` to parent `(trace_id, span_id)`; `service` narrows AFTER the edges
+exist, never as a scan filter, and the `MAX_MAP_SPANS` cap is reported as `capped`) and
+`GET/POST /api/deployments` (releases — **detected at ingest**, not reported: `service.version` on a
+trace batch's RESOURCE that has never been seen before IS the deployment, so a 5,000-span batch costs
+four string lookups; CI may POST commit/author/message to enrich a row, but `detected_at_ms` and
+`source` are write-once so a late pipeline post cannot move a deploy marker off the moment the graph
+changed) and the SLO surface `GET/POST /api/services/:service/slos`,
+`PATCH/DELETE /api/services/:service/slos/:id`, `GET /api/services/:service/slos/:id/budget`
+(error budget + multi-window burn rate, computed from the **rollup only** — a window the rollup
+does not cover comes back `partial`, never a part-window number dressed as a full one; a latency
+objective's threshold snaps DOWN to a `LATENCY_BOUNDS_NS` edge and the response says which) (see
+[`docs/subsystems/services-apm.md`](docs/subsystems/services-apm.md)) and the cross-signal alert engine
 `GET/POST /api/alerts/rules`, `GET/PATCH/DELETE /api/alerts/rules/:id`,
 `POST /api/alerts/rules/:id/test`, `POST /api/alerts/preview`, `GET/POST /api/alerts/channels`,
 `GET/PATCH/DELETE /api/alerts/channels/:id`, `POST /api/alerts/channels/:id/test`,

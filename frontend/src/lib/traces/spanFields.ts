@@ -67,6 +67,11 @@ export const SPAN_FIELDS: SpanFieldDescriptor[] = [
     description: 'Federated tenant (stamped by central)',
     kind: 'match',
   },
+  {
+    name: 'deployment.environment',
+    description: 'Deployment environment (prod / staging / …), as declared by the producer',
+    kind: 'match',
+  },
 ]
 
 // name -> catalog entry, or undefined for unknown fields.

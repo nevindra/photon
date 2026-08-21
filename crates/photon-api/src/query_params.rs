@@ -24,6 +24,30 @@ pub fn clamp_buckets(n: usize) -> usize {
     n.clamp(1, MAX_BUCKETS)
 }
 
+/// One grammar term (`field:value`) built from an arbitrary value, or `None` when the grammar
+/// cannot express it.
+///
+/// Three cases, and the third is why this returns an `Option`:
+///
+///   - Ordinary value → bare `field:value`. Dots and dashes mean nothing special to the parser.
+///   - Value with whitespace or a comma → quoted `field:"a b"`. Quoting is the ONLY way to express
+///     those: the parser splits terms on whitespace and OR-lists on commas, so an unquoted
+///     `service.name:my api` parses as a service plus a stray free-text word — a filter that
+///     silently describes a different set of rows than the caller asked for.
+///   - Value containing a `"` → `None`. The grammar has no escape, so any term we built here would
+///     match nothing. Dropping the term (and widening the result) is honest; emitting one that
+///     silently matches nothing is not.
+pub fn grammar_term(field: &str, value: &str) -> Option<String> {
+    if value.is_empty() || value.contains('"') {
+        return None;
+    }
+    if value.chars().any(|c| c.is_whitespace() || c == ',') {
+        Some(format!("{field}:\"{value}\""))
+    } else {
+        Some(format!("{field}:{value}"))
+    }
+}
+
 /// Shared ceiling for any `limit` (facet/search row-count) query param — reuses the value already
 /// enforced ad hoc by `build_span_query_request` below.
 pub const MAX_LIMIT: usize = 1000;

@@ -193,12 +193,24 @@ export interface RedRow {
 }
 
 export interface ServiceTimeseriesPoint {
+  /** Bucket start, epoch MILLISECONDS — the same unit the route sends. */
   ts: number
   rate: number
   error_rate: number
+  /** Requests served in the bucket (entry spans, ADR-0003). */
+  count: number
+  span_count: number
+  basis: 'entry' | 'trace_root' | 'all_spans'
+  error_count: number
+  http_4xx: number
+  http_5xx: number
   p50: string
   p90: string
   p99: string
+  apdex: number | null
+  satisfied: number
+  tolerating: number
+  frustrated: number
 }
 
 // --- Metrics ---
@@ -1049,7 +1061,7 @@ export function mockTracesLatency(query: string, start: string, end: string, buc
 export function mockRed(query: string, start: string, end: string, group = 'operation'): RedRow[] {
   const groups = new Map<string, RedGroup>()
   for (const s of filterSpans({ query })) {
-    const key = group === 'service' ? s.service : `${s.service} ${s.name}`
+    const key = group === 'service' ? s.service : `${s.service}\u0000${s.name}`
     let g = groups.get(key)
     if (!g) {
       g = { service: s.service, operation: group === 'service' ? null : s.name, count: 0, error_count: 0, durations: [] }
@@ -1108,15 +1120,480 @@ export function mockServiceTimeseries(
     const p50ns = Math.round((40 + Math.sin(i / 7) * 15 + rnd() * 10) * 1e6)
     const p90ns = Math.round(p50ns * (2.4 + rnd() * 0.4))
     const p99ns = Math.round(p50ns * (4.5 + rnd() * 1.2))
+    // The counters the volume / errors-by-class / Apdex charts read. Without them the mock UI
+    // showed three empty panels beside two full ones, which reads as a bug in the page rather
+    // than a gap in the fixture.
+    const count = Math.max(1, Math.round(rate * (width / 1000)))
+    const error_count = Math.round(count * error_rate)
+    const http_5xx = Math.round(error_count * 0.7)
+    const frustrated = Math.round(count * Math.min(0.3, error_rate * 2 + rnd() * 0.03))
+    const tolerating = Math.round(count * (0.05 + rnd() * 0.08))
+    const satisfied = Math.max(0, count - tolerating - frustrated)
     return {
       ts,
       rate: Math.round(rate * 10) / 10,
       error_rate: Math.round(error_rate * 1000) / 1000,
+      count,
+      span_count: Math.round(count * 1.6),
+      basis: 'entry' as const,
+      error_count,
+      http_4xx: Math.max(0, error_count - http_5xx),
+      http_5xx,
       p50: String(p50ns),
       p90: String(p90ns),
       p99: String(p99ns),
+      apdex: count > 0 ? (satisfied + tolerating * 0.5) / count : null,
+      satisfied,
+      tolerating,
+      frustrated,
     }
   })
+}
+
+// A latency heatmap over the same fixed ladder photon-query uses (`LATENCY_BOUNDS_NS`). The shape
+// is bimodal on purpose: a fast path and a slow path, which is exactly the case three percentile
+// lines cannot draw, and therefore the case the mock should show.
+const HEATMAP_BOUNDS_NS = [
+  1e6, 2e6, 5e6, 10e6, 20e6, 50e6, 100e6, 200e6, 500e6, 1e9, 2e9, 5e9, 10e9,
+]
+
+export function mockLatencyHeatmap(
+  start: string,
+  end: string,
+  buckets = 48,
+): { columns: number[]; bounds: string[]; cells: [number, number, number][]; open_spans: number } {
+  const NS = 1_000_000n
+  const endMs = Number(BigInt(end) / NS)
+  const startMs = Number(BigInt(start) / NS)
+  const n = Math.max(1, Number(buckets) | 0)
+  const width = (endMs - startMs) / n
+  const rnd = seeded(hashSeed('heat:' + start + end))
+  const columns = Array.from({ length: n }, (_, i) => Math.round(startMs + i * width))
+  const cells: [number, number, number][] = []
+  for (let t = 0; t < n; t++) {
+    // Fast mode around 5-20ms, slow mode around 200-500ms, the slow one thickening over time.
+    const slowShare = 0.05 + (t / n) * 0.25
+    for (const [band, share] of [
+      [2, 0.35 * (1 - slowShare)],
+      [3, 0.45 * (1 - slowShare)],
+      [4, 0.2 * (1 - slowShare)],
+      [7, slowShare * 0.6],
+      [8, slowShare * 0.4],
+    ] as [number, number][]) {
+      const c = Math.round(share * (60 + rnd() * 40))
+      if (c > 0) cells.push([t, band, c])
+    }
+  }
+  return { columns, bounds: HEATMAP_BOUNDS_NS.map((b) => String(b)), cells, open_spans: 0 }
+}
+
+// ---- Backend Issues fixtures --------------------------------------------------------------
+// Errored spans grouped by `(service, error.fingerprint)`. `NPE_IN_TWO_SERVICES` is deliberate:
+// one exception present in both `api` and `worker` is TWO Issues sharing one fingerprint, which
+// is the identity rule the whole surface rests on. A mock that showed it once would quietly teach
+// the wrong model.
+interface BackendIssueFixture {
+  service: string
+  fingerprint: string
+  error_type: string
+  message: string
+  count: number
+  traces: number
+  operations: number
+  operation: string
+  status: string
+}
+const BACKEND_ISSUES: BackendIssueFixture[] = [
+  { service: 'api', fingerprint: 'b1f0c2a4', error_type: 'SQLTimeoutError', message: 'canceling statement due to statement timeout', count: 412, traces: 388, operations: 2, operation: 'POST /v1/charges', status: '500' },
+  { service: 'api', fingerprint: 'd93a71e5', error_type: 'NullPointerException', message: 'Cannot read property id of undefined', count: 137, traces: 137, operations: 1, operation: 'GET /v1/customers/:id', status: '500' },
+  { service: 'api', fingerprint: '4c8e0b12', error_type: 'ValidationError', message: 'amount must be a positive integer', count: 96, traces: 96, operations: 1, operation: 'POST /v1/charges', status: '400' },
+  { service: 'worker', fingerprint: 'd93a71e5', error_type: 'NullPointerException', message: 'Cannot read property id of undefined', count: 58, traces: 58, operations: 1, operation: 'settle-batch', status: '' },
+  { service: 'worker', fingerprint: '7a2d55f9', error_type: 'ERROR', message: 'batch settle failed', count: 21, traces: 21, operations: 1, operation: 'settle-batch', status: '' },
+  { service: 'auth-svc', fingerprint: 'e410bb7c', error_type: 'JwtExpiredError', message: 'token expired at 2026-01-01T00:00:00Z', count: 340, traces: 340, operations: 1, operation: 'POST /oauth/token', status: '401' },
+]
+
+function backendIssueRow(f: BackendIssueFixture, startNs: string, endNs: string) {
+  const span = BigInt(endNs) - BigInt(startNs)
+  return {
+    service: f.service,
+    fingerprint: f.fingerprint,
+    error_type: f.error_type,
+    message: f.message,
+    count: f.count,
+    traces: f.traces,
+    operations: f.operations,
+    first_seen: String(BigInt(startNs) + span / 8n),
+    last_seen: String(BigInt(endNs) - span / 32n),
+    trace_id: f.fingerprint.repeat(8).slice(0, 32),
+  }
+}
+
+// `q` is honoured only as a substring of the type/message/operation — enough for the offline UI to
+// react to typing, and honest about being a mock rather than a second grammar implementation.
+export function mockBackendIssues(service: string | null, q: string, startNs: string, endNs: string) {
+  const needle = (q ?? '').replace(/[a-z_.]+:/gi, '').trim().toLowerCase()
+  const rows = BACKEND_ISSUES.filter((f) => (!service || f.service === service))
+    .filter((f) =>
+      !needle ||
+      f.error_type.toLowerCase().includes(needle) ||
+      f.message.toLowerCase().includes(needle) ||
+      f.operation.toLowerCase().includes(needle),
+    )
+    .sort((a, b) => b.count - a.count)
+    .map((f) => backendIssueRow(f, startNs, endNs))
+  // `service` is present only on the per-service list — the fleet list names no service of its
+  // own, because each ROW carries one. Mirrors the real handler's response shape exactly.
+  return {
+    window: { start: startNs, end: endNs },
+    errors: rows,
+    ...(service ? { service } : {}),
+  }
+}
+
+export function mockBackendIssueFacets(service: string) {
+  const rows = BACKEND_ISSUES.filter((f) => f.service === service)
+  const tally = (pick: (f: BackendIssueFixture) => string) => {
+    const m = new Map<string, number>()
+    for (const f of rows) {
+      const k = pick(f)
+      if (k) m.set(k, (m.get(k) ?? 0) + f.count)
+    }
+    return {
+      values: [...m].map(([value, count]) => ({ value, count })).sort((a, b) => b.count - a.count),
+      capped: false,
+    }
+  }
+  const total = rows.reduce((s, f) => s + f.count, 0)
+  return {
+    service,
+    facets: {
+      'error.type': tally((f) => f.error_type),
+      name: tally((f) => f.operation),
+      kind_text: { values: total ? [{ value: 'SERVER', count: total }] : [], capped: false },
+      'deployment.environment': { values: total ? [{ value: 'prod', count: total }] : [], capped: false },
+      'host.name': { values: total ? [{ value: 'node-a', count: Math.round(total * 0.6) }, { value: 'node-b', count: Math.round(total * 0.4) }] : [], capped: false },
+      'http.status_code': tally((f) => f.status),
+    },
+  }
+}
+
+// ---- Service map fixtures ------------------------------------------------------------------
+// A small, realistic topology over the same `SERVICES` corpus the rest of the mock uses. Edges are
+// directed and acyclic on purpose — a cycle is legal in the real data (and the layout handles it),
+// but a fixture that starts with one teaches the graph as noise rather than as structure.
+const MAP_EDGES: [string, string, number, number][] = [
+  // from, to, calls, error share
+  ['web', 'api', 41_200, 0.004],
+  ['web', 'auth-svc', 12_800, 0.001],
+  ['api', 'postgres', 38_400, 0.0009],
+  ['api', 'auth-svc', 9_600, 0.002],
+  ['api', 'ingestor', 6_400, 0.031],
+  ['worker', 'postgres', 8_100, 0.0004],
+  ['worker', 'ingestor', 2_050, 0.012],
+]
+// Services with no inbound edge are where work enters the system.
+const MAP_ROOT_SERVICES = new Set(['web', 'worker'])
+
+export function mockServiceMap(service: string | null, startNs: string, endNs: string) {
+  const rnd = seeded(hashSeed('map:' + (service ?? '') + startNs))
+  const windowSecs = Math.max(1, Number((BigInt(endNs) - BigInt(startNs)) / 1_000_000_000n))
+
+  const edges = MAP_EDGES.filter(([from, to]) => !service || from === service || to === service).map(
+    ([from, to, count, errShare]) => {
+      const errors = Math.round(count * errShare)
+      const base = 2_000_000 + rnd() * 30_000_000
+      return {
+        from,
+        to,
+        count,
+        rate: count / windowSecs,
+        error_count: errors,
+        error_rate: count ? errors / count : 0,
+        p50: String(Math.round(base)),
+        p95: String(Math.round(base * 4)),
+        p99: String(Math.round(base * 9)),
+      }
+    },
+  )
+
+  const touched = new Set<string>()
+  for (const e of edges) {
+    touched.add(e.from)
+    touched.add(e.to)
+  }
+  if (service) touched.add(service)
+
+  const nodes = SERVICES.filter((s) => !service || touched.has(s)).map((s) => {
+    // A node's spans include work with no edge of its own, so the totals are bigger than the sum
+    // of its edges — the same relationship the real engine produces.
+    const inbound = MAP_EDGES.filter(([, to]) => to === s).reduce((n, [, , c]) => n + c, 0)
+    const outbound = MAP_EDGES.filter(([from]) => from === s).reduce((n, [, , c]) => n + c, 0)
+    const count = Math.max(1, inbound + Math.round(outbound * 0.2) + 500)
+    const errors = Math.round(count * (0.001 + rnd() * 0.01))
+    const roots = MAP_ROOT_SERVICES.has(s) ? Math.round(count * 0.9) : 0
+    return {
+      service: s,
+      count,
+      rate: count / windowSecs,
+      error_count: errors,
+      error_rate: errors / count,
+      roots,
+      is_entry: roots > 0,
+    }
+  })
+
+  return {
+    window: { start: startNs, end: endNs },
+    service: service ?? null,
+    nodes: nodes.sort((a, b) => b.count - a.count),
+    edges: edges.sort((a, b) => b.count - a.count),
+    scanned: nodes.reduce((n, x) => n + x.count, 0),
+    capped: false,
+  }
+}
+
+// Deployments. Versions walk backwards from now at uneven spacing, because real releases are not a
+// cron job — a burst on a Tuesday afternoon and then four quiet days is the normal shape. Roughly
+// one row in three carries CI metadata, so the timeline shows both kinds side by side.
+const DEPLOY_AUTHORS = ['nevindra', 'ade', 'rizky', 'sari']
+const DEPLOY_MESSAGES = [
+  'fix: retry the upstream call once before giving up',
+  'perf: reuse the connection pool across handlers',
+  'feat: carry the tenant through the span attributes',
+  'chore: bump datafusion to 43',
+  'fix: stop double-counting rollup buckets',
+]
+
+export function mockDeployments(filter: {
+  service?: string
+  environment?: string
+  tenant?: string
+  start?: string
+  end?: string
+}) {
+  const services = filter.service ? [filter.service] : SERVICES.slice(0, 4)
+  const now = Date.now()
+  const out: {
+    id: string
+    service: string
+    environment: string
+    tenant: string
+    version: string
+    detected_at_ms: number
+    source: 'detected' | 'ci'
+    commit_sha: string | null
+    author: string | null
+    message: string | null
+    url: string | null
+  }[] = []
+  for (const service of services) {
+    const rnd = seeded(hashSeed('deploy:' + service))
+    let at = now - Math.round(rnd() * 3 * 3_600_000)
+    const perService = 3 + Math.floor(rnd() * 4)
+    for (let i = 0; i < perService; i++) {
+      const version = `1.${8 - i}.${Math.floor(rnd() * 6)}`
+      const ci = rnd() < 0.35
+      const environment = filter.environment ?? 'prod'
+      const tenant = filter.tenant ?? ''
+      out.push({
+        id: `${service}-${version}-${i}`,
+        service,
+        environment,
+        tenant,
+        version,
+        detected_at_ms: at,
+        source: ci ? ('ci' as const) : ('detected' as const),
+        commit_sha: ci ? hashSeed(service + version).toString(16).padStart(8, '0').repeat(5).slice(0, 40) : null,
+        author: ci ? DEPLOY_AUTHORS[Math.floor(rnd() * DEPLOY_AUTHORS.length)] : null,
+        message: ci ? DEPLOY_MESSAGES[Math.floor(rnd() * DEPLOY_MESSAGES.length)] : null,
+        url: ci ? `https://example.invalid/deploys/${service}/${version}` : null,
+      })
+      // Uneven gaps: mostly hours, occasionally a multi-day quiet stretch.
+      at -= Math.round((0.5 + rnd() * 9) * 3_600_000 * (rnd() < 0.25 ? 12 : 1))
+    }
+  }
+  const startMs = filter.start ? Number(BigInt(filter.start) / MS) : 0
+  const endMs = filter.end ? Number(BigInt(filter.end) / MS) : Number.MAX_SAFE_INTEGER
+  return {
+    deployments: out
+      .filter((d) => d.detected_at_ms >= startMs && d.detected_at_ms <= endMs)
+      .sort((a, b) => b.detected_at_ms - a.detected_at_ms),
+  }
+}
+
+// Per-service data usage. The shape that matters in the fixture is the ORDERING: a chatty service
+// with cheap log rows must not outrank a quieter one whose span rows cost a hundred times more,
+// because that inversion is the whole reason the page sorts on bytes rather than rows.
+export function mockServiceUsage(startNs: string, endNs: string, limit = 50) {
+  const rnd = seeded(hashSeed('usage:' + startNs))
+  const LOG_BYTES = 42
+  const SPAN_BYTES = 380
+  const rows = SERVICES.map((service) => {
+    const logRows = Math.round((500 + rnd() * 40_000) * (service === 'web' ? 6 : 1))
+    const spanRows = Math.round(200 + rnd() * 9_000)
+    const logs = { rows: logRows, bytes: Math.round(logRows * LOG_BYTES) }
+    const traces = { rows: spanRows, bytes: Math.round(spanRows * SPAN_BYTES) }
+    return {
+      service,
+      signals: { logs, traces },
+      rows_total: logRows + spanRows,
+      bytes_total: logs.bytes + traces.bytes,
+    }
+  })
+    .sort((a, b) => b.bytes_total - a.bytes_total || a.service.localeCompare(b.service))
+    .slice(0, limit)
+
+  const basis = (bytesPerRow: number, attributed: boolean) => {
+    const storeRows = 1_000_000 + Math.round(rnd() * 4_000_000)
+    return {
+      store_rows: storeRows,
+      store_bytes: Math.round(storeRows * bytesPerRow),
+      bytes_per_row: bytesPerRow,
+      attributed,
+      capped: false,
+    }
+  }
+
+  return {
+    window: { start: startNs, end: endNs },
+    rows,
+    estimated: true,
+    signals: {
+      logs: basis(LOG_BYTES, true),
+      traces: basis(SPAN_BYTES, true),
+      metrics: basis(96, false),
+    },
+    notes: {
+      metrics:
+        "Metrics are not attributed to services: a metric series is keyed by name, and most of " +
+        "them (host and GPU metrics, RUM vitals, the service rollup's own output) do not belong " +
+        'to a service at all.',
+    },
+  }
+}
+
+// SLOs. Two per service — one availability, one latency — because the interesting case is a
+// service where one objective is fine and the other is not, which a single card can never show.
+export function mockSlos(service: string) {
+  return [
+    {
+      id: `${service}-availability`,
+      service,
+      environment: 'prod',
+      operation: '',
+      name: 'Availability',
+      kind: 'availability' as const,
+      target: 0.999,
+      threshold_ms: 0,
+      window_days: 30,
+    },
+    {
+      id: `${service}-latency`,
+      service,
+      environment: 'prod',
+      operation: '',
+      name: 'Latency under 200ms',
+      kind: 'latency' as const,
+      target: 0.99,
+      threshold_ms: 200,
+      window_days: 30,
+    },
+  ]
+}
+
+export function mockSloBudget(service: string, id: string) {
+  const slo = mockSlos(service).find((s) => s.id === id) ?? mockSlos(service)[0]
+  const rnd = seeded(hashSeed('slo:' + id))
+  const now = Date.now()
+  const total = 400_000 + Math.round(rnd() * 600_000)
+  // Spend somewhere between a third and 1.4× the budget, so the fixture shows both a healthy card
+  // and an overspent one depending on the service.
+  const budget = (1 - slo.target) * total
+  const bad = Math.round(budget * (0.3 + rnd() * 1.1))
+  const remaining = budget - bad
+  const burn = (window: number) => Math.max(0, (bad / total / (1 - slo.target)) * window)
+  const longRate = burn(0.9 + rnd() * 1.2)
+  const shortRate = burn(0.6 + rnd() * 2.4)
+  return {
+    slo,
+    window_start_ms: now - slo.window_days * 86_400_000,
+    window_end_ms: now,
+    partial: false,
+    total_events: total,
+    bad_events: bad,
+    sli: (total - bad) / total,
+    budget_events: budget,
+    remaining_events: remaining,
+    remaining_fraction: budget > 0 ? remaining / budget : null,
+    exhausts_in_secs: remaining > 0 && longRate > 0 ? (remaining / (bad / 3600)) * 0.5 : null,
+    fast: {
+      long: '1h',
+      short: '5m',
+      long_rate: longRate,
+      short_rate: shortRate,
+      threshold: 14.4,
+      firing: longRate >= 14.4 && shortRate >= 14.4,
+    },
+    slow: {
+      long: '6h',
+      short: '30m',
+      long_rate: longRate * 0.4,
+      short_rate: shortRate * 0.5,
+      threshold: 6,
+      firing: longRate * 0.4 >= 6 && shortRate * 0.5 >= 6,
+    },
+    measured_threshold_ms: slo.kind === 'latency' ? 200 : null,
+  }
+}
+
+export function mockBackendIssueDetail(service: string, fingerprint: string, startNs: string, endNs: string) {
+  const f = BACKEND_ISSUES.find((x) => x.service === service && x.fingerprint === fingerprint)
+  const startMs = Number(BigInt(startNs) / MS)
+  const endMs = Number(BigInt(endNs) / MS)
+  const n = 48
+  const width = (endMs - startMs) / n
+  const rnd = seeded(hashSeed('issue:' + service + fingerprint))
+  const occurrences = f?.count ?? 0
+  const series: [number, number][] = Array.from({ length: n }, (_, i) => [
+    Math.round(startMs + i * width),
+    Math.max(0, Math.round((occurrences / n) * (0.4 + rnd() * 1.4))),
+  ])
+  const share = (x: number) => Math.max(1, Math.round(occurrences * x))
+  return {
+    service,
+    fingerprint,
+    error_type: f?.error_type ?? 'ERROR',
+    message: f?.message ?? '',
+    first_seen: String(BigInt(startNs) + (BigInt(endNs) - BigInt(startNs)) / 8n),
+    last_seen: endNs,
+    occurrences,
+    traces: f?.traces ?? 0,
+    operations: f?.operations ?? 0,
+    series,
+    tags: [
+      { field: 'name', values: [{ value: f?.operation ?? 'unknown', count: occurrences }] },
+      { field: 'http.status_code', values: f?.status ? [{ value: f.status, count: occurrences }] : [] },
+      { field: 'deployment.environment', values: [{ value: 'prod', count: occurrences }] },
+      { field: 'host.name', values: [{ value: 'node-a', count: share(0.6) }, { value: 'node-b', count: share(0.4) }] },
+    ],
+    // A status-only Issue (`error_type: 'ERROR'`) has no exception event, so it has no stack —
+    // the real backend returns null there and the UI must handle it.
+    sample_stack:
+      f && f.error_type !== 'ERROR'
+        ? `${f.error_type}: ${f.message}\n    at handler (service.rs:142)\n    at dispatch (router.rs:88)\n    at serve (server.rs:31)`
+        : null,
+    events: Array.from({ length: Math.min(20, occurrences) }, (_, i) => ({
+      timestamp: String(BigInt(endNs) - BigInt(i) * 300_000n * MS),
+      trace_id: (fingerprint + String(i)).repeat(8).slice(0, 32),
+      span_id: (fingerprint + String(i)).repeat(4).slice(0, 16),
+      operation: f?.operation ?? 'unknown',
+      kind: 'SERVER',
+      duration_nanos: String(Math.round(20_000_000 + rnd() * 800_000_000)),
+      status_message: f?.message ?? '',
+      host: i % 2 ? 'node-b' : 'node-a',
+      environment: 'prod',
+    })),
+  }
 }
 
 // ---- Metrics fixtures (Phase 3) -----------------------------------------------------------

@@ -23,6 +23,9 @@ const props = defineProps({
   loading: { type: Boolean, default: false },
   viz: { type: String, default: 'line' },
   yLog: { type: Boolean, default: false },
+  // [{ xMs, label, color }] — moments in time drawn as dashed verticals (deploy markers).
+  // Forwarded verbatim to both chart kinds so a marker looks the same on bars and on lines.
+  markers: { type: Array, default: () => [] },
 })
 const emit = defineEmits(['exemplar', 'zoom', 'legend-toggle', 'point-click', 'highlight'])
 
@@ -81,6 +84,7 @@ defineExpose({ onPointClick })
     :start-ms="startMs"
     :end-ms="endMs"
     :stacked="barStacked"
+    :markers="markers"
     :format-value="formatValue"
     :loading="loading"
     @zoom="onZoom"
@@ -93,6 +97,7 @@ defineExpose({ onPointClick })
     :start-ms="startMs"
     :end-ms="endMs"
     :format-value="formatValue"
+    :markers="markers"
     :area="area"
     :stacked="stacked"
     :y-log="yLog"

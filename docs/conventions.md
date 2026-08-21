@@ -84,18 +84,27 @@ public API, adding a dependency, or touching the query/chart data path.
 - **No Pinia.** Server state lives in **TanStack Query** (a request cache); within-view state lives
   in **URL params** (`useUrlState.js`, `?tab=`, route params). App-wide state is a few ad-hoc
   reactive-ref modules — the module-singleton pattern, not a store: `lib/auth.js`, `lib/theme.js`,
-  and `lib/context.ts` — the sanctioned home for app-wide **time window** (`timeRange`/`customRange`,
-  plus derived `startNs`/`endNs`) and **entity scope** (`scope`, e.g. a service or RUM app). Do not
-  add a global store, and do not duplicate time/scope state locally in a view — read it from
-  `context.ts`.
-- **URL query-key ownership is split and merge-preserving.** `lib/context.ts` is the *sole* owner of
-  the `range`/`from`/`to`/`scope` keys; `useUrlState.js` owns only `svc`/`sev`/`q` (per-view
+  and `lib/core/context.ts` — the sanctioned home for the three app-wide context dimensions: the
+  **time window** (`timeRange`/`customRange`, plus derived `startNs`/`endNs`), the **Site**
+  (`tenant`), and the **environment** (`environment`, i.e. `deployment.environment`). Do not add a
+  global store, and do not duplicate any of it locally in a view — read it from `context.ts`.
+- **URL query-key ownership is split and merge-preserving.** `lib/core/context.ts` is the *sole*
+  owner of the `range`/`from`/`to`/`tenant`/`env` keys; `useUrlState.ts` owns only `svc`/`sev`/`q` (per-view
   service/severity/text filters). Each module's URL sync (`history.replaceState`) deletes and
   rewrites *only* the keys it owns, leaving the rest of `location.search` untouched — so editing a
   view's text filter never clobbers the current time window, and changing the time range never drops
   a view's filters. `lib/useCorrelate.ts`'s `correlate()` follows the same discipline when building
-  cross-signal links: it always injects the current time+scope alongside the destination's own query
-  params. Give any new URL-backed state a single owning module and touch only that module's keys.
+  cross-signal links: it always injects the current time+tenant+env alongside the destination's own
+  query params. Give any new URL-backed state a single owning module and touch only that module's keys.
+- **Every query composable appends the global context through `withContext()`.** The Site and
+  environment dimensions filter by contributing grammar terms (`tenant:x`,
+  `deployment.environment:y`) to the `q`/`filter` string a composable sends, and `contextQueryTerm()`
+  is the single cache-key slot they re-key on — one slot, not one per dimension, so adding a fourth
+  dimension later doesn't widen every key. Never hand-roll the join at a call site: a composable that
+  appends one dimension but not the other renders a page that silently ignores a picker, which is
+  worse than not having the picker. The one sanctioned exception is `lib/core/environments.ts`, which
+  facets `deployment.environment` and must not filter by it — see
+  [frontend.md](frontend.md#the-environment-dimension).
 - **`ui/` primitives are `<script setup lang="ts">`; views and domain components are, by default,
   plain JS `<script setup>`.** The only plain-JS files under `ui/` are the Photon-authored composites
   (`facet/`, `nav-tabs/`, `peek-drawer/`, `select-menu/`, `sparkline/`).

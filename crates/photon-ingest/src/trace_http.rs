@@ -36,6 +36,9 @@ pub(crate) struct TraceHttpState<W: Wal + Send + Sync + 'static> {
     /// Federation `full` mode: the raw decoded body is offered here for best-effort
     /// forwarding to central. `None` on a non-federated node.
     pub(crate) federation_tee: Option<crate::FederationTee>,
+    /// Deploy detection. `None` = nobody is recording deployments, and the resource walk is
+    /// skipped entirely rather than computed and thrown away.
+    pub(crate) deployments: Option<Arc<dyn crate::deployments::DeploymentWatcher>>,
 }
 
 /// Decode a raw protobuf body into an `ExportTraceServiceRequest`. Pure — no I/O — so the
@@ -94,6 +97,14 @@ async fn ingest_traces<W: Wal + Send + Sync + 'static>(
 
     if let Auth::Tenant(tenant) = &auth {
         stamp_tenant_traces(&mut req, tenant);
+    }
+
+    // Deploy detection reads the RESOURCE attributes, after the tenant stamp so a federated
+    // batch is attributed to its Site. Before the builder, which consumes `req`.
+    if let Some(watcher) = &state.deployments {
+        for seen in crate::deployments::resource_versions(&req) {
+            watcher.observe(&seen);
+        }
     }
 
     let mut builder = SpanBatchBuilder::with_capacity(&state.schema, estimate_rows(&req));
@@ -178,6 +189,7 @@ mod tests {
             counters: Arc::new(photon_core::ingest_counters::IngestCounters::new()),
             tenant_tokens: TenantTokenMap::default(),
             federation_tee: None,
+            deployments: None,
         };
 
         let _first = state

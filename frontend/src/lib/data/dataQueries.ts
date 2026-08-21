@@ -10,6 +10,7 @@ import {
   type SetRetentionResult,
   type PurgeRequest,
   type PurgeResult,
+  type ServiceUsageResult,
 } from '@/lib/core/api'
 import { windowMs } from '@/lib/core/context'
 import { toast } from '@/components/ui/toast'
@@ -81,6 +82,30 @@ export function usePurge() {
       qc.invalidateQueries({ queryKey: storageQueryKey() })
       toast({ variant: 'success', title: 'Data purged' })
     },
+  })
+}
+
+export const serviceUsageQueryKey = (
+  startNs: MaybeRefOrGetter<string>,
+  endNs: MaybeRefOrGetter<string>,
+) => ['usage', 'services', String(toValue(startNs)), String(toValue(endNs))]
+
+/**
+ * Per-service footprint over the global window.
+ *
+ * Unlike the rest of this file it takes the RAW nanosecond window rather than the coarse
+ * `usageWindow` bucket: `/api/usage/services` facets the real stores, so it can answer any window,
+ * and rounding "the last 90 minutes" up to 24h would attribute six times the data to everybody.
+ */
+export function useServiceUsage(
+  startNs: MaybeRefOrGetter<string>,
+  endNs: MaybeRefOrGetter<string>,
+  limit = 50,
+) {
+  return useQuery<ServiceUsageResult>({
+    queryKey: computed(() => serviceUsageQueryKey(startNs, endNs)),
+    queryFn: ({ signal }) => api.serviceUsage(toValue(startNs), toValue(endNs), limit, { signal }),
+    placeholderData: keepPreviousData,
   })
 }
 

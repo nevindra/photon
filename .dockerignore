@@ -18,5 +18,4 @@ docs/
 photon.toml
 photon.dev.toml
 process-compose.yaml
-.superpowers/
 .claude/

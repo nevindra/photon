@@ -12,7 +12,8 @@ wraps `<router-view>` in one app-wide `TooltipProvider` + `Toaster` and calls `i
 
 **No Pinia.** Server state lives in TanStack Query; within-view state lives in URL params. App-wide
 auth/theme/context are a few ad-hoc reactive-ref modules (`lib/core/auth.ts`, `lib/core/theme.ts`,
-`lib/core/context.ts` — the app-wide time window + federation tenant).
+`lib/core/context.ts` — the app-wide time window, federation tenant (Site), and deployment
+environment).
 
 ## Design tokens & elevation
 
@@ -91,6 +92,33 @@ route params) — no store. `lib/core/api.ts` tries `/api` and falls back per-me
 corpus (`lib/core/mock.ts`) on a **network** failure, while still surfacing real 400/404s; the reactive
 `api.mock` flag drives the shell's "demo data" banner.
 
+### The environment dimension
+
+`deployment.environment` is the **third global context dimension**, alongside the time Window and the
+federation Site (`tenant`), and it applies to every signal — not just Backend. It is a promoted
+attribute (`[schema].promoted_attributes` in `photon.example.toml`), so it filters through the ordinary
+query grammar: `contextQueryTerm()` contributes `deployment.environment:<x>`.
+
+Three choices in `ContextBar.vue` / `lib/core/context.ts` that look arbitrary and are not:
+
+- **The picker hides below two values.** It is populated from `GET /api/facet?field=deployment.environment`
+  **unioned with** `GET /api/traces/facet?field=deployment.environment`, both over the active window — the
+  dimension is global, and a trace-only install (APM first, logs later) would never see the picker off the
+  logs facet alone. An install whose producers declare no environment, or all declare the same one, has
+  nothing to choose between — a picker over a constant is a control that cannot change anything. Same rule
+  that hides the tenant picker on an empty registry.
+- **`prod` is the default when it exists.** Prod is the environment worth waking someone for, and averaging
+  staging's numbers into it is how a real regression gets hidden. Everything else stays one click away
+  rather than selected for the reader. The default applies **once** per session (`environmentDefaulted`),
+  so clearing the picker sticks instead of snapping back on the next facet refetch; an explicit `?env=` in
+  the URL wins over it.
+- **Nothing selected means no term at all** — never `deployment.environment:*`. Records whose producer
+  declares no environment belong to no environment (Photon never infers one), and `:*` would drop them.
+
+The environment facet itself is the one query that does **not** apply the environment term
+(`lib/core/environments.ts`): picking `prod` would otherwise collapse the facet to a single value and hide
+the picker that was just used. It does apply the Site term — environments are per-Site.
+
 ## Routes → views
 
 | Path | View | Section |
@@ -98,7 +126,8 @@ corpus (`lib/core/mock.ts`) on a **network** failure, while still surfacing real
 | `/` → `/home` | `HomeView.vue` | The **Attention Board** (landing) — see [`adr/0001`](adr/0001-landing-page-is-an-attention-board.md) |
 | `/logs` | `LogsView.vue` | Logs explorer |
 | `/traces` · `/traces/:traceId` | `TracesExplorer.vue` · `TraceDetailView.vue` | Traces + waterfall |
-| `/services` · `/services/:service` | `ServicesListView.vue` · `ServiceDetailView.vue` | APM |
+| `/services` · `/services/errors` · `/services/map` | `ServicesListView.vue` · `BackendIssuesView.vue` · `ServiceMapView.vue` | Backend: the fleet board, its Issues, its topology |
+| `/services/:service` (+ `/operations[/:operation]` · `/errors[/:fingerprint]` · `/dependencies` · `/deployments`) | `ServiceDetailView.vue` + the sub-route views | APM detail — each tab owns its own queries |
 | `/metrics` · `/metrics/catalog` | `MetricsExplorer.vue` (reused) | Metrics explorer |
 | `/rum` · `/rum/:appId` · `/rum/:appId/pages[/:route]` · `/rum/:appId/errors` | `Rum*View.vue` | RUM (apps · vitals · pages/detail · errors) |
 | `/uptime` | `UptimeDashboard.vue` | Uptime |
@@ -135,18 +164,24 @@ readings. The decisions behind it — and the alternatives that were rejected �
 the vocabulary (Subject, Attention Level, Silence, Watch Range, Spread, Unattributed Incident, Site,
 Central) is in [`../CONTEXT.md`](../CONTEXT.md). What matters for the code:
 
-- **One axis.** Every watched thing becomes a `Subject` at one of five levels — **Down** (not
-  answering) / **Critical** / **Warning** / **OK**, plus **Unknown**, which is the *absence* of a
-  judgment and never a colour. `attention.ts` adds no fourth opinion about what "bad" means: it maps
-  `serviceHealth.ts`, `hostStats.ts`, the API's own Web-Vital `rating` and the tenants API's own
-  up/stale/down onto that axis, and keeps each kind's native word verbatim in the reason line.
+- **One axis, and it is defined once.** Every watched thing becomes a `Subject` at one of five
+  levels — **Down** (not answering) / **Critical** / **Warning** / **OK**, plus **Unknown**, which
+  is the *absence* of a judgment and never a colour. The axis itself (`AttentionLevel`,
+  `LEVEL_RANK`, the `STATUS_META` display table, `INCIDENT_LEVEL`) lives in
+  `lib/services/serviceHealth.ts` and `attention.ts` re-exports it as `LEVEL_META` &co. — the
+  Services pages and `/home` speak the same five words, so nothing can read "Critical" on one page
+  and "Degraded" on the other in the same second. `attention.ts` adds no fourth opinion about what
+  "bad" means: it maps `serviceHealth.ts`'s `serviceLevel()`, `hostStats.ts`, the API's own
+  Web-Vital `rating` and the tenants API's own up/stale/down onto that axis, and keeps each kind's
+  native word verbatim in the reason line.
 - **The Watch Range is not the Window.** `watchRange.ts` owns a bounded 5m/15m/1h/6h lookback and
   the `watch` URL key. Drilling out calls `applyWatchRangeToWindow()` *before* `correlate()`, so the
   destination shows the same slice of time.
 - **Silence is Down.** A Subject that reported and then stopped is Down; one that never reported is
   Unknown. Detected client-side against the previous equal-length range (`InfraHost.lastSeenNs`
   gives hosts a finer signal). This is what stops a service falling to zero traffic from reading as
-  `idle` and disappearing.
+  a calm neutral nothing and disappearing — the old `idle` level covered both facts at once and is
+  retired.
 - **The roll-up cards are the filter.** No tabs. Each card always shows its World's full tallies and
   toggles `?world=<key>` in place.
 - **Merging across Sites is Services-only.** `RedRow.tenant` is populated for `group=service`, so
@@ -161,6 +196,103 @@ Central) is in [`../CONTEXT.md`](../CONTEXT.md). What matters for the code:
   NOT `hasSites`: a row the backend never stamped with a `tenant` would otherwise read `central`
   while sitting under a `divtik` filter.
 
+## The Services index (`/services`)
+
+A **fleet board**, not a table with a Site column — see
+[`adr/0004`](adr/0004-the-services-index-is-a-fleet-board.md). Three reading layers, in the order a
+person needs them, all fed by ONE request (`GET /api/services/overview`) plus a second copy of it for
+the previous window:
+
+1. **The Site band** (`SiteBand` → `SiteCard`) — which Sites are even reporting. It *is* the Site
+   filter: clicking a card sets the global tenant, clicking the active one clears it. There is no
+   separate picker, because a picker that showed no health would make you choose blind. A stale Site
+   is tinted, badged `stale`, and renders `—` rather than `0/s`. Renders nothing on a Site install
+   (the tenant registry is empty), which is what makes one page work in both deployments.
+2. **KPIs + the attention strip** (`MetricTiles`, `AttentionStrip` → `AttentionCard`) — Requests /
+   Error rate / p99 / Apdex / Open incidents, then a card per subject that is not OK, worst first,
+   capped at 8 with a `+N more` chip that scrolls to the table. The chip is load-bearing: capping
+   silently makes a fleet with thirty problems read as having eight.
+3. **The table** (`ServicesTable`) — one dense row per `(service, environment)`. Seven columns, all
+   on the active Window: `Health · Service · <window> sparkline · Traffic · Errors · Latency p99 ·
+   Apdex`. No 30-day error budget, no cumulative data usage — a row that mixes three clocks with none
+   of them labelled is how a table starts lying quietly.
+
+Two behaviours in the table are deliberate. Clicking a **row** expands it (`ServiceRowExpansion`:
+per-Site child rows plus a top-operations / slowest-operations / worst-dependencies mini-dashboard,
+fetched only while open); only the service **name** navigates. Making the whole row navigate is what
+made the old table useless for comparison, and the expansion is what replaces a separate compare
+mode. One row is open at a time.
+
+The previous-window request is fetched with `buckets=1`: it exists solely so `serviceLevel` can tell
+Silence ("it reported, then stopped" → Down) from never-reported (→ Unknown), and 30 unused series
+per service is a real cost on a fleet.
+
+**Services · Issues · Map** are three sibling tabs on one bar, not modes of one view. Issues groups
+errored spans and Map groups call edges; neither is a filter of the services table, and presenting
+them as a toggle would imply they are. See
+[`subsystems/services-apm.md`](subsystems/services-apm.md) for what each answers.
+
+The **fleet graph** on `/services/map` is the app's only route that pulls a layout library, and it
+pulls it with a dynamic `import()` so `@dagrejs/dagre` lands in its own ~48 kB chunk instead of the
+initial bundle. Its node dots read the Attention Level out of `lib/services/serviceHealth.ts` rather
+than deriving a second judgment from span counts — `GET /api/services/map` deliberately carries no
+level, because a level depends on Apdex and on the previous window and neither is a topology fact.
+
+### Two chart engines, and the measurement that decided the boundary
+
+Photon draws its charts with **uPlot**, except one: the service Overview's **Apdex band chart**,
+which renders through **TanStack Charts** (`components/charts/tanstack/`). That is a deliberate,
+measured boundary, not a migration in progress.
+
+The evaluation ported the one shape that actually qualified. Of the four candidates, three did not:
+
+| Shape | Ported? | Why |
+|---|---|---|
+| Apdex band chart | **yes** | A plain stacked bar over evenly-spaced buckets. No brush, no drag-zoom, no drag-to-filter — the interactions TanStack Charts has no documented equivalent for. |
+| Latency heatmap | no | Already a plain CSS grid, on purpose. It is a grid of rectangles with a colour scale and backend-supplied axis labels; a chart engine would cost a dependency and lose text selection and hover targets. |
+| Row sparkline | no | Already a hand-authored SVG path, 22px tall. There is nothing an engine would add at that size. |
+| Deploy markers | no | An annotation on other charts, not a shape of its own. Porting them means porting the charts they sit on, which this boundary excludes. |
+
+`SpanVolumeHistogram` and `LatencyHistogram` stay on uPlot for the reason the plan named: their
+drag-to-zoom and drag-to-filter-duration interactions have no documented equivalent.
+
+**The bundle delta, measured on the real build:**
+
+| | Raw | Gzipped |
+|---|---|---|
+| uPlot — every other chart in the app | 52.35 kB | 23.30 kB |
+| TanStack Charts — this one chart | **96.95 kB** | **33.85 kB** |
+
+TanStack Charts costs roughly **1.5x uPlot's entire footprint to draw one chart**. It is therefore
+loaded through a dynamic `import()` (`components/charts/tanstack/lazy.ts`), exactly like the fleet
+graph's dagre, so it lands in its own chunk and nobody opening `/logs` pays for it: the initial
+bundle moved 327.98 kB to 328.95 kB gzipped, a ~1 kB cost for the async wrapper.
+
+Two more things the port surfaced. The Vue adapter is **SVG only** — the canvas surface has React
+and Octane entry points, not a Vue one — which is acceptable at Photon's 48-bucket default
+(`crates/photon-api/src/histogram.rs`) and is a second reason the uPlot explorers stay put. And the
+engine's default colours are `currentColor`, so `chartTheme.ts` resolves `tokens.css` into concrete
+`hsl()` values and hands them over explicitly, mirroring what `useChartTheme.js` already does for
+uPlot.
+
+`ServiceVolumeChart` (uPlot) and `ApdexBandChart` (TanStack) sit on the same page over the same
+buckets on purpose: the two engines can be compared on something real. **A full migration is a
+separate decision, and the numbers above are the evidence it should be taken on.**
+
+**Deploy markers** are one helper (`lib/services/deployMarkers.ts`) feeding four chart kinds, so a
+release line looks and reads the same on a bar chart and on the latency lines beside it. Charts take
+them as `[{ xMs, label, color }]` — wall-clock moments, not points on a series — and `BaseChart`
+draws each as a dashed vertical with the version as its label. The helper caps at the **12 newest**:
+a service that ships forty times in the window would otherwise turn the plot into a picket fence,
+hiding the very thing the markers exist to reveal, and when you are chasing a step in a chart the
+release you want is almost always a recent one.
+
+> Note the unit split this exposed: `charts/LineChart.vue` takes `points[].t` in **ms**, but
+> `metrics/MetricChart.vue` — shared with the metrics explorer, whose points are ns — divides by 1e6
+> on the way in. Both service views were handing it ms, so their error and latency charts plotted at
+> epoch 1970 and drew an empty window. Fixed at the call sites (`b.ts * MS_TO_NS`) rather than by
+> changing `MetricChart`'s contract, which the metrics explorer depends on.
+
 ## Component groups (`src/components/`)
 
 - **`charts/`** — the shared uPlot layer: `BaseChart`/`LineChart`/`BarChart`, `MiniAreaChart` (a
@@ -169,7 +301,8 @@ Central) is in [`../CONTEXT.md`](../CONTEXT.md). What matters for the code:
   `ChartPanel`, `ChartTooltipCard`, plus pure option builders (`chartOptions.js`), the lifecycle
   composable (`useUplot.js`), and theme-aware colors (`useChartTheme.js`).
 - **`common/`** — app chrome & toolbar widgets: `AppShell`, `NavRail`, `ContextBar` (the single
-  consolidated header row, mounted once by `AppShell`: breadcrumb + tenant picker on the left, a
+  consolidated header row, mounted once by `AppShell`: breadcrumb + tenant picker + environment
+  picker on the left, a
   middle `search` slot, and the global time picker + `LiveControl` on the right — searchable views
   forward their `SearchBar` into that slot via `AppShell`'s `toolbar` slot; non-searchable views
   leave it empty and the breadcrumb labels the page), `PhotonMark`, `SearchBar` (query-language
@@ -259,15 +392,21 @@ cross-cutting. Imports use the extensionless alias form `@/lib/<folder>/<name>`.
 - *Transport:* `api.ts` (Ky + mock fallback), `mock.ts` (in-browser mock corpus), `liveStream.ts`
   (`EventSource` wrapper for live-tail SSE).
 - *App-wide reactive state & navigation:* `auth.ts`, `context.ts` (app-wide time range + federation
-  tenant — the same module-singleton pattern as `auth.ts`/`theme.ts`; sole owner of the
-  `range`/`from`/`to`/`tenant` URL keys; `tenantQueryTerm()` is what the logs/traces/metrics
-  composables append to `q`, picked via the ContextBar dropdown or a Home tenant card),
+  tenant (Site) + deployment environment — the same module-singleton pattern as
+  `auth.ts`/`theme.ts`; sole owner of the `range`/`from`/`to`/`tenant`/`env` URL keys.
+  `tenantQueryTerm()` / `envQueryTerm()` are the two grammar terms the dimensions contribute;
+  `contextQueryTerm()` joins them into the ONE value every composable puts in its cache key, and
+  `withContext(q)` is what appends them to the `q`/`filter` string sent to the backend — every
+  query composable in `lib/*Queries.ts` routes through it, so a page cannot silently ignore a
+  picked Site or environment. Tenant is picked via the ContextBar dropdown or a Home tenant card;
+  environment via the ContextBar dropdown fed by `lib/core/environments.ts`'s `useEnvironments()`,
+  a `deployment.environment` facet — see "The environment dimension" below),
   `useUrlState.ts` (per-view `svc`/`sev`/`q`; merge-preserves
   every other key, including the context ones — plus `useUrlParam(key, ref)`, its one-key counterpart
   for views owning a single param, e.g. `/home`'s `?world=`), `historyUrl.ts` (`replaceSearch()` — the **only**
   sanctioned way to rewrite the query string without navigating; preserves vue-router's entry state
   and keeps its `current` in step, see [conventions](conventions.md)), `useCorrelate.ts` (`correlate()` builds a same-app
-  link that always carries the current time+tenant; `relatedFor()` is the per-entity-kind
+  link that always carries the current time+tenant+env; `relatedFor()` is the per-entity-kind
   related-destination graph behind `RelatedMenu`; **every destination must send a key its target
   view actually reads** — `q` for logs/traces/metrics/uptime, `app` for `/rum` — a param nothing
   consumes silently lands the pivot unfiltered), `useBackTo.ts` (`backTo(router, listPath)` —
@@ -292,7 +431,28 @@ follow the same contract) plus its signal-specific helpers:
   with `localStorage` backing), `quickStarts.ts` (curated + type-relative quick-start definitions),
   `metricViz.ts` (viz registry, stat summary, bucket building, viz URL codec).
 - **`rum/`** — `rumQueries.ts`, `rumSummary.ts` (fleet executive-summary derivation).
-- **`services/`** — `servicesQueries.ts`, `serviceHealth.ts`, `serviceColor.ts` (stable hash → palette).
+- **`services/`** — `servicesQueries.ts`, `servicesOverview.ts`, `serviceColor.ts` (stable hash →
+  palette), and
+  `serviceHealth.ts` — **the app's single Attention Level model** (pure, table-tested): the
+  `AttentionLevel` type + `LEVEL_RANK` + `STATUS_META` + `INCIDENT_LEVEL`, and `serviceLevel(row,
+  { prev, siteStale, incidents })`, which judges one RED row in this order — a stale Site is
+  Unknown whatever the numbers say, traffic in `prev` and none now is Down (Silence), nothing at
+  either end is Unknown, a firing incident may only *raise* the level, and otherwise error rate or
+  Apdex (whichever is worse) picks the band off the exported `ERROR_*`/`APDEX_*` thresholds.
+  `/home`'s `attention.ts` imports it rather than re-deriving a second opinion.
+  `servicesOverview.ts` is the `/services` index's data layer: `useServicesOverview` (one request,
+  `GET /api/services/overview`) plus the pure **fleet merge**. Rows arrive one per
+  `(service, Site, environment)` because that is what the backend can honestly produce; `mergeFleet`
+  folds them into one row per `(service, environment)` carrying **Spread** — how many Sites this
+  service is unhealthy in, out of how many are actually *reporting*. A stale Site is excluded from
+  Spread's denominator and from every numeric total, because "unhealthy in 1 of 3" is a lie when one
+  of the three has not been heard from, and averaging a blind Site's zeros in halves the fleet's real
+  traffic. p50/p90/p99 are the **worst** across Sites, never the mean (a mean of two p99s is not a
+  percentile of anything), and Apdex is recomputed from the bands rather than averaged.
+  `siteStats()` derives the Site band from those same merged rows, so the band and the table under it
+  cannot disagree inside one response — the backend sends only the registry facts (liveness, mode, UI
+  url) that no row could carry. `useIncidentsByService()` attributes triggered incidents through
+  `attention.ts`'s `resolveIncident`, not a second copy of the rules.
 - **`uptime/`** — `uptimeQueries.ts`.
 - **`data/`** — `dataQueries.ts`.
 - **`infra/`** — `infraQueries.ts` (`useInfraHosts`/`useInfraHost`/`useInfraHostSeries`, plus
@@ -301,8 +461,9 @@ follow the same contract) plus its signal-specific helpers:
 - **`tenants/`** (federation central only) — `tenantsQueries.ts` (`useTenants`/`useTenantsSummary` +
   mutations for create/update/rotate/delete, all with mutation side-effects: invalidate + toast).
 - **`home/`** (the Attention Board, cross-signal) — `attention.ts` (the pure, table-tested domain
-  model: Attention Level, Subject builders per kind, Silence, incident resolution, roll-up and
-  ordering), `watchRange.ts` (the bounded lookback `/home` judges over — its own module singleton,
+  model: Subject builders per kind, Silence for hosts/RUM apps, incident resolution, roll-up and
+  ordering; the Attention Level axis itself is imported from `services/serviceHealth.ts` and
+  re-exported here, `LEVEL_META` being `STATUS_META` under the board's name), `watchRange.ts` (the bounded lookback `/home` judges over — its own module singleton,
   sole owner of the `watch` URL key, NOT the global Window), `useAttentionBoard.ts` (the fan-out that
   wires every signal's existing composable into Subjects + the vital-signs strip).
 

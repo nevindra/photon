@@ -165,7 +165,7 @@ $(DEV_CONFIG):
 		'days = 7' \
 		'' \
 		'[schema]' \
-		'promoted_attributes = ["service.name", "host.name"]' \
+		'promoted_attributes = ["service.name", "host.name", "deployment.environment"]' \
 		'' \
 		'[wal]' \
 		'segment_max_bytes = 134217728' \

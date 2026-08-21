@@ -7,6 +7,12 @@
 //! the pre-sized Arrow builder with no intermediate `Vec<SpanRecord>` and no per-span
 //! `BTreeMap` — the same win the logs guard locks for `otlp_logs_into_builder`. Own separate
 //! test binary (its own `#[global_allocator]`) so its counters never mix with the logs guard's.
+//!
+//! The fixture's spans are healthy (`status = OK`, no events) on purpose, which is also what pins
+//! the cost of Backend Issue fingerprinting: `trace_mapping::error_attributes` returns before it
+//! allocates anything unless the span already looks like an error, so this baseline is the same
+//! number it was before that shipped. Errored spans do pay three `String`s each — that is the
+//! feature's price, and it scales with errors, not with traffic.
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{any_value::Value, AnyValue, KeyValue};

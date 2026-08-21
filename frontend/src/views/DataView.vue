@@ -1,19 +1,21 @@
 <script setup>
-// The `/data` page: a single-header-row shell (AppShell → the global ContextBar) hosting four
+// The `/data` page: a single-header-row shell (AppShell → the global ContextBar) hosting five
 // URL-synced tabs — Overview (usage/footprint charts + tiles), Storage (per-signal cards + durable
-// strip), Retention (the retention form), and Delete (per-signal purge actions). The active tab
+// strip), Services (per-service footprint attribution), Retention (the retention form), and Delete
+// (per-signal purge actions). The active tab
 // lives in the `?tab=` query param so tabs are deep-linkable and survive a refresh. The tab switch
 // folds into the ContextBar's search region as a query-driven sub-nav (NavTabItem is a RouterLink),
 // so there's no second header bar; the four bodies render conditionally by the active tab. Each body is its own component and owns its data
 // composables, mirroring the settings dialog this page retired.
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
-import { Activity, HardDrive, Timer, Trash2 } from 'lucide-vue-next'
+import { Activity, HardDrive, Layers, Timer, Trash2 } from 'lucide-vue-next'
 import AppShell from '@/components/common/AppShell.vue'
 import { NavTabs, NavTabItem } from '@/components/ui/nav-tabs'
 import { api } from '@/lib/core/api'
 import DataOverview from '@/components/data/DataOverview.vue'
 import DataStorage from '@/components/data/DataStorage.vue'
+import DataServices from '@/components/data/DataServices.vue'
 import DataRetention from '@/components/data/DataRetention.vue'
 import DataDelete from '@/components/data/DataDelete.vue'
 
@@ -21,7 +23,7 @@ const route = useRoute()
 
 // Read-only now: navigation is via the NavTabItem RouterLinks (each writes `?tab=`), so the getter
 // just resolves the active tab from the URL and falls back to Overview for a missing/unknown value.
-const TABS = ['overview', 'storage', 'retention', 'delete']
+const TABS = ['overview', 'storage', 'services', 'retention', 'delete']
 const tab = computed(() => (TABS.includes(route.query.tab) ? route.query.tab : 'overview'))
 </script>
 
@@ -47,6 +49,13 @@ const tab = computed(() => (TABS.includes(route.query.tab) ? route.query.tab : '
           <HardDrive /> Storage
         </NavTabItem>
         <NavTabItem
+          :to="{ query: { ...route.query, tab: 'services' } }"
+          :active="tab === 'services'"
+          data-testid="data-tab-services"
+        >
+          <Layers /> Services
+        </NavTabItem>
+        <NavTabItem
           :to="{ query: { ...route.query, tab: 'retention' } }"
           :active="tab === 'retention'"
           data-testid="data-tab-retention"
@@ -66,6 +75,7 @@ const tab = computed(() => (TABS.includes(route.query.tab) ? route.query.tab : '
     <section class="flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pt-5 pb-6">
       <DataOverview v-if="tab === 'overview'" />
       <DataStorage v-else-if="tab === 'storage'" />
+      <DataServices v-else-if="tab === 'services'" />
       <DataRetention v-else-if="tab === 'retention'" />
       <DataDelete v-else-if="tab === 'delete'" />
     </section>

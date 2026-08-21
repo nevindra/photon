@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default)]
     pub alerts: AlertsConfig,
     #[serde(default)]
+    pub rollup: RollupConfig,
+    #[serde(default)]
     pub federation: Option<FederationConfig>,
 }
 
@@ -257,6 +259,72 @@ impl Default for AlertsConfig {
     }
 }
 
+/// `[rollup]` — optional, always on. The background pass that publishes `photon.service.*`
+/// metrics from spans (`docs/adr/0002-red-rollups-are-published-as-metrics.md`), so the Backend
+/// pages can read a wide window without re-scanning raw spans.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollupConfig {
+    /// How often a pass runs. Clamped to a 15s floor: a pass costs three DataFusion aggregates
+    /// over the lag window, and running them faster than that buys nothing a 60s bucket can show.
+    #[serde(default = "RollupConfig::default_interval_secs")]
+    pub interval_secs: u64,
+    /// How much recent time each pass recomputes and re-emits before considering it settled.
+    /// Spans arriving later than this never reach the rollup — the rollup's one documented
+    /// inaccuracy (see `docs/subsystems/rollup.md`).
+    #[serde(default = "RollupConfig::default_lag_secs")]
+    pub lag_secs: u64,
+    /// Operation-level series kept per `(service, environment)`; the rest fold into `__other__`.
+    /// `0` disables the operation level and keeps only per-service series.
+    #[serde(default = "RollupConfig::default_top_operations")]
+    pub top_operations: usize,
+    /// Set false to stop publishing entirely. The Backend read paths then always read raw spans,
+    /// which is correct but slower over wide windows.
+    #[serde(default = "RollupConfig::default_enabled")]
+    pub enabled: bool,
+}
+impl RollupConfig {
+    /// One pass per bucket. Anything faster re-derives the same numbers.
+    pub const MIN_INTERVAL_SECS: u64 = 15;
+    /// The rollup's bucket width, in seconds. NOT configurable: it is baked into every emitted
+    /// timestamp, and two nodes disagreeing about it would make a federated series unreadable.
+    pub const BUCKET_SECS: u64 = 60;
+
+    fn default_interval_secs() -> u64 {
+        60
+    }
+    fn default_lag_secs() -> u64 {
+        600
+    }
+    fn default_top_operations() -> usize {
+        50
+    }
+    fn default_enabled() -> bool {
+        true
+    }
+
+    /// `interval_secs`, floored at [`Self::MIN_INTERVAL_SECS`].
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.interval_secs.max(Self::MIN_INTERVAL_SECS))
+    }
+
+    /// `lag_secs`, floored at one whole bucket — a lag shorter than a bucket would leave the
+    /// newest bucket permanently unwritten.
+    pub fn lag_secs(&self) -> u64 {
+        self.lag_secs.max(Self::BUCKET_SECS)
+    }
+}
+impl Default for RollupConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: Self::default_interval_secs(),
+            lag_secs: Self::default_lag_secs(),
+            top_operations: Self::default_top_operations(),
+            enabled: Self::default_enabled(),
+        }
+    }
+}
+
 /// `[federation]` — optional. Absent by default; presence turns this node into a tenant that
 /// pushes to a central Photon (`summary` mode: synthetic health metrics; `full`: best-effort
 /// OTLP tee) over the given `endpoint`/`token`.
@@ -275,6 +343,16 @@ pub struct FederationConfig {
     pub interval_secs: u64,
     #[serde(default = "FederationConfig::default_queue_batches")]
     pub queue_batches: usize,
+    /// Ship this Site's `photon.service.*` / `photon.operation.*` rollup to central.
+    ///
+    /// On by default, and it applies in BOTH modes. A `summary`-mode Site otherwise tells central
+    /// almost nothing about its services, which would make the cross-Site Services index work only
+    /// for Sites that can afford `full` mode. And `full` mode does not cover it either: the tee
+    /// mirrors accepted OTLP batches, but the rollup writes straight to the local metrics WAL and
+    /// never passes through OTLP ingest — so without this flag its points reach central in neither
+    /// mode. Central stamps `tenant` on arrival exactly as it does for every other metric.
+    #[serde(default = "FederationConfig::default_push_service_rollup")]
+    pub push_service_rollup: bool,
 }
 
 impl FederationConfig {
@@ -283,6 +361,9 @@ impl FederationConfig {
     }
     fn default_queue_batches() -> usize {
         1024
+    }
+    fn default_push_service_rollup() -> bool {
+        true
     }
 }
 
@@ -390,6 +471,18 @@ impl Config {
             self.apm.default_apdex_threshold_ms =
                 parse_var("PHOTON_APM_DEFAULT_APDEX_THRESHOLD_MS", &v)?;
         }
+        if let Some(v) = get("PHOTON_ROLLUP_ENABLED") {
+            self.rollup.enabled = parse_var("PHOTON_ROLLUP_ENABLED", &v)?;
+        }
+        if let Some(v) = get("PHOTON_ROLLUP_INTERVAL_SECS") {
+            self.rollup.interval_secs = parse_var("PHOTON_ROLLUP_INTERVAL_SECS", &v)?;
+        }
+        if let Some(v) = get("PHOTON_ROLLUP_LAG_SECS") {
+            self.rollup.lag_secs = parse_var("PHOTON_ROLLUP_LAG_SECS", &v)?;
+        }
+        if let Some(v) = get("PHOTON_ROLLUP_TOP_OPERATIONS") {
+            self.rollup.top_operations = parse_var("PHOTON_ROLLUP_TOP_OPERATIONS", &v)?;
+        }
         // Durable tier: presence of the endpoint is the toggle. bucket/region are then
         // required (env, or inherited from a base file's [storage.durable]); keys optional.
         if let Some(endpoint) = get("PHOTON_DURABLE_ENDPOINT").filter(|e| !e.trim().is_empty()) {
@@ -477,6 +570,12 @@ impl Config {
                 ),
                 None => existing.and_then(|f| f.signals.clone()),
             };
+            let push_service_rollup = match get("PHOTON_FEDERATION_PUSH_SERVICE_ROLLUP") {
+                Some(v) => parse_var("PHOTON_FEDERATION_PUSH_SERVICE_ROLLUP", &v)?,
+                None => existing
+                    .map(|f| f.push_service_rollup)
+                    .unwrap_or_else(FederationConfig::default_push_service_rollup),
+            };
             self.federation = Some(FederationConfig {
                 endpoint,
                 token,
@@ -484,6 +583,7 @@ impl Config {
                 signals,
                 interval_secs,
                 queue_batches,
+                push_service_rollup,
             });
         }
 

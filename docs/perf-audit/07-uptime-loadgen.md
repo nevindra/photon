@@ -3,7 +3,7 @@
 
 Read-only audit. No source was modified. All findings cite `file:line`; MEASURED facts and
 HYPOTHESES are tagged, and anything requiring a microbench is tagged `NEEDS-BENCH`. Severity is
-calibrated against the vertical's own declared scale — `docs/superpowers/specs/2026-07-04-uptime-monitoring-design.md:31`
+calibrated against the vertical's own declared scale — the uptime design target (`docs/subsystems/uptime.md`)
 says "100 monitors @ 30s ≈ 288k [heartbeats/day]" — which at the default 30-day retention
 (`crates/photon-core/src/config.rs:100-102`) implies a **steady-state `heartbeats` table around
 8.6M rows**. That number is load-bearing for several findings below.

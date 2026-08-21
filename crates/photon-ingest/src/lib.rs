@@ -1,8 +1,7 @@
 //! photon-ingest: OTLP logs receivers (gRPC + HTTP), token auth, OTLP -> LogRecord mapping,
 //! WAL append.
 //!
-//! Implemented per the `photon-ingest` section of
-//! `docs/superpowers/plans/2026-07-01-photon-interface-contracts.md`.
+//! Its place in the crate graph is described in `docs/architecture.md`.
 //!
 //! [`otlp_logs_to_records`] is the pure, unit-tested core: it flattens an OTLP
 //! `ExportLogsServiceRequest` into Photon [`LogRecord`](photon_core::record::LogRecord)s.
@@ -11,6 +10,8 @@
 //! shared bearer token, map the request, build a `RecordBatch`, and append it to the WAL.
 
 mod auth;
+/// Deploy detection at ingest — the `DeploymentWatcher` seam `photon-server` implements.
+pub mod deployments;
 mod grpc;
 mod grpc_metrics;
 mod grpc_trace;
@@ -188,6 +189,9 @@ pub struct IngestServer<W: Wal + Send + Sync + 'static> {
     /// bounded tee for best-effort forwarding to central. `None` = no mirroring. The tee runs
     /// on tenant installs and the token map runs on central; both fields coexist harmlessly.
     pub federation_tee: Option<FederationTee>,
+    /// Deploy detection over the trace receivers. `None` = off, and the resource walk never
+    /// runs. Set by `photon-server` to the SQLite-backed deployments store.
+    pub deployments: Option<Arc<dyn deployments::DeploymentWatcher>>,
 }
 
 impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
@@ -217,6 +221,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             counters,
             tenant_tokens: TenantTokenMap::default(),
             federation_tee: None,
+            deployments: None,
         }
     }
 
@@ -257,6 +262,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             counters: self.counters.clone(),
             tenant_tokens: self.tenant_tokens.clone(),
             federation_tee: self.federation_tee.clone(),
+            deployments: self.deployments.clone(),
         };
         let grpc_metrics_service = GrpcMetricsService {
             wal: self.metrics_wal.clone(),
@@ -306,6 +312,7 @@ impl<W: Wal + Send + Sync + 'static> IngestServer<W> {
             counters: self.counters.clone(),
             tenant_tokens: self.tenant_tokens.clone(),
             federation_tee: self.federation_tee.clone(),
+            deployments: self.deployments.clone(),
         });
         let metrics_state = Arc::new(MetricsHttpState {
             wal: self.metrics_wal.clone(),
@@ -540,6 +547,7 @@ mod gzip_interop_tests {
                 counters: counters.clone(),
                 tenant_tokens: TenantTokenMap::default(),
                 federation_tee: None,
+                deployments: None,
             }),
             Arc::new(MetricsHttpState {
                 wal: wal.clone(),

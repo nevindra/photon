@@ -9,6 +9,28 @@ A distributed-trace explorer + single-trace waterfall, with log↔trace↔span c
 ## Backend
 
 - **Ingest:** `otlp_traces_to_spans` (`photon-ingest`) maps OTLP → `Span` records → `spans_wal`.
+- **Error fingerprinting at ingest** (`photon_core::span_error`): a span that looks like an error
+  (`status_code == 2`, or an event named `exception`) gains three attributes — `error.type`,
+  `error.message`, `error.fingerprint`. That fingerprint is what makes a **Backend Issue**; it is
+  `rum::fingerprint` verbatim (type + digit-masked message + top stack frame), because a Frontend
+  Issue and a Backend Issue are the same idea about two different runtimes. Three properties are
+  load-bearing:
+  - **A healthy span gets no attributes at all**, not an empty fingerprint — an empty fingerprint
+    would collect every healthy span in the fleet into one enormous phantom Issue. It is also the
+    cost control: `error_attributes` returns before allocating anything, so the alloc guard's
+    baseline (32.2 allocs/span) is unchanged and the price scales with errors, not traffic.
+  - **Only the first exception event and only its top frame.** A retry loop records one event per
+    attempt and they are the same error; one bug reached by two call paths shares a top frame and
+    differs further down, so hashing the whole trace would split it into as many Issues as there are
+    ways to reach it.
+  - **The fingerprint carries no service.** Issue identity is `(service, fingerprint)` at query time
+    (see [`../../CONTEXT.md`](../../CONTEXT.md)), so the same exception in two services is still two
+    Issues — but the shared hash is what lets a reader see one bug across three services rather than
+    three unrelated bugs.
+
+  Spans ingested before this shipped carry no fingerprint and never will: no backfill, no query-time
+  fallback. One honest gap in the history beats two grouping rules for one concept, and the UI states
+  the cut-over rather than hiding it.
 - **Schema** (`photon-core/src/span_schema.rs`): 15 fixed columns. Sorted `(service.name, start_time)`.
 - **Compaction:** `SpanCompactor` → zstd Parquet under `data-spans/` + a spans skip index that blooms
   over `name` tokens **and whole `trace_id` values** (so a lookup by trace ID prunes hard). Free-text

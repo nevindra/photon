@@ -21,12 +21,12 @@ import {
   type RumErrorFacetsResult,
   type RumErrorDetailResult,
 } from '@/lib/core/api'
-import { tenant, tenantQueryTerm } from '@/lib/core/context'
+import { tenant, contextQueryTerm, withContext } from '@/lib/core/context'
 import { toast } from '@/components/ui/toast'
 
-// Appends the active tenant's grammar term to a q, mirroring servicesQueries — central's /rum
-// becomes a read-only lens over the mirrored tenant data when the tenant context is active.
-const withTenant = (q = ''): string => [q, tenantQueryTerm()].filter(Boolean).join(' ')
+// `withContext` appends the global context fragment (Site + Environment) to a q, mirroring
+// servicesQueries — central's /rum becomes a read-only lens over the mirrored tenant data when
+// the tenant context is active.
 
 export const rumVitalsKey = (
   app: MaybeRefOrGetter<string>,
@@ -134,9 +134,9 @@ function fanOut<T>(
   return useQueries({
     queries: computed(() =>
       (toValue(apps) ?? []).map((app: string) => ({
-        queryKey: ['rum', keyKind, app, String(toValue(startNs)), String(toValue(endNs)), tenantQueryTerm()],
+        queryKey: ['rum', keyKind, app, String(toValue(startNs)), String(toValue(endNs)), contextQueryTerm()],
         queryFn: ({ signal }: { signal: AbortSignal }): Promise<T> =>
-          fetchFn(app, toValue(startNs), toValue(endNs), { signal }, withTenant()),
+          fetchFn(app, toValue(startNs), toValue(endNs), { signal }, withContext()),
         placeholderData: keepPreviousData,
         refetchInterval,
       })),
@@ -174,9 +174,9 @@ export function useRumVitals(
   endNs: MaybeRefOrGetter<string>,
 ) {
   return useQuery({
-    queryKey: computed(() => [...rumVitalsKey(app, startNs, endNs), tenantQueryTerm()]),
+    queryKey: computed(() => [...rumVitalsKey(app, startNs, endNs), contextQueryTerm()]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<RumVitalsResult> =>
-      api.rumVitals(toValue(app), toValue(startNs), toValue(endNs), { signal }, withTenant()),
+      api.rumVitals(toValue(app), toValue(startNs), toValue(endNs), { signal }, withContext()),
     enabled: computed(() => !!toValue(app)),
     placeholderData: keepPreviousData,
     refetchInterval: 15_000,
@@ -197,10 +197,10 @@ export function useRumBreakdown(
       toValue(dimension),
       String(toValue(startNs)),
       String(toValue(endNs)),
-      tenantQueryTerm(),
+      contextQueryTerm(),
     ]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<RumBreakdownResult> =>
-      api.rumBreakdown(toValue(app), toValue(dimension), toValue(startNs), toValue(endNs), { signal }, withTenant()),
+      api.rumBreakdown(toValue(app), toValue(dimension), toValue(startNs), toValue(endNs), { signal }, withContext()),
     enabled: computed(() => !!toValue(app)),
   })
 }
@@ -211,9 +211,9 @@ export function useRumPages(
   endNs: MaybeRefOrGetter<string>,
 ) {
   return useQuery({
-    queryKey: computed(() => ['rum', 'pages', toValue(app), String(toValue(startNs)), String(toValue(endNs)), tenantQueryTerm()]),
+    queryKey: computed(() => ['rum', 'pages', toValue(app), String(toValue(startNs)), String(toValue(endNs)), contextQueryTerm()]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<RumPagesResult> =>
-      api.rumPages(toValue(app), toValue(startNs), toValue(endNs), { signal }, withTenant()),
+      api.rumPages(toValue(app), toValue(startNs), toValue(endNs), { signal }, withContext()),
     enabled: computed(() => !!toValue(app)),
   })
 }
@@ -232,10 +232,10 @@ export function useRumPageDetail(
       toValue(route),
       String(toValue(startNs)),
       String(toValue(endNs)),
-      tenantQueryTerm(),
+      contextQueryTerm(),
     ]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<RumPageDetailResult> =>
-      api.rumPageDetail(toValue(app), toValue(route), toValue(startNs), toValue(endNs), { signal }, withTenant()),
+      api.rumPageDetail(toValue(app), toValue(route), toValue(startNs), toValue(endNs), { signal }, withContext()),
     enabled: computed(() => !!toValue(app) && !!toValue(route)),
   })
 }
@@ -247,9 +247,9 @@ export function useRumErrors(
   q: MaybeRefOrGetter<string> = () => '',
 ) {
   return useQuery({
-    queryKey: computed(() => ['rum', 'errors', toValue(app), String(toValue(startNs)), String(toValue(endNs)), withTenant(toValue(q))]),
+    queryKey: computed(() => ['rum', 'errors', toValue(app), String(toValue(startNs)), String(toValue(endNs)), withContext(toValue(q))]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<RumErrorsResult> =>
-      api.rumErrors(toValue(app), toValue(startNs), toValue(endNs), { signal }, withTenant(toValue(q))),
+      api.rumErrors(toValue(app), toValue(startNs), toValue(endNs), { signal }, withContext(toValue(q))),
     enabled: computed(() => !!toValue(app)),
   })
 }
@@ -261,9 +261,9 @@ export function useRumErrorFacets(
   endNs: MaybeRefOrGetter<string>,
 ) {
   return useQuery({
-    queryKey: computed(() => ['rum', 'error-facets', toValue(app), withTenant(toValue(q)), String(toValue(startNs)), String(toValue(endNs))]),
+    queryKey: computed(() => ['rum', 'error-facets', toValue(app), withContext(toValue(q)), String(toValue(startNs)), String(toValue(endNs))]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<RumErrorFacetsResult> =>
-      api.rumErrorFacets(toValue(app), withTenant(toValue(q)), toValue(startNs), toValue(endNs), { signal }),
+      api.rumErrorFacets(toValue(app), withContext(toValue(q)), toValue(startNs), toValue(endNs), { signal }),
     enabled: computed(() => !!toValue(app)),
   })
 }
@@ -282,10 +282,10 @@ export function useRumErrorDetail(
       toValue(fingerprint),
       String(toValue(startNs)),
       String(toValue(endNs)),
-      tenantQueryTerm(),
+      contextQueryTerm(),
     ]),
     queryFn: ({ signal }: { signal: AbortSignal }): Promise<RumErrorDetailResult> =>
-      api.rumErrorDetail(toValue(app), toValue(fingerprint), toValue(startNs), toValue(endNs), { signal }, withTenant()),
+      api.rumErrorDetail(toValue(app), toValue(fingerprint), toValue(startNs), toValue(endNs), { signal }, withContext()),
     enabled: computed(() => !!toValue(app) && !!toValue(fingerprint)),
   })
 }

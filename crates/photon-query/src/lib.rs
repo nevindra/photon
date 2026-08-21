@@ -1,9 +1,8 @@
 //! photon-query: prune (manifest + per-file skip index) then read the surviving Parquet
 //! files with DataFusion.
 //!
-//! Implemented per the `photon-query` section of
-//! `docs/superpowers/plans/2026-07-01-photon-interface-contracts.md`, as refined by the
-//! Wave-2 dispatch instructions.
+//! Its place in the crate graph and its prune-then-read contract are described in
+//! `docs/architecture.md`.
 //!
 //! ## Milestone simplification — local filesystem only
 //!
@@ -65,6 +64,7 @@ mod metric_query;
 pub use metric_query::{MetricSeriesRequest, QuerySeriesResult, SeriesPoint, SeriesResult};
 
 mod metric_dist;
+pub use metric_dist::{LatencySli, LatencySliResult};
 
 mod metric_classic_hist;
 
@@ -78,6 +78,9 @@ pub use span_histogram::SpanHistogramBucket;
 mod span_latency;
 pub use span_latency::{LatencyBucket, LatencyHistogram};
 
+mod span_heatmap;
+pub use span_heatmap::{HeatCell, LatencyHeatmap};
+
 mod span_predicate;
 pub use span_predicate::span_resolved_query_to_expr;
 
@@ -85,7 +88,7 @@ mod metric_predicate;
 pub use metric_predicate::metric_resolved_query_to_expr;
 
 mod red;
-pub use red::{RedGroup, RedRow};
+pub use red::{RedBasis, RedGroup, RedRow};
 
 mod rum_vitals;
 pub use rum_vitals::{BreakdownRow, LcpAttribution, VitalSummary};
@@ -97,11 +100,23 @@ mod rum_errors;
 pub use rum_errors::ErrorIssue;
 pub use rum_errors::{CountBucket, ErrorDetail, ErrorEvent, TagBreakdown};
 
+mod span_issues;
+pub use span_issues::{
+    IssueBucket, IssueEvent, IssueTag, SpanIssue, SpanIssueDetail, ISSUE_FACET_FIELDS,
+    ISSUE_TAG_FIELDS,
+};
+
 mod service_dependencies;
 pub use service_dependencies::{DepRow, Dependencies};
 
+mod service_map;
+pub use service_map::{MapEdge, MapNode, ServiceMap};
+
 mod red_timeseries;
 pub use red_timeseries::RedBucket;
+
+mod red_rollup;
+pub use red_rollup::{RollupPass, RollupRow, LATENCY_BOUNDS_NS, OTHER_OPERATION};
 
 mod span_search;
 
