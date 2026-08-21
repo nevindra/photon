@@ -1,0 +1,60 @@
+# Local replica of the 192.168.100.187 production instance.
+#
+# The data under `.photon-prod/hot` is a copy of that box's hot tier (~5.9 GB, ~8 days of
+# logs/spans/metrics). It exists so the Backend revamp can be worked on against real telemetry
+# instead of loadgen output.
+#
+#   cargo run -p photon-server -- photon.prod-replica.toml
+#
+# Two things to know before you run it:
+#
+#   1. **The server MUTATES this directory.** `merge_once` consolidates small Parquet files and
+#      unlinks the originals, the rollup writes new `photon.service.*` points into the metrics
+#      WAL, and retention purges anything older than `[retention].days`. There is no pristine
+#      copy kept locally — 5.9 GB is not worth storing twice — so resetting means pulling the hot
+#      tier down again.
+#   2. **Ingest is bound to loopback and the token is a throwaway.** This replica is not meant to
+#      receive real traffic; nothing here should ever be pointed at production producers.
+#
+# The control-plane database is deliberately a FRESH one, not the production copy. Production's
+# `photon.db` did come down with the data (it sits beside this one, unused), but the alert engine
+# and the uptime prober are always on and read their work straight out of that database: pointing
+# the replica at it would evaluate production's alert rules against replica data and deliver to
+# production's real Discord/Telegram channels, and start probing production endpoints from a
+# laptop. So the replica starts empty and asks for onboarding on first open. That costs one
+# "create your account" screen and removes any way for local work to page a human.
+
+[ingest]
+token = "local-replica-token-not-a-secret"
+http_addr = "127.0.0.1:4318"
+grpc_addr = "127.0.0.1:4317"
+
+[storage]
+hot_dir = ".photon-prod/hot"
+# Fresh, NOT `.photon-prod/photon.db` (the production copy) — see the note above.
+db_path = ".photon-prod/replica.db"
+
+# No [storage.durable] — hot-tier only. The production box replicates to Garage; a local replica
+# must not, or it would write into that bucket.
+
+[retention]
+# Production keeps 30 days and the copy is ~8 days old, so nothing is purged on first run. Raise
+# this if you want the replica to stop ageing data out from under you.
+days = 30
+
+[schema]
+# Must match production exactly. A different promoted set makes the same Parquet read differently:
+# a key promoted here but not there reads NULL (it lives in the file's attributes map), and vice
+# versa. This is the same mismatch that makes `deployment.environment` empty for pre-upgrade data.
+promoted_attributes = ["service.name", "host.name", "deployment.environment"]
+
+[wal]
+segment_max_bytes = 33554432
+segment_max_age_secs = 60
+group_commit_max_delay_ms = 5
+
+[auth]
+session_secret = "local-replica-session-secret-not-a-secret-32b+"
+
+[apm]
+default_apdex_threshold_ms = 500

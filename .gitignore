@@ -19,6 +19,7 @@ Cargo.lock.orig
 .env.*
 !.env.example
 # config env-only smoke-test scratch dir (Config::load local run)
+/.photon-prod/
 /.photon-smoke/
 /photon.tenant.toml
 /.photon-tenant/

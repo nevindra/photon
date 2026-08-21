@@ -90,14 +90,28 @@ backend; Vue hot-reloads via Vite). `make help` lists all targets.
 To run just the frontend dev server manually: `cd frontend && bun run dev` (needs the backend running
 on `:8080` for `/api`).
 
+### Running against a copy of real data
+
+`make replica` serves `photon.prod-replica.toml` over a hot tier copied out of a real deployment
+into `.photon-prod/` (gitignored) — for working on the read path against real telemetry instead of
+loadgen output. Two things that copy needs, and the config file explains both: a hot tier copied out
+of a *running* Photon is not a clean snapshot (`merge_once` unlinks files mid-copy, so run
+`scripts/prune-replica-manifest.py .photon-prod/hot` to drop manifest entries whose Parquet did not
+survive), and the replica must use a **fresh** control-plane DB rather than the source's — the alert
+engine and the uptime prober are always on and read their work out of that database, so pointing a
+replica at a production copy would fire production's real notification channels and probe
+production's endpoints. `[schema].promoted_attributes` must also match the source exactly, or the
+same Parquet reads differently (a key promoted on one side but not the other reads NULL).
+
 The frontend (`frontend/`) is **Vue 3 + Vite + Tailwind** with **Reka UI** headless components (the
 shadcn-vue equivalent) and Lucide icons; package manager is **bun** (never npm — `bun.lock` is the
 lockfile). It is deliberately lean — **Vue Router for top-level routes, but no Pinia** (server state
 lives in **TanStack Query**, a request cache). Time range + federation tenant + **deployment
 environment** are **global**, module-singleton state in `lib/core/context.ts`: `withContext(q)` appends
 the tenant and environment terms to every logs/traces/metrics/RUM/services/infra composable's `q`, so a
-new dimension is wired in one place instead of per module (`tenantQueryTerm()` and the five per-module
-`withTenant` helpers are gone; there is no entity-scope dimension anymore — it was removed as
+new dimension is wired in one place instead of per module (the five per-module `withTenant` helpers
+are gone; `tenantQueryTerm()` survives only for `lib/core/environments.ts`, which needs the tenant
+term without the environment one; there is no entity-scope dimension anymore — it was removed as
 decorative-only). `deployment.environment` ships as a promoted column by default
 (`photon-core/src/default.toml`), and `lib/core/environments.ts` unions the logs and spans facets to
 fill the picker — applying the tenant term but deliberately **not** the environment term, since routing
