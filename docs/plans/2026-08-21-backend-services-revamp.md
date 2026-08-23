@@ -235,7 +235,7 @@ header already flags precomputed rollups as the known optimisation target.
 | `photon.service.spans` | Sum (delta) | `{spans}` | all kinds, for the honest second number |
 | `photon.service.errors` | Sum (delta) | `{errors}` | `status_code == 2` |
 | `photon.service.http_4xx` / `.http_5xx` | Sum (delta) | `{responses}` | from Task 2 |
-| `photon.service.duration` | Histogram | `ns` | explicit buckets; `metric_dist.rs` already does quantiles |
+| `photon.service.duration` | Histogram | `ns` | explicit buckets; `metric_dist.rs` already does quantiles. **Shipped as `photon.service.latency`** — the ladder was later extended past 10s, which requires a rename; see [`rollup.md`](../subsystems/rollup.md) |
 | `photon.service.apdex.satisfied` / `.tolerating` / `.frustrated` | Sum (delta) | `{requests}` | |
 | `photon.service.basis` | Gauge | `1` | `1` when `basis != Entry`, attribute `basis` — lets the UI badge a span-based service without a second query |
 
@@ -585,7 +585,7 @@ on the same axes so the heatmap and the Apdex score describe the same thing; a r
    matched set. Data-derived bins re-scale the y-axis when one outlier enters the window, so a cell
    would mean something different at 10:00 than at 10:05 — and the columns of a heatmap have to be
    comparable or the chart says nothing. It also means a wide-window heatmap can later be answered
-   from `photon.service.duration`.
+   from `photon.service.duration` (shipped as `photon.service.latency`).
 3. **Spans that never closed are reported apart from every band** (`open_spans`). "Under 1ms" and
    "never finished" are opposite facts; folding the second into the first makes a stalling operation
    look like it got faster.

@@ -68,6 +68,18 @@ public API, adding a dependency, or touching the query/chart data path.
 - **Prometheus classic-histogram families:** folded at query time (not ingest). `le` is always
   consumed by the aggregation and never a group-by dimension. Supported percentiles are p50/p90/p99
   (no p95).
+- **`promoted_attributes` is a read-path lever, not cosmetics.** A span Parquet's long-tail
+  `attributes` map is 63% of the file's bytes and **96% of its decoded bytes**, so referencing it at
+  all costs roughly the same however many keys are probed. Promotion is what gets a query off it;
+  `span_engine::attr_lookup` picks the cheapest correct form per key and drops the map column
+  entirely when the manifest proves no surviving file carries it. Changing the list only affects
+  segments written from then on — a query spanning the change reads both layouts correctly, and the
+  speed arrives once the older segments age out.
+- **Parquet filter pushdown stays OFF.** Photon reads with an explicit schema, and in DataFusion 43
+  pushdown over files whose schemas differ from it empties any `LIMIT` plan — silently. The failure
+  hides behind any sort or aggregate, so it shows up as "this metric does not exist" on exactly the
+  three call sites that filter straight into a limit. See
+  [`architecture.md`](architecture.md) and the regression test in `photon-query/src/lib.rs`.
 - **Two independent auth systems, never conflated:** OTLP **ingest** uses a shared service **bearer
   token** (`[ingest].token`); human **UI** users use **argon2 password + signed session cookie**.
   RUM's public beacon (`POST /api/rum`) uses a **third** model — per-app public key + Origin

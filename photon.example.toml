@@ -74,7 +74,23 @@ days = 30
 # them into one row hides real regressions. It is a global UI filter (the ContextBar's environment
 # picker), so it is read on every page and earns its own column. Removing it does not break
 # anything — the key still filters from the long-tail map, just without min/max pruning.
-promoted_attributes = ["service.name", "host.name", "deployment.environment"]
+#
+# `tenant` and `http.response.status_code` are here for cost, not identity. The Backend read paths
+# touch both on every request (`tenant` labels each row on a federation central; the HTTP status
+# decides `http_4xx`/`http_5xx` and, with the span status, what counts as an error), and probing
+# the long-tail map for even one key decodes the whole map — 63% of a span file's bytes and 96% of
+# its decoded bytes. Measured on 300M spans: `/api/red` over 7 days, 12.3 s touching the map
+# against 2.2 s without.
+#
+# Changing this list only affects segments written from now on. A query spanning the change reads
+# both layouts correctly, and the speed arrives once the older segments age out of retention.
+promoted_attributes = [
+    "service.name",
+    "host.name",
+    "deployment.environment",
+    "tenant",
+    "http.response.status_code",
+]
 
 # --- Write-ahead log ---------------------------------------------------------------------
 [wal]
@@ -120,7 +136,7 @@ default_apdex_threshold_ms = 500
 # A background pass turns spans into per-service and per-operation RED, published as ordinary
 # metrics, so the Backend pages can read a wide window without re-scanning raw spans. Always on;
 # every key below is optional. Env: PHOTON_ROLLUP_ENABLED / _INTERVAL_SECS / _LAG_SECS /
-# _TOP_OPERATIONS. See docs/subsystems/rollup.md.
+# _TOP_OPERATIONS / _BACKFILL_DAYS. See docs/subsystems/rollup.md.
 [rollup]
 # enabled        = true   # false = never publish; the Backend pages then always scan raw spans
 # interval_secs  = 60     # how often a pass runs (floored at 15)
@@ -128,6 +144,26 @@ default_apdex_threshold_ms = 500
 #                         # ONCE and never revisited. Spans later than this never reach the rollup.
 # top_operations = 50     # operation series kept per (service, environment); the tail is summed
 #                         # into a single `__other__` series. 0 = service level only.
+# backfill_days  = 30     # how far a FIRST run reaches back to cover spans already on disk.
+#                         # Matches the default [retention].days so the rollup can answer every
+#                         # window whose data this node still holds. Without it the rollup could
+#                         # only describe the future, and every Backend page over a wider window
+#                         # would fall back to scanning raw spans — measured on 300M spans,
+#                         # /api/services/overview took 23.1 s over 7 days that way against 63 ms
+#                         # off the rollup. Deliberately larger than the widest window the UI
+#                         # offers: coverage starts at now-backfill_days and a 7-day window ENDS
+#                         # at now, so sizing them the same puts every 7-day query exactly on the
+#                         # boundary. Slices with no data left cost a manifest lookup. 0 = off.
+
+# --- Query engine --------------------------------------------------------------------------
+# Optional. One process-wide DataFusion memory pool is shared by every query engine, so this is a
+# ceiling on the SUM of all concurrent queries, not a per-query allowance. Omit it and the size is
+# a quarter of total RAM (read from /proc/meminfo), clamped to 256 MiB..=4 GiB — set it only to
+# pin a low-memory node or to hand a big box more. Raising it does not make an unbounded query
+# safe: sorts and grouped aggregations spill to disk at their fair share, and the pool stays the
+# loud backstop for the operators that cannot spill.
+# [query]
+# memory_pool_bytes = 2147483648   # 2 GiB
 
 # --- Real-User Monitoring (RUM) -----------------------------------------------------------
 # RUM apps are managed in the UI (Frontend → Manage apps), not in config. On a fresh install

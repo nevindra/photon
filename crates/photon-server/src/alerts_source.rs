@@ -277,6 +277,7 @@ impl EngineConditionSource {
             limit: 0,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         };
         // Grouping per operation when one is pinned lets us select the exact (service, operation)
         // row; otherwise a per-service rollup. Apdex thresholds only affect the satisfied/

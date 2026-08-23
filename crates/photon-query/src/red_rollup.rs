@@ -14,9 +14,17 @@
 //!    ([`LATENCY_BOUNDS_NS`]) that `metric_dist::histogram_series` can re-quantile over ANY window.
 //!    Percentiles pre-computed per bucket cannot be re-aggregated — averaging p99s is not a p99 —
 //!    so storing the distribution is the only way a wide-window read off the rollup is honest.
-//! 2. **Local spans only.** Spans carrying a `tenant` attribute arrived from a Site, and that Site
-//!    rolls up its own services and ships the result (Task 7). Rolling them up again on Central
-//!    would double-count every federated service.
+//! 2. **Every tenant that is not rolling itself up.** Spans carrying a `tenant` attribute arrived
+//!    from a Site. When that Site ships its own rollup (`push_service_rollup`), rolling the
+//!    mirrored spans up again on Central would double-count the federated service — so Central
+//!    skips those tenants, and the caller says which ones by passing `covered_tenants`.
+//!
+//!    Central used to skip ALL mirrored spans, on the assumption that every Site ships its rollup.
+//!    `push_service_rollup` is opt-in, so that assumption is wrong by default, and the result was
+//!    worse than slow: Central's watermark still advanced over those windows, so
+//!    `services_rollup::rollup_eligible` reported the window as covered, the Backend pages read a
+//!    rollup that had deliberately been given nothing, and the fleet board rendered EMPTY. A
+//!    Central aggregating Sites that do not push now rolls their spans up itself.
 //! 3. **Bounded operation cardinality.** See [`RollupPass::folded_operations`].
 
 use std::collections::{HashMap, HashSet};
@@ -24,7 +32,6 @@ use std::collections::{HashMap, HashSet};
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::DataType;
 use datafusion::dataframe::DataFrame;
-use datafusion::functions::core::expr_ext::FieldAccessor;
 use datafusion::functions_aggregate::expr_fn::sum;
 use datafusion::prelude::{cast, lit, when, Expr};
 
@@ -35,32 +42,51 @@ use crate::red::{
     candidate_count_aggs, entry_mask, http_status_expr, masked_duration, root_mask, RedBasis,
     HTTP_STATUS_CODE, HTTP_STATUS_CODE_LEGACY,
 };
-use crate::span_engine::span_base_predicate;
+use crate::span_engine::{attr_lookup, span_base_predicate, AttrKeys};
 use crate::{col_ref, SpanQueryEngine, SpanQueryRequest};
 
-/// Explicit histogram bucket boundaries for `photon.service.duration`, in NANOSECONDS, ascending.
-/// A ladder over the range web request latency actually occupies: sub-millisecond internal calls
-/// at one end, a ten-second timeout at the other, densest through 50ms–1s where the p90 of most
+/// The metric-name suffix the latency histogram is published under — `photon.service.latency`
+/// and `photon.operation.latency`. It was `…duration` while [`LATENCY_BOUNDS_NS`] topped out at
+/// 10s; the rename is what lets the longer ladder below exist without a query interpolating
+/// across two different meanings of the same name. See the ladder's own note.
+pub const LATENCY_METRIC: &str = "latency";
+
+/// Explicit histogram bucket boundaries for `photon.service.latency`, in NANOSECONDS, ascending.
+/// A ladder over the range request latency actually occupies: sub-millisecond internal calls at
+/// one end, a half-hour batch job at the other, densest through 50ms–1s where the p90 of most
 /// services sits.
 ///
+/// The tail above 10s is not padding. Everything past the top bound lands in the `+Inf` overflow
+/// bucket, and the quantile read interpolates that bucket at the top bound — so a ladder ending
+/// at 10s reports **exactly 10s** for a service whose real p50 is two minutes, silently, with no
+/// marker that the number is a floor rather than a measurement. Whatever the top bound is, it is
+/// the largest latency this histogram can ever report.
+///
 /// These are the `explicit_bounds` of the emitted OTLP histogram, so they are a **wire contract**:
-/// changing them changes the meaning of every already-stored `photon.service.duration` point, and
-/// a query spanning the change would interpolate across two different ladders. Add a new metric
-/// name before you renumber this array.
-pub const LATENCY_BOUNDS_NS: [i64; 13] = [
-    1_000_000,      // 1ms
-    2_000_000,      // 2ms
-    5_000_000,      // 5ms
-    10_000_000,     // 10ms
-    20_000_000,     // 20ms
-    50_000_000,     // 50ms
-    100_000_000,    // 100ms
-    200_000_000,    // 200ms
-    500_000_000,    // 500ms
-    1_000_000_000,  // 1s
-    2_000_000_000,  // 2s
-    5_000_000_000,  // 5s
-    10_000_000_000, // 10s
+/// changing them changes the meaning of every already-stored point under [`LATENCY_METRIC`], and
+/// a query spanning the change would interpolate across two different ladders. Renumbering this
+/// array means renaming [`LATENCY_METRIC`] in the same change — that is how the 10s ladder was
+/// retired, and it is the only safe way to retire this one.
+pub const LATENCY_BOUNDS_NS: [i64; 19] = [
+    1_000_000,         // 1ms
+    2_000_000,         // 2ms
+    5_000_000,         // 5ms
+    10_000_000,        // 10ms
+    20_000_000,        // 20ms
+    50_000_000,        // 50ms
+    100_000_000,       // 100ms
+    200_000_000,       // 200ms
+    500_000_000,       // 500ms
+    1_000_000_000,     // 1s
+    2_000_000_000,     // 2s
+    5_000_000_000,     // 5s
+    10_000_000_000,    // 10s
+    30_000_000_000,    // 30s
+    60_000_000_000,    // 1m
+    120_000_000_000,   // 2m
+    300_000_000_000,   // 5m
+    600_000_000_000,   // 10m
+    1_800_000_000_000, // 30m
 ];
 
 /// The operation name every folded-away operation is summed into. Not a real operation: it is the
@@ -70,7 +96,7 @@ pub const OTHER_OPERATION: &str = "__other__";
 
 /// Discovery candidates keyed by `(service, environment)`: `(count, operation)` pairs, sorted in
 /// Rust because the candidate set is already bounded (see `top_operations_over`).
-type DiscoveryByService = HashMap<(String, Option<String>), Vec<(u64, String)>>;
+type DiscoveryByService = HashMap<(String, Option<String>, Option<String>), Vec<(u64, String)>>;
 
 /// Hard cap on the (service, environment, operation) triples operation discovery will consider.
 /// An operation name carrying an id (`GET /v1/charges/ch_1a2b3c`) makes distinct operations scale
@@ -91,6 +117,9 @@ pub struct RollupRow {
     /// Bucket START, epoch nanos, aligned to the pass's bucket grid.
     pub ts: i64,
     pub service: String,
+    /// The Site this service belongs to, from the span's `tenant` attribute; `None` for a
+    /// service running on this node rather than mirrored in from a federated Site.
+    pub tenant: Option<String>,
     /// `deployment.environment`; `None` when the service never set it.
     pub environment: Option<String>,
     /// `None` at the service level.
@@ -156,22 +185,42 @@ impl SpanQueryEngine {
         thresholds: &HashMap<String, u32>,
         default_ms: u32,
         top_operations: usize,
+        covered_tenants: &HashSet<String>,
     ) -> Result<RollupPass, PhotonError> {
         let promoted = self.promoted_attributes();
+        // Survivors first: the attribute expressions below are built against what the surviving
+        // files actually declare, so a key none of them carries never drags the `attributes` map
+        // into the plan (see `AttrKeys`).
+        let Some((df, attr_keys)) = self.span_survivors(&req).await? else {
+            return Ok(RollupPass::default());
+        };
         let cols = RollupCols {
-            environment: promoted_or_map(promoted, ENVIRONMENT),
-            tenant: promoted_or_map(promoted, "tenant"),
+            environment: promoted_or_map(promoted, ENVIRONMENT, &attr_keys),
+            tenant: promoted_or_map(promoted, "tenant", &attr_keys),
             http_status: http_status_expr(
                 promoted.iter().any(|p| p == HTTP_STATUS_CODE),
                 promoted.iter().any(|p| p == HTTP_STATUS_CODE_LEGACY),
+                &attr_keys,
             ),
         };
-        let Some(df) = self.span_survivors_df(&req).await? else {
-            return Ok(RollupPass::default());
+        // Local spans, plus every mirrored tenant that is not already publishing its own rollup
+        // into this window (see the module header). `covered_tenants` is what the caller observed
+        // in the metrics, not a config flag — a Site's `push_service_rollup` is the Site's
+        // setting, and Central cannot read it.
+        let mut skip: Vec<Expr> = covered_tenants.iter().map(|t| lit(t.as_str())).collect();
+        skip.sort_by_key(|e| format!("{e}")); // deterministic plan across passes
+        let mine = if skip.is_empty() {
+            cols.tenant
+                .clone()
+                .is_null()
+                .or(cols.tenant.clone().is_not_null())
+        } else {
+            cols.tenant
+                .clone()
+                .is_null()
+                .or(cols.tenant.clone().in_list(skip, true))
         };
-        // Local spans only — a `tenant` attribute means the span was mirrored from a Site that
-        // rolls up its own services (see the module header).
-        let predicate = span_base_predicate(&req).and(cols.tenant.clone().is_null());
+        let predicate = span_base_predicate(&req).and(mine);
 
         let services = rollup_over(
             df.clone(),
@@ -242,12 +291,8 @@ const ENVIRONMENT: &str = "deployment.environment";
 /// A key's value expression, picked by where the schema actually put it: `span_record` routes a
 /// promoted key OUT of the `attributes` map, so a map lookup on a promoted key reads NULL. Same
 /// choice `red_over` makes for `tenant`.
-fn promoted_or_map(promoted: &[String], key: &str) -> Expr {
-    if promoted.iter().any(|p| p == key) {
-        col_ref(key)
-    } else {
-        col_ref(span_schema::ATTRIBUTES).field(key)
-    }
+fn promoted_or_map(promoted: &[String], key: &str, attr_keys: &AttrKeys) -> Expr {
+    attr_lookup(key, promoted.iter().any(|p| p == key), attr_keys)
 }
 
 /// The three schema-dependent expressions every query in the pass needs, resolved once.
@@ -316,24 +361,36 @@ fn bucket_index_expr(start: i64, buckets: i64, bucket_ns: i64) -> Result<Expr, P
 }
 
 /// The composite identity of one operation series, as the single string the fold test compares.
-/// `\u{1}` cannot appear in a service name, an environment or a span name, so this is injective —
-/// which matters, because a collision would fold one service's hot endpoint into another's tail.
-fn triple_key(service: &str, environment: Option<&str>, operation: &str) -> String {
+/// `\u{1}` cannot appear in a tenant, a service name, an environment or a span name, so this is
+/// injective — which matters, because a collision would fold one service's hot endpoint into
+/// another's tail.
+fn operation_key(
+    service: &str,
+    tenant: Option<&str>,
+    environment: Option<&str>,
+    operation: &str,
+) -> String {
     format!(
-        "{service}\u{1}{}\u{1}{operation}",
+        "{service}\u{1}{}\u{1}{}\u{1}{operation}",
+        tenant.unwrap_or(""),
         environment.unwrap_or("")
     )
 }
 
 /// The same key, as a DataFusion expression over the grouped columns.
-fn triple_key_expr(environment: &Expr) -> Expr {
+fn operation_key_expr(tenant: &Expr, environment: &Expr) -> Expr {
     use datafusion::functions::expr_fn::concat;
+    fn or_empty(e: &Expr) -> Expr {
+        when(e.clone().is_null(), lit(""))
+            .otherwise(e.clone())
+            .expect("rollup null-to-empty case")
+    }
     concat(vec![
         col_ref("service.name"),
         lit("\u{1}"),
-        when(environment.clone().is_null(), lit(""))
-            .otherwise(environment.clone())
-            .expect("rollup environment coalesce case"),
+        or_empty(tenant),
+        lit("\u{1}"),
+        or_empty(environment),
         lit("\u{1}"),
         col_ref(span_schema::NAME),
     ])
@@ -375,6 +432,7 @@ async fn discover_top_operations(
         .aggregate(
             vec![
                 col_ref("service.name").alias("service"),
+                cols.tenant.clone().alias("tenant"),
                 cols.environment.clone().alias("environment"),
                 col_ref(span_schema::NAME).alias("operation"),
             ],
@@ -394,6 +452,7 @@ async fn discover_top_operations(
     let mut total = 0usize;
     for b in &batches {
         let service = str_col(b, "service")?;
+        let tenant = str_col(b, "tenant")?;
         let environment = str_col(b, "environment")?;
         let operation = str_col(b, "operation")?;
         let n = i64_col(b, "n")?;
@@ -409,8 +468,9 @@ async fn discover_top_operations(
                 _ => nonneg_u64(n, i),
             };
             let env = (!environment.is_null(i)).then(|| environment.value(i).to_string());
+            let ten = (!tenant.is_null(i)).then(|| tenant.value(i).to_string());
             per_service
-                .entry((service.value(i).to_string(), env))
+                .entry((service.value(i).to_string(), ten, env))
                 .or_default()
                 .push((eff, operation.value(i).to_string()));
             total += 1;
@@ -420,13 +480,18 @@ async fn discover_top_operations(
 
     let mut keep = HashSet::new();
     let mut folded = 0usize;
-    for ((service, environment), mut ops) in per_service {
+    for ((service, tenant, environment), mut ops) in per_service {
         // count desc, then name asc so a tie picks the same operation on every pass — a series
         // that flickers in and out of `__other__` between passes is worse than a stable choice.
         ops.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         for (rank, (_, operation)) in ops.into_iter().enumerate() {
             if rank < top_n {
-                keep.insert(triple_key(&service, environment.as_deref(), &operation));
+                keep.insert(operation_key(
+                    &service,
+                    tenant.as_deref(),
+                    environment.as_deref(),
+                    &operation,
+                ));
             } else {
                 folded += 1;
             }
@@ -482,6 +547,7 @@ async fn rollup_over(
     let mut group_exprs = vec![
         bucket_index_expr(start, buckets, bucket_ns)?.alias("bucket"),
         col_ref("service.name").alias("service"),
+        cols.tenant.clone().alias("tenant"),
         cols.environment.clone().alias("environment"),
     ];
     if let Some(keep) = keep {
@@ -490,7 +556,7 @@ async fn rollup_over(
         let survives = if keys.is_empty() {
             lit(false)
         } else {
-            triple_key_expr(&cols.environment).in_list(keys, false)
+            operation_key_expr(&cols.tenant, &cols.environment).in_list(keys, false)
         };
         let folded_name = when(survives, col_ref(span_schema::NAME))
             .otherwise(lit(OTHER_OPERATION))
@@ -512,14 +578,20 @@ async fn rollup_over(
     decode(&batches, start, bucket_ns, keep.is_some(), basis_by_service)
 }
 
-/// A `(service, environment)` series identity — the key an operation inherits its basis by.
-pub(crate) type ServiceKey = (String, Option<String>);
+/// A `(service, tenant, environment)` series identity — the key an operation inherits its basis
+/// by.
+pub(crate) type ServiceKey = (String, Option<String>, Option<String>);
 
 /// The basis each `(service, environment)` resolved to, from the service-level rows.
 fn basis_map(services: &[RollupRow]) -> HashMap<ServiceKey, RedBasis> {
     services
         .iter()
-        .map(|r| ((r.service.clone(), r.environment.clone()), r.basis))
+        .map(|r| {
+            (
+                (r.service.clone(), r.tenant.clone(), r.environment.clone()),
+                r.basis,
+            )
+        })
         .collect()
 }
 
@@ -535,12 +607,13 @@ fn decode(
     with_operation: bool,
     basis_by_service: Option<&HashMap<ServiceKey, RedBasis>>,
 ) -> Result<Vec<RollupRow>, PhotonError> {
-    type SeriesKey = (String, Option<String>, Option<String>);
+    type SeriesKey = (String, Option<String>, Option<String>, Option<String>);
     // Pass 1: collect every bucket's three candidates, keyed by series.
     let mut series: HashMap<SeriesKey, Vec<(i64, Cands)>> = HashMap::new();
     for b in batches {
         let bucket = i64_col(b, "bucket")?;
         let service = str_col(b, "service")?;
+        let tenant = str_col(b, "tenant")?;
         let environment = str_col(b, "environment")?;
         let operation = with_operation
             .then(|| str_col(b, "operation"))
@@ -555,6 +628,7 @@ fn decode(
             }
             let key = (
                 service.value(i).to_string(),
+                (!tenant.is_null(i)).then(|| tenant.value(i).to_string()),
                 (!environment.is_null(i)).then(|| environment.value(i).to_string()),
                 operation.map(|o| {
                     if o.is_null(i) {
@@ -577,9 +651,11 @@ fn decode(
 
     // Pass 2: pick the cascade winner per series, then emit its buckets.
     let mut rows = Vec::new();
-    for ((service, environment, operation), buckets) in series {
-        let inherited =
-            basis_by_service.and_then(|m| m.get(&(service.clone(), environment.clone())).copied());
+    for ((service, tenant, environment, operation), buckets) in series {
+        let inherited = basis_by_service.and_then(|m| {
+            m.get(&(service.clone(), tenant.clone(), environment.clone()))
+                .copied()
+        });
         let basis = inherited.unwrap_or_else(|| {
             let entry_total: u64 = buckets.iter().map(|(_, c)| c.entry.n).sum();
             let root_total: u64 = buckets.iter().map(|(_, c)| c.root.n).sum();
@@ -600,6 +676,7 @@ fn decode(
             rows.push(RollupRow {
                 ts: start + bucket * bucket_ns,
                 service: service.clone(),
+                tenant: tenant.clone(),
                 environment: environment.clone(),
                 operation: operation.clone(),
                 count: won.n,
@@ -781,9 +858,9 @@ mod tests {
     fn cols() -> RollupCols {
         let promoted = vec!["service.name".to_string(), ENVIRONMENT.to_string()];
         RollupCols {
-            environment: promoted_or_map(&promoted, ENVIRONMENT),
-            tenant: promoted_or_map(&promoted, "tenant"),
-            http_status: http_status_expr(false, false),
+            environment: promoted_or_map(&promoted, ENVIRONMENT, &AttrKeys::Unknown),
+            tenant: promoted_or_map(&promoted, "tenant", &AttrKeys::Unknown),
+            http_status: http_status_expr(false, false, &AttrKeys::Unknown),
         }
     }
 
@@ -1016,7 +1093,8 @@ mod tests {
     async fn latency_buckets_are_non_cumulative_and_carry_the_sum() {
         let rows = roll(
             &[
-                // bounds are [1ms, 2, 5, 10, 20, 50, 100, 200, 500, 1s, 2s, 5s, 10s]
+                // bounds are [1ms, 2, 5, 10, 20, 50, 100, 200, 500, 1s, 2s, 5s, 10s,
+                //             30s, 1m, 2m, 5m, 10m, 30m]
                 Span {
                     dur: Some(500_000),
                     ..Default::default()
@@ -1030,9 +1108,13 @@ mod tests {
                     ..Default::default()
                 }, // <= 5ms  -> idx 2
                 Span {
-                    dur: Some(30_000 * MS),
+                    dur: Some(120_000 * MS),
                     ..Default::default()
-                }, // > 10s -> +Inf
+                }, // <= 2m   -> idx 15
+                Span {
+                    dur: Some(3_600_000 * MS),
+                    ..Default::default()
+                }, // > 30m   -> +Inf
             ],
             0,
             60_000_000_000,
@@ -1046,6 +1128,11 @@ mod tests {
         assert_eq!(r.latency_buckets[0], 1);
         assert_eq!(r.latency_buckets[1], 0, "nothing between 1ms and 2ms");
         assert_eq!(r.latency_buckets[2], 2);
+        assert_eq!(
+            r.latency_buckets[15], 1,
+            "a two-minute span is measured, not overflowed — the ladder reaches past 10s, and a \
+             service whose real p50 is minutes used to read as exactly 10s because it did not"
+        );
         assert_eq!(*r.latency_buckets.last().unwrap(), 1, "+Inf overflow");
         assert_eq!(
             r.latency_buckets.iter().sum::<u64>(),
@@ -1053,7 +1140,10 @@ mod tests {
             "every measured span lands in exactly one bucket"
         );
         assert_eq!(r.duration_count, r.count, "nothing was left open here");
-        assert_eq!(r.duration_sum, 500_000 + 3 * MS + 3 * MS + 30_000 * MS);
+        assert_eq!(
+            r.duration_sum as i64,
+            500_000 + 3 * MS + 3 * MS + 120_000 * MS + 3_600_000 * MS
+        );
     }
 
     #[tokio::test]
@@ -1191,13 +1281,13 @@ mod tests {
         .unwrap();
 
         assert!(!truncated);
-        assert!(keep.contains(&triple_key("loud", Some("prod"), "GET /a")));
-        assert!(keep.contains(&triple_key("loud", Some("prod"), "GET /b")));
+        assert!(keep.contains(&operation_key("loud", None, Some("prod"), "GET /a")));
+        assert!(keep.contains(&operation_key("loud", None, Some("prod"), "GET /b")));
         assert!(
-            keep.contains(&triple_key("quiet", Some("prod"), "GET /z")),
+            keep.contains(&operation_key("quiet", None, Some("prod"), "GET /z")),
             "a quiet service still gets its own top-N slot"
         );
-        assert!(!keep.contains(&triple_key("loud", Some("prod"), "GET /c")));
+        assert!(!keep.contains(&operation_key("loud", None, Some("prod"), "GET /c")));
         assert_eq!(folded, 1, "only `loud`'s third operation folds");
     }
 
@@ -1226,7 +1316,7 @@ mod tests {
         }
 
         let mut keep = HashSet::new();
-        keep.insert(triple_key("svc", Some("prod"), "GET /a"));
+        keep.insert(operation_key("svc", None, Some("prod"), "GET /a"));
         let ops = roll(&spans, 0, 60_000_000_000, 60_000_000_000, Some(&keep)).await;
 
         assert_eq!(ops.len(), 2, "one kept operation plus `__other__`");
@@ -1287,8 +1377,8 @@ mod tests {
         assert_eq!(services[0].count, 2);
 
         let mut keep = HashSet::new();
-        keep.insert(triple_key("svc", Some("prod"), "GET /a"));
-        keep.insert(triple_key("svc", Some("prod"), "SELECT users"));
+        keep.insert(operation_key("svc", None, Some("prod"), "GET /a"));
+        keep.insert(operation_key("svc", None, Some("prod"), "SELECT users"));
         let basis = basis_map(&services);
         let ops = rollup_over(
             df_of(&spans).await,
@@ -1360,15 +1450,15 @@ mod tests {
     }
 
     #[test]
-    fn triple_keys_do_not_collide_across_services() {
+    fn operation_keys_do_not_collide_across_services() {
         // Naive concatenation would make ("a", "b\u{1}c") and ("a\u{1}b", "c") the same key.
         assert_ne!(
-            triple_key("a", Some("b"), "c"),
-            triple_key("a\u{1}b", None, "c")
+            operation_key("a", None, Some("b"), "c"),
+            operation_key("a\u{1}b", None, None, "c")
         );
         assert_ne!(
-            triple_key("api", None, "GET /x"),
-            triple_key("api", Some(""), "GET /x\u{1}")
+            operation_key("api", None, None, "GET /x"),
+            operation_key("api", None, Some(""), "GET /x\u{1}")
         );
     }
 }

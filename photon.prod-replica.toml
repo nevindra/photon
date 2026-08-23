@@ -43,10 +43,19 @@ db_path = ".photon-prod/replica.db"
 days = 30
 
 [schema]
-# Must match production exactly. A different promoted set makes the same Parquet read differently:
-# a key promoted here but not there reads NULL (it lives in the file's attributes map), and vice
-# versa. This is the same mismatch that makes `deployment.environment` empty for pre-upgrade data.
-promoted_attributes = ["service.name", "host.name", "deployment.environment"]
+# Match production, plus whatever you are testing a promotion of. The read path resolves a promoted
+# key from its column OR the attributes map (`span_engine::attr_lookup`), so promoting a key here
+# that production has not promoted yet reads the copied Parquet correctly — that is exactly the
+# mixed state a real deployment sits in for one retention period after changing this list. What you
+# do NOT get from a promotion here is its speed: the copied segments still carry the key in their
+# map, so the map is still decoded. Only segments written after the change skip it.
+promoted_attributes = [
+    "service.name",
+    "host.name",
+    "deployment.environment",
+    "tenant",
+    "http.response.status_code",
+]
 
 [wal]
 segment_max_bytes = 33554432

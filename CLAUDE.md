@@ -100,8 +100,14 @@ of a *running* Photon is not a clean snapshot (`merge_once` unlinks files mid-co
 survive), and the replica must use a **fresh** control-plane DB rather than the source's — the alert
 engine and the uptime prober are always on and read their work out of that database, so pointing a
 replica at a production copy would fire production's real notification channels and probe
-production's endpoints. `[schema].promoted_attributes` must also match the source exactly, or the
-same Parquet reads differently (a key promoted on one side but not the other reads NULL).
+production's endpoints. `[schema].promoted_attributes` may be a **superset** of the source's — the
+read path resolves a promoted key from its column OR the attributes map
+(`span_engine::attr_lookup`), which is exactly the mixed state a real deployment sits in for one
+retention period after changing the list. What a promotion here does not buy you is its speed: the
+copied segments still carry the key in their map. Dropping a key the source promoted is the one
+direction that breaks — it reads NULL. One more thing the copy can surprise you with: if the source
+was a federation **central**, every span carries a `tenant` and the rollup pass correctly refuses to
+roll them up (the Site publishes its own), so a local rollup produces nothing.
 
 The frontend (`frontend/`) is **Vue 3 + Vite + Tailwind** with **Reka UI** headless components (the
 shadcn-vue equivalent) and Lucide icons; package manager is **bun** (never npm — `bun.lock` is the
@@ -227,6 +233,16 @@ photon-query    three engines: QueryEngine (logs), SpanQueryEngine (traces/APM/R
                 `latency_sli` answers "how many samples were at or below X" off an explicit-bucket
                 histogram (the latency-SLO read); it shares its accumulation with the quantile path
                 so two readers of one metric cannot drift on the cumulative-reset rule.
+                `attr_lookup` (`span_engine.rs`) decides how to read ONE attribute and is the
+                single biggest lever on the Backend read path: a span Parquet's `attributes` map is
+                63% of its bytes and 96% of its DECODED bytes, so referencing it at all costs about
+                the same however many keys are probed. The manifest records each file's long-tail
+                keys, so a key no surviving file declares becomes a typed NULL literal and the map
+                column never enters the plan (`AttrKeys::Unknown` = at least one file did not
+                declare, so keep the probe). Measured on 300M spans: `/api/red` over 7 days, 12.3 s
+                touching the map against 2.2 s without. The pool that bounds all this is sized from
+                `[query].memory_pool_bytes` (default: a quarter of RAM, 256 MiB..=4 GiB) via
+                `set_memory_pool_bytes`, not a hard-coded constant.
 photon-ingest   OTLP gRPC (tonic) + HTTP (axum) receivers for logs/traces/metrics, mapping, token auth
                 (local token + federated tenant tokens). Also DEPLOY DETECTION: `deployments.rs`
                 reads a trace batch's RESOURCE `service.version` and reports first sightings through
@@ -251,7 +267,15 @@ photon-server   the binary: config load, wiring, background-task supervision (3 
                 per-service `photon.service.*` and per-operation `photon.operation.*` metrics —
                 60s buckets, each published EXACTLY ONCE behind a SQLite watermark (the metrics
                 reader sums a bucket, it does not de-duplicate, so re-emitting would multiply every
-                counter). Optional `[rollup]` tunes `interval_secs`/`lag_secs`/`top_operations`.
+                counter). A first run BACKFILLS `[rollup].backfill_days` (default 30) so the rollup
+                describes the spans already on disk and not only the ones that arrive next, walking
+                forward one hour-wide slice per pass and writing the watermark after each. The
+                latency histogram is `photon.{service,operation}.latency` over a 19-bucket ladder
+                reaching 30 minutes; renumbering `LATENCY_BOUNDS_NS` requires renaming
+                `LATENCY_METRIC`, and `repair_latency` then republishes the histogram (and ONLY the
+                histogram — quantiles are scale-invariant, counters are not) over the covered range.
+                Optional `[rollup]` tunes
+                `interval_secs`/`lag_secs`/`top_operations`/`backfill_days`.
                 See [`docs/subsystems/rollup.md`](docs/subsystems/rollup.md). Optional `federation/` module spawns the summary pusher
                 and full-mode forwarder — both tenant-side; central runs nothing from this module.
                 `[federation].signals` covers four signals (logs/traces/metrics/rum; omit = all

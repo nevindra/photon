@@ -177,6 +177,7 @@ mod tests {
             ts: 1_700_000_000_000_000_000,
             service: "api".into(),
             environment: Some("prod".into()),
+            tenant: None,
             operation: operation.map(String::from),
             count: 10,
             span_count: 14,
@@ -251,7 +252,7 @@ mod tests {
         let m = req.resource_metrics[0].scope_metrics[0]
             .metrics
             .iter()
-            .find(|m| m.name == "photon.service.duration")
+            .find(|m| m.name == "photon.service.latency")
             .unwrap();
         let Some(Data::Histogram(h)) = &m.data else {
             panic!("duration must be a Histogram")

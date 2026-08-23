@@ -15,8 +15,9 @@ use photon_core::PhotonError;
 
 use crate::metric_engine::{metric_base_predicate, MetricRequest};
 use crate::metric_query::{
-    bucket_of, bucket_start, MetricSeriesRequest, ProbeMeta, QuerySeriesResult, SeriesPoint,
-    SeriesResult, MAX_COLLECT_ROWS, MAX_SERIES, TEMPORALITY_CUMULATIVE,
+    bucket_of, bucket_start, collect_sorted_prefix, MetricSeriesRequest, ProbeMeta,
+    QuerySeriesResult, SeriesPoint, SeriesResult, MAX_COLLECT_ROWS, MAX_SERIES,
+    TEMPORALITY_CUMULATIVE,
 };
 use crate::{col_ref, MetricsQueryEngine};
 
@@ -153,22 +154,20 @@ impl MetricsQueryEngine {
             .collect();
         sorts.push(col("__ts").sort(true, false));
 
-        let batches = df
-            .filter(metric_base_predicate(base))
-            .map_err(|e| PhotonError::Query(format!("dist filter: {e}")))?
-            .select(selects)
-            .map_err(|e| PhotonError::Query(format!("dist select: {e}")))?
-            .sort(sorts)
-            .map_err(|e| PhotonError::Query(format!("dist sort: {e}")))?
-            // Applied AFTER the sort so a truncation keeps a deterministic prefix (the sort
-            // order's leading rows) rather than whatever DataFusion happened to scan first.
-            // `row_cap + 1`: collecting exactly that many rows is the signal that the true result
-            // was larger than `row_cap` (see the row-walk loop below).
-            .limit(0, Some(row_cap + 1))
-            .map_err(|e| PhotonError::Query(format!("dist limit: {e}")))?
-            .collect()
-            .await
-            .map_err(|e| PhotonError::Query(format!("dist collect: {e}")))?;
+        // The prefix is taken AFTER the sort, so a truncation keeps a deterministic set of rows
+        // (the sort order's leading ones) rather than whatever DataFusion happened to scan first.
+        // `row_cap + 1`: seeing exactly that many rows is the signal that the true result was
+        // larger than `row_cap` (see the row-walk loop below).
+        let batches = collect_sorted_prefix(
+            df.filter(metric_base_predicate(base))
+                .map_err(|e| PhotonError::Query(format!("dist filter: {e}")))?
+                .select(selects)
+                .map_err(|e| PhotonError::Query(format!("dist select: {e}")))?,
+            sorts,
+            row_cap,
+            "dist",
+        )
+        .await?;
 
         let mut out: Vec<(BTreeMap<String, String>, Vec<DistRow>)> = Vec::new();
         let mut cur_key: Option<Vec<Option<String>>> = None;

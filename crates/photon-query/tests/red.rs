@@ -116,6 +116,7 @@ fn req() -> SpanQueryRequest {
         limit: 0,
         offset: 0,
         projected_attributes: Vec::new(),
+        required_attributes: Vec::new(),
     }
 }
 

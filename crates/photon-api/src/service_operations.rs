@@ -16,11 +16,12 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use photon_query::RedGroup;
+use photon_query::{RedGroup, RedSeriesKey};
 
 use crate::query_params::{build_span_query_request, clamp_buckets, grammar_term};
 use crate::red::{red_row_to_json, window_seconds};
-use crate::services_rollup::{red_buckets, red_rows};
+use crate::services_overview::{points, spark_series};
+use crate::services_rollup::red_rows;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -36,11 +37,6 @@ pub(crate) struct OperationsParams {
 fn default_buckets() -> usize {
     30
 }
-
-/// How many rows get a sparkline. Same reasoning (and same number) as `services_overview`: each
-/// one is its own bucketed read, so this is the difference between a page load and a thundering
-/// herd. Rows past the cap render without a sparkline rather than being dropped.
-const MAX_SPARKLINES: usize = 40;
 
 /// The caller's query, narrowed to one service, and to one operation when given.
 ///
@@ -104,41 +100,26 @@ pub(crate) async fn operations(
         }
     };
 
-    let sparked = rows.len().min(MAX_SPARKLINES);
-    let sparks = futures::future::join_all(rows.iter().take(sparked).map(|r| {
-        let state = state.clone();
-        let q = scoped_query(&p.q, &service, r.operation.as_deref());
-        let (start, end) = (p.start.clone(), p.end.clone());
-        async move {
-            let Ok(req) = build_span_query_request(
-                &q,
-                &start,
-                &end,
-                "recent",
-                0,
-                0,
-                state.span_query.promoted_attributes(),
-            ) else {
-                return Vec::new();
-            };
-            red_buckets(&state, &q, req, buckets, default_ms)
-                .await
-                .map(|(b, _)| b)
-                .unwrap_or_default()
-        }
-    }))
-    .await;
+    // Every operation's sparkline from ONE bucketed pass, scoped to this service — not one pass
+    // per row. See `services_overview::spark_series`.
+    let sparks = spark_series(&state, &q, &p.start, &p.end, buckets, RedGroup::Operation).await;
 
     let window_secs = window_seconds(start_ns, end_ns);
     let out: Vec<Value> = rows
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
+        .map(|r| {
             let mut v = red_row_to_json(r, window_secs, source);
-            let series = sparks.get(i);
+            let series = sparks.as_ref().and_then(|s| {
+                s.get(&RedSeriesKey {
+                    service: r.service.clone(),
+                    tenant: None,
+                    environment: None,
+                    operation: r.operation.clone(),
+                })
+            });
             if let Some(obj) = v.as_object_mut() {
-                // `[]` past the cap — an empty sparkline, not a flat one. A flat line would claim
-                // the operation had no traffic.
+                // `[]` when the series is missing — an empty sparkline, not a flat one. A flat line
+                // would claim the operation had no traffic.
                 obj.insert(
                     "spark".into(),
                     Value::Array(series.map(|b| points(b, |x| x.count)).unwrap_or_default()),
@@ -162,16 +143,6 @@ pub(crate) async fn operations(
         "rows": out,
     }))
     .into_response()
-}
-
-fn points(
-    buckets: &[photon_query::RedBucket],
-    f: impl Fn(&photon_query::RedBucket) -> u64,
-) -> Vec<Value> {
-    buckets
-        .iter()
-        .map(|b| json!([b.ts / 1_000_000, f(b)]))
-        .collect()
 }
 
 #[derive(Deserialize)]

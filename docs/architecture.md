@@ -141,17 +141,34 @@ See [`subsystems/rum.md`](subsystems/rum.md) and the per-feature docs in
 
 1. **Manifest** selects candidate files by time overlap and per-file promoted-column value ranges.
 2. **Skip index** (`.idx` sidecar) prunes further by min/max ranges and token bloom membership.
-3. **DataFusion** columnar-scans only the survivors, predicates pushed down. Free-text log search is
+3. **DataFusion** columnar-scans only the survivors. Free-text log search is
    bloom-pruned then confirmed with a `strpos(body, text) > 0` substring scan — **there is no
    inverted index.**
 
+**Row-level Parquet filter pushdown is OFF** (`datafusion.execution.parquet.pushdown_filters`,
+`photon-query/src/lib.rs`), and it must stay off. Every signal is read with an *explicit* schema
+(`ParquetReadOptions::schema`) because it has to be: changing `[schema].promoted_attributes` changes
+the columns new segments are written with, so for one retention period a query legitimately spans
+two layouts. In DataFusion 43, pushdown over a file set whose physical schemas do not all match the
+declared schema makes any plan carrying a `fetch` (a `LIMIT`) return **zero rows** — not an error,
+not a partial answer, an empty result. Measured on the 120M-span replica across four surviving
+metrics files, two written before a promotion and two after: the same filtered frame reported 29,819
+rows to `count()` and 0 rows to `LIMIT 1`.
+
+An aggregate or a sort between the filter and the limit hides it, because the fetch then never
+reaches the scan — which is why only three call sites in `photon-query` ever showed it
+(`metric_meta_probe`, `service_map`, `service_dependencies`) and why the symptom was "this metric
+does not exist" rather than a failure. The counters on a Backend page stayed right while its
+percentiles vanished. `a_fetch_plan_over_mixed_schema_files_still_returns_rows` (`lib.rs`) is the
+regression test; the flag can go back on when the bug is fixed upstream.
+
 Every engine's `SessionContext` (the shared `session()` factory in `photon-query/src/lib.rs`) draws on
-**one process-wide, bounded DataFusion memory pool** (`FairSpillPool`, `QUERY_MEMORY_POOL_BYTES` =
-512 MiB) — a single `Arc<RuntimeEnv>` built lazily via `OnceLock` and shared by every session (only
-each session's `SessionConfig` / Parquet tuning is freshly built). So 512 MiB is an **aggregate cap
+**one process-wide, bounded DataFusion memory pool** (`FairSpillPool`) — a single `Arc<RuntimeEnv>`
+built lazily via `OnceLock` and shared by every session (only
+each session's `SessionConfig` / Parquet tuning is freshly built). So the ceiling is an **aggregate cap
 across ALL concurrent queries**, not a per-query allowance: opening the UI dashboard fans out ~10
 queries at once, and a fresh pool per session would make that budget additive and effectively
-unbounded (N × 512 MiB). Its job is to keep the remaining intrinsically-unbounded query path — a
+unbounded (N × pool). Its job is to keep the remaining intrinsically-unbounded query path — a
 facet `GROUP BY value` on a high-cardinality field (holds every distinct value in a hash table before
 the `LIMIT`) — from OOM-killing a low-memory single node. As a `FairSpillPool` it does this two ways:
 a heavy **spillable** operator (sort, grouped aggregation) that exceeds its fair share **degrades to
@@ -171,8 +188,24 @@ straddling the row-cap boundary keeps only its time-ascending prefix, so *its ow
 bound from turning into cross-query starvation: the budget is divided evenly among concurrent
 spillable consumers (`(pool_size - unspillable) / num_spillers`), so one expensive query can't
 monopolize it and push unrelated ones into `ResourcesExhausted` — it hits its own fair-share ceiling
-and spills to disk instead. It is not a config surface yet; a future change could make it
-per-deployment tunable.
+and spills to disk instead.
+
+**Sizing it.** `photon-server` sets the pool once at startup, before any engine is built, from
+`[query].memory_pool_bytes` (`photon_core::config::QueryConfig`) — omit it and the size is a quarter
+of total RAM read from `/proc/meminfo`, clamped to 256 MiB..=4 GiB, falling back to the floor where
+RAM cannot be read. It used to be a hard-coded 512 MiB regardless of the host, which is the wrong
+shape for a number covering a whole machine's read path: generous on a 2 GB VM, absurd on a 30 GB
+server, where a 7-day histogram query failed with "Resources exhausted" while the box had 21 GB
+free. `photon_query::set_memory_pool_bytes` is a setter rather than a `session()` parameter on
+purpose — a per-call parameter would let each caller mint its own budget, which is exactly what one
+shared pool exists to prevent. Nothing calls it in tests, so they keep the old 512 MiB constant.
+
+Pool exhaustion is a **500, not a 400.** `engine_query_failure` (`photon-api/src/search.rs`) splits
+engine errors: a rejected request (unsupported aggregation, `rate` on a gauge, an unknown group-by
+column) is the caller's fault and stays 400, while an I/O failure or `Resources exhausted` is ours.
+`/api/red` and `/api/metrics/query` used to answer both with 400, which is not a cosmetic mislabel —
+a 400 says "your query is malformed", so a server out of query memory looked exactly like a user
+typo, and nothing in an access log or an uptime check told the two apart.
 
 Per-signal engines:
 

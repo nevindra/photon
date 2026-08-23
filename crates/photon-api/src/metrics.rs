@@ -192,14 +192,9 @@ pub(crate) async fn query(
                     "default_agg": r.default_agg.as_str(),
                 }));
             }
-            Err(e) => {
-                // Engine query error (e.g. unsupported agg, bad group-by) → 400 with the message.
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": e.to_string() })),
-                )
-                    .into_response();
-            }
+            // 400 when the engine rejected the request (unsupported agg, bad group-by), 500 when
+            // it failed to run a valid one — see `search::engine_query_failure`.
+            Err(e) => return crate::search::engine_query_failure("metrics query", &e),
         }
     }
 

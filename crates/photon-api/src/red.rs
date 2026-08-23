@@ -5,7 +5,6 @@
 //! returns raw counts + percentiles and stays window-agnostic. Percentiles cross as
 //! decimal-nanosecond strings (JS-safe), consistent with `/api/traces/latency`.
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -73,11 +72,7 @@ pub(crate) async fn red(State(state): State<AppState>, Query(p): Query<RedParams
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => crate::search::engine_query_failure("red metrics", &e),
     }
 }
 

@@ -21,11 +21,13 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use photon_query::{RedGroup, RedRow};
+use std::collections::HashMap;
 
-use crate::query_params::{build_span_query_request, clamp_buckets, grammar_term};
+use photon_query::{RedGroup, RedSeriesKey, SparkPoint};
+
+use crate::query_params::{build_span_query_request, clamp_buckets};
 use crate::red::{red_row_to_json, window_seconds};
-use crate::services_rollup::{red_buckets, red_rows};
+use crate::services_rollup::red_rows;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -41,11 +43,6 @@ pub(crate) struct OverviewParams {
 fn default_buckets() -> usize {
     30
 }
-
-/// How many rows get a sparkline. Each one is its own bucketed read, so this is the difference
-/// between a page load and a thundering herd. Rows past the cap render without a sparkline rather
-/// than being dropped — the table is still complete, it just stops drawing.
-const MAX_SPARKLINES: usize = 40;
 
 /// `GET /api/services/overview?start&end&buckets&q`.
 pub(crate) async fn overview(
@@ -90,31 +87,8 @@ pub(crate) async fn overview(
         }
     };
 
-    // Sparklines: one bucketed read per row, concurrently, for the busiest rows only.
-    let sparked = rows.len().min(MAX_SPARKLINES);
-    let sparks = futures::future::join_all(rows.iter().take(sparked).map(|r| {
-        let state = state.clone();
-        let q = row_query(&p.q, r);
-        let (start, end) = (p.start.clone(), p.end.clone());
-        async move {
-            let Ok(req) = build_span_query_request(
-                &q,
-                &start,
-                &end,
-                "recent",
-                0,
-                0,
-                state.span_query.promoted_attributes(),
-            ) else {
-                return Vec::new();
-            };
-            red_buckets(&state, &q, req, buckets, default_ms)
-                .await
-                .map(|(b, _)| b)
-                .unwrap_or_default()
-        }
-    }))
-    .await;
+    // Sparklines for every row, from ONE bucketed pass keyed by the same tuple the rows are.
+    let sparks = spark_series(&state, &p.q, &p.start, &p.end, buckets, RedGroup::Service).await;
 
     // The SAME row shape `/api/red` returns (`rate`, `error_rate` and `apdex` are derived there),
     // plus this route's two sparklines. Hand-rolling a second copy is how the index lost `rate` and
@@ -123,13 +97,19 @@ pub(crate) async fn overview(
     let window_secs = window_seconds(start_ns, end_ns);
     let out_rows: Vec<Value> = rows
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
+        .map(|r| {
             let mut v = red_row_to_json(r, window_secs, source);
-            let series = sparks.get(i);
+            let series = sparks.as_ref().and_then(|s| {
+                s.get(&RedSeriesKey {
+                    service: r.service.clone(),
+                    tenant: r.tenant.clone(),
+                    environment: r.environment.clone(),
+                    operation: None,
+                })
+            });
             if let Some(obj) = v.as_object_mut() {
-                // `[]` where the row fell past MAX_SPARKLINES — an empty sparkline, not a flat one.
-                // A flat line would claim the service had no traffic.
+                // `[]` when the series is missing — an empty sparkline, not a flat one. A flat
+                // line would claim the service had no traffic.
                 obj.insert(
                     "spark".into(),
                     Value::Array(series.map(|b| points(b, |x| x.count)).unwrap_or_default()),
@@ -157,35 +137,125 @@ pub(crate) async fn overview(
 }
 
 /// `(epoch ms, value)` pairs — the shape the UI's chart components already read.
-fn points(
-    buckets: &[photon_query::RedBucket],
-    f: impl Fn(&photon_query::RedBucket) -> u64,
-) -> Vec<Value> {
+pub(crate) fn points(buckets: &[SparkPoint], f: impl Fn(&SparkPoint) -> u64) -> Vec<Value> {
     buckets
         .iter()
         .map(|b| json!([b.ts / 1_000_000, f(b)]))
         .collect()
 }
 
-/// The caller's query narrowed to one row's identity, for that row's sparkline.
+/// Every row's sparkline for one board, in a single bucketed pass over the same spans the RED
+/// aggregate just read.
 ///
-/// Every term goes through `grammar_term`, which quotes a value containing whitespace or a comma
-/// and drops one the grammar cannot express at all. An unquoted `service.name:my api` would parse
-/// as a service plus a stray free-text word, and the sparkline would silently belong to a different
-/// set of spans than its row.
-fn row_query(base: &str, r: &RedRow) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if !base.trim().is_empty() {
-        parts.push(base.trim().to_string());
+/// This replaced a `1 + N` fan-out — one `red_timeseries` call per row, concurrently, capped at 40
+/// — which re-scanned the whole window once per row. On 86.6M spans a 24h Services index was eight
+/// scans instead of two, and an Operations tab with 40 rows would have been forty-one.
+///
+/// A failure here is not fatal: the board still renders, just without sparklines. Losing the
+/// mini-charts is much better than 500-ing the page they sit on.
+pub(crate) async fn spark_series(
+    state: &AppState,
+    q: &str,
+    start: &str,
+    end: &str,
+    buckets: usize,
+    group: RedGroup,
+) -> Option<HashMap<RedSeriesKey, Vec<SparkPoint>>> {
+    let req = build_span_query_request(
+        q,
+        start,
+        end,
+        "recent",
+        0,
+        0,
+        state.span_query.promoted_attributes(),
+    )
+    .ok()?;
+    let (start_ns, end_ns) = (req.start_ts_nanos, req.end_ts_nanos);
+
+    // Off the rollup when it covers the window, same rule and same seam the rows above use — a
+    // board whose numbers came from the rollup and whose sparklines came from a raw span scan
+    // would pay the full cost of the scan it was built to avoid, and could draw a shape its own
+    // totals disagree with.
+    let width = ((end_ns - start_ns).max(1) / buckets.max(1) as i64).max(1);
+    let coverage = match &state.rollup {
+        Some(status) => status.coverage().await.unwrap_or(None),
+        None => None,
+    };
+    if let Some(through) =
+        crate::services_rollup::rollup_split(q, start_ns, end_ns, Some(width), coverage)
+    {
+        match crate::services_rollup::spark_from_rollup(
+            &state.metrics_query,
+            q,
+            start_ns,
+            end_ns,
+            buckets,
+            group,
+        )
+        .await
+        {
+            Ok(mut prefix) => {
+                // Same seam as the rows: the rollup cannot see the last ~11 minutes, and a
+                // sparkline that ends in zeros reads as an outage. Top the tail up from spans —
+                // see `services_rollup::rollup_split`.
+                if through < end_ns {
+                    let from_idx = ((through - start_ns) / width).max(0);
+                    let from_ts = start_ns + from_idx * width;
+                    let n = (((end_ns - from_ts) + width - 1) / width).max(1) as usize;
+                    let mut tail_req = req.clone();
+                    tail_req.start_ts_nanos = from_ts;
+                    match state
+                        .span_query
+                        .red_spark_series(tail_req, from_ts, end_ns, n, group)
+                        .await
+                    {
+                        Ok(tail) => splice_spark(&mut prefix, from_idx as usize, tail),
+                        Err(e) => {
+                            eprintln!("photon-api: sparkline tail failed ({e}) — prefix only")
+                        }
+                    }
+                }
+                return Some(prefix);
+            }
+            Err(e) => eprintln!("photon-api: rollup sparklines failed ({e}) — falling back to raw"),
+        }
     }
-    parts.extend(grammar_term("service.name", &r.service));
-    if let Some(env) = &r.environment {
-        parts.extend(grammar_term("deployment.environment", env));
+
+    match state
+        .span_query
+        .red_spark_series(req, start_ns, end_ns, buckets, group)
+        .await
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("photon-api: warning: sparkline pass failed, rendering without it: {e}");
+            None
+        }
     }
-    if let Some(t) = r.tenant.as_deref() {
-        parts.extend(grammar_term("tenant", t));
+}
+
+/// Overwrite each series' trailing buckets with the raw-span tail, keeping the grid's timestamps.
+/// A series only the tail saw is added whole — it started serving inside the unsettled window, and
+/// its zero-filled lead-in is the truth about the rest of the chart.
+fn splice_spark(
+    prefix: &mut HashMap<RedSeriesKey, Vec<SparkPoint>>,
+    from: usize,
+    tail: HashMap<RedSeriesKey, Vec<SparkPoint>>,
+) {
+    for (key, points) in tail {
+        let Some(slots) = prefix.get_mut(&key) else {
+            prefix.insert(key, points);
+            continue;
+        };
+        for (i, p) in points.into_iter().enumerate() {
+            let Some(slot) = slots.get_mut(from + i) else {
+                break;
+            };
+            slot.count = p.count;
+            slot.error_count = p.error_count;
+        }
     }
-    parts.join(" ")
 }
 
 /// The Site band: the tenant registry's liveness facts, and nothing else.
@@ -225,6 +295,7 @@ async fn sites_block(state: &AppState) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use photon_query::RedRow;
     use tower::ServiceExt;
 
     async fn get(uri: &str) -> (StatusCode, Value) {
@@ -334,54 +405,5 @@ mod tests {
         assert_eq!(v["error_rate"], json!(0.05));
         assert_eq!(v["apdex"], json!(0.95));
         assert_eq!(v["environment"], json!("prod"));
-    }
-
-    #[test]
-    fn a_rows_sparkline_query_is_scoped_to_that_row_alone() {
-        let q = row_query("", &row("payments-api", Some("jkt"), Some("prod")));
-        assert!(q.contains("service.name:payments-api"));
-        assert!(q.contains("deployment.environment:prod"));
-        assert!(q.contains("tenant:jkt"));
-    }
-
-    #[test]
-    fn the_callers_own_filter_is_kept_not_replaced() {
-        let q = row_query("http.route:/checkout", &row("api", None, None));
-        assert!(q.starts_with("http.route:/checkout "));
-        assert!(q.contains("service.name:api"));
-    }
-
-    #[test]
-    fn a_service_name_with_a_space_is_quoted_and_still_resolves_to_that_name() {
-        // Unquoted, `service.name:my api` would parse as a service plus a stray free-text word,
-        // and the sparkline would silently belong to a different set of spans than its row. The
-        // parse assertion is not enough on its own — a term can parse cleanly and match nothing,
-        // which is exactly what quoting used to do, so the VALUE is what this pins.
-        let q = row_query("", &row("my api", None, None));
-        assert!(q.contains(r#"service.name:"my api""#));
-        let parsed = photon_core::query::parse(&q).unwrap();
-        assert_eq!(
-            parsed.terms[0].kind,
-            photon_core::query::TermKind::Match {
-                field: "service.name".into(),
-                values: vec!["my api".into()],
-            }
-        );
-    }
-
-    #[test]
-    fn a_name_the_grammar_cannot_express_drops_its_term_instead_of_mismatching() {
-        // There is no escape for a `"` in the grammar. A term built around one would parse and
-        // then match nothing — a blank sparkline with no error. Widening is the honest failure.
-        let q = row_query("", &row(r#"we"ird"#, None, None));
-        assert!(!q.contains("service.name"));
-    }
-
-    #[test]
-    fn an_empty_tenant_label_is_not_turned_into_a_term() {
-        // The rollup reader fills `tenant` with `Some("")` for a local (untenanted) service;
-        // `tenant:""` would match nothing and blank the row's sparkline.
-        let q = row_query("", &row("api", Some(""), None));
-        assert!(!q.contains("tenant:"));
     }
 }

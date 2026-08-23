@@ -289,6 +289,7 @@ mod tests {
             limit: 0,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         };
         let out = engine.histogram(req, 10_000_000).await.unwrap();
         assert_eq!(out.len(), 3000, "buckets must be clamped to MAX_BUCKETS");

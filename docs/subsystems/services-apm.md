@@ -75,22 +75,39 @@ returning a 500.
   [`rollup.md`](rollup.md), [`ADR-0002`](../adr/0002-red-rollups-are-published-as-metrics.md).
   Operations there inherit their service's `basis`, so a `CLIENT`-only operation reports 0 requests
   rather than falling through to `AllSpans` and counting outbound calls as traffic served.
-- **Read-path switch** (`photon-api/src/services_rollup.rs`): `/api/red` and
-  `/api/services/:service/timeseries` prefer the rollup and fall back to raw spans. Every row and
-  bucket carries `"source": "rollup" | "raw"` so a wrong number is attributable. The rollup is used
-  only when all of these hold, and it is deliberately conservative — falling back costs latency,
-  answering wrongly costs correctness:
-  - the window sits entirely inside what the rollup has published (`RollupStatus::coverage`, backed
-    by the pass's SQLite watermark). Reading past the watermark would show traffic falling off a
-    cliff at `now - lag`; reading before coverage begins would answer with zeros, which looks
-    exactly like an outage.
+- **Read-path switch** (`photon-api/src/services_rollup.rs`): `/api/red`,
+  `/api/services/overview` and `/api/services/:service/timeseries` prefer the rollup and fall back
+  to raw spans. Every row and bucket carries `"source": "rollup" | "raw"` so a wrong number is
+  attributable. `rollup_split` decides, and it is deliberately conservative — falling back costs
+  latency, answering wrongly costs correctness:
+  - the window **starts** inside coverage (`RollupStatus::coverage`, backed by the pass's SQLite
+    watermark). Reading before coverage begins would answer with zeros, which looks exactly like an
+    outage.
+  - the rollup covers at least `MIN_ROLLUP_SHARE` (90%) of the window. Below that the uncovered
+    tail carries the answer, and a raw scan of a window that short is fast anyway (an hour measured
+    at 166 ms).
   - the requested resolution is at least one 60s bucket. Finer than that, the rollup does not hold it.
   - the query only touches keys a rollup series carries (`service.name`, `deployment.environment`,
     `operation`, `tenant`), un-negated. `status_code:2`, a body substring or `duration>1s` did not
     survive aggregation, so those always read raw.
 
+  **The window is split, not refused.** A bucket is published once its minute closes and `lag_secs`
+  has passed, so `published_through` always trails `now` by ~11 minutes at the defaults. The old
+  rule — `end > published_through` ⇒ ineligible — read as caution and behaved as an off switch:
+  every window the UI actually asks for ends at *now*, so the rollup was never once used on a live
+  page. It was built to keep the Backend pages off raw spans and, in normal use, kept them on it.
+  Measured on 300M spans, `/api/services/overview` took 3.4 s over 24 hours and 24.8 s over 7 days
+  from spans, against 24 ms off the rollup.
+
+  So the covered prefix is read from the rollup and the unsettled tail — eleven minutes of spans,
+  next to nothing — from raw spans, and `merge_tail` folds them together. **Counters add** (prefix
+  and tail share no span); **percentiles do not** — p99 over the prefix and p99 over the tail cannot
+  be combined, and there is no third number that would let them be, so the prefix's percentiles
+  stand. That is what the 90% floor is protecting: they describe at least 90% of the window.
+
   A rollup read that errors is logged and falls back rather than 500ing: a Backend page that works
-  slowly beats one that breaks because a shortcut did.
+  slowly beats one that breaks because a shortcut did. A *tail* read that errors loses the tail, not
+  the answer — reporting a good 23-hour prefix beats discarding it over the last eleven minutes.
 - **Config:** `[apm].default_apdex_threshold_ms` (default 500), `[rollup]` (see above). Apdex bands: **satisfied** ≤ T,
   **tolerating** T..4T, **frustrated** > 4T, all over the entry set (a null-duration span lands in no
   band). A per-service override can be set from the UI (stored via the `settings` route).
@@ -230,10 +247,10 @@ act on, "12% of the month's budget left and burning it 16× faster than you can 
   a full one, and never a silent fallback to a scan.
 - **Two kinds.** *Availability*: good = requests that did not error, straight off
   `photon.{service,operation}.requests` and `.errors`. *Latency*: good = requests at or below a
-  threshold, read off the rollup's explicit-bucket `duration` histogram.
+  threshold, read off the rollup's explicit-bucket `photon.{service,operation}.latency` histogram.
 - **A latency threshold snaps DOWN to a ladder edge**, and the response says which
-  (`measured_threshold_ms`). A histogram knows nothing finer than its own `LATENCY_BOUNDS_NS` edges,
-  so a 300ms objective is measured at 200ms. Snapping down keeps it conservative — an objective
+  (`measured_threshold_ms`). A histogram knows nothing finer than its own `LATENCY_BOUNDS_NS` edges
+  (19 of them, 1 ms to 30 minutes), so a 300ms objective is measured at 200ms. Snapping down keeps it conservative — an objective
   reported as met was met, never rounded into being met — and reporting the edge stops anyone
   believing a line was held that was never tested. The read is
   `MetricsQueryEngine::latency_sli` (`photon-query/src/metric_dist.rs`), which shares its
@@ -271,7 +288,7 @@ Two decisions are load-bearing:
   derived from the matched set the way `span_latency`'s geometric bins are. Data-derived bins would
   re-scale the y-axis the moment one slow outlier entered the window, and a cell would mean something
   different at 10:00 than at 10:05. Reusing the rollup's ladder also means a wide-window heatmap can
-  later be answered from `photon.service.duration` without changing what a row means.
+  later be answered from `photon.service.latency` without changing what a row means.
 - **Spans that never closed are counted apart from every band** (`open_spans`). "Under 1ms" and
   "never finished" are opposite facts, and folding the second into the first would make an operation
   whose spans stop closing look like it got faster.

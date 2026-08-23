@@ -480,7 +480,10 @@ async fn counts(
             let bound_ns = (slo.threshold_ms as f64) * (MS as f64);
             let res = state
                 .metrics_query
-                .latency_sli(series_req(format!("{fam}duration"), Agg::Count), bound_ns)
+                .latency_sli(
+                    series_req(format!("{fam}{}", photon_query::LATENCY_METRIC), Agg::Count),
+                    bound_ns,
+                )
                 .await?;
             let mut good = 0.0;
             let mut total = 0.0;
@@ -1260,7 +1263,7 @@ mod budget_tests {
         let points: Vec<MetricPoint> = (0..10)
             .map(|i| {
                 duration(
-                    "photon.service.duration",
+                    "photon.service.latency",
                     NOW - 86_400 * SEC + (i * 86_400 * SEC) / 10,
                     90,
                     10,
@@ -1291,7 +1294,7 @@ mod budget_tests {
         let points: Vec<MetricPoint> = (0..10)
             .map(|i| {
                 duration(
-                    "photon.service.duration",
+                    "photon.service.latency",
                     NOW - 86_400 * SEC + (i * 86_400 * SEC) / 10,
                     90,
                     10,

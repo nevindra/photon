@@ -3,6 +3,7 @@
 //!
 //! Its place in the crate graph is described in `docs/architecture.md`.
 
+mod align;
 mod compactor;
 mod metrics_compactor;
 mod span_compactor;

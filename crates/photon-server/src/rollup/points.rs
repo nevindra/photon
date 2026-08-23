@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use photon_core::metric_record::MetricPoint;
 use photon_core::metric_schema;
-use photon_query::{RedBasis, RollupRow, LATENCY_BOUNDS_NS};
+use photon_query::{RedBasis, RollupRow, LATENCY_BOUNDS_NS, LATENCY_METRIC};
 
 /// The two metric families this module emits, one per level. They are deliberately NOT the same
 /// name distinguished by an `operation` attribute: `metric_query`'s bucket fold is `sum(value)`
@@ -23,6 +23,9 @@ use photon_query::{RedBasis, RollupRow, LATENCY_BOUNDS_NS};
 /// Both are reserved: an operator's own metric under either prefix would be indistinguishable
 /// from a rollup series.
 pub const SERVICE_PREFIX: &str = "photon.service.";
+/// The per-service request counter — the one series every rolled-up bucket emits, so "does this
+/// window already hold rollup points" can be answered by asking about this name alone.
+pub const REQUESTS_METRIC: &str = "photon.service.requests";
 pub const OPERATION_PREFIX: &str = "photon.operation.";
 
 /// The family a row belongs to, by level.
@@ -48,11 +51,20 @@ const TEMPORALITY_DELTA: i32 = 1;
 pub const ATTR_SERVICE: &str = "service.name";
 pub const ATTR_ENVIRONMENT: &str = "deployment.environment";
 pub const ATTR_OPERATION: &str = "operation";
+/// The Site a mirrored service belongs to. Only set on rows Central rolled up itself; a Site's
+/// own pushed rollup carries the same label from the federation egress path.
+pub const ATTR_TENANT: &str = "tenant";
 
 /// The identifying attributes for one row, in the order the schema wants them.
 fn attrs(row: &RollupRow) -> BTreeMap<String, String> {
     let mut a = BTreeMap::new();
     a.insert(ATTR_SERVICE.to_string(), row.service.clone());
+    if let Some(tenant) = &row.tenant {
+        // Present only when Central rolled up a Site's mirrored spans itself. It is the same
+        // `tenant` label a Site's own pushed rollup carries, and `services_rollup::CARRIED_KEYS`
+        // already lists it, so both arrive at the read path identically.
+        a.insert(ATTR_TENANT.to_string(), tenant.clone());
+    }
     if let Some(env) = &row.environment {
         // Omitted rather than emitted as "" when the service never set it: an empty-string
         // environment would look like a real one in the picker.
@@ -94,6 +106,38 @@ fn sum_point(
     }
 }
 
+/// The one latency histogram a bucket publishes, or `None` when the bucket measured nothing.
+///
+/// Split out of [`points_for`] because it is also published *alone*, by the ladder repair: when
+/// [`photon_query::LATENCY_METRIC`] is renamed (which is what a renumbering of
+/// `LATENCY_BOUNDS_NS` costs), the already-covered range holds counters that are still correct
+/// and a histogram under a name nothing reads any more. Republishing the counters alongside it
+/// would double every one of them; republishing this point alone is close to free, because a
+/// quantile is scale-invariant — a bucket whose histogram somehow landed twice reports the same
+/// p50, p90 and p99 as one that landed once.
+pub fn latency_point(row: &RollupRow) -> Option<MetricPoint> {
+    if row.duration_count == 0 {
+        return None;
+    }
+    Some(MetricPoint {
+        metric_name: format!("{}{LATENCY_METRIC}", prefix(row)),
+        metric_type: metric_schema::metric_type::HISTOGRAM,
+        type_text: Some("Histogram".into()),
+        temporality: Some(TEMPORALITY_DELTA),
+        is_monotonic: None,
+        unit: Some("ns".into()),
+        timestamp_nanos: row.ts,
+        start_timestamp_nanos: Some(row.ts),
+        scope_name: Some("photon.rollup".into()),
+        value: None,
+        histogram: Some(histogram_json(row)),
+        exp_histogram: None,
+        summary: None,
+        exemplars: None,
+        attributes: attrs(row),
+    })
+}
+
 /// Every `MetricPoint` one rolled-up bucket publishes.
 ///
 /// A bucket with no requests still emits its counters as zeros — that is what makes "this service
@@ -114,25 +158,7 @@ pub fn points_for(row: &RollupRow) -> Vec<MetricPoint> {
         sum_point("apdex.frustrated", "{requests}", row.frustrated, row, &a),
     ];
 
-    if row.duration_count > 0 {
-        out.push(MetricPoint {
-            metric_name: format!("{}duration", prefix(row)),
-            metric_type: metric_schema::metric_type::HISTOGRAM,
-            type_text: Some("Histogram".into()),
-            temporality: Some(TEMPORALITY_DELTA),
-            is_monotonic: None,
-            unit: Some("ns".into()),
-            timestamp_nanos: row.ts,
-            start_timestamp_nanos: Some(row.ts),
-            scope_name: Some("photon.rollup".into()),
-            value: None,
-            histogram: Some(histogram_json(row)),
-            exp_histogram: None,
-            summary: None,
-            exemplars: None,
-            attributes: a.clone(),
-        });
-    }
+    out.extend(latency_point(row));
 
     // Service level only, and only when the count is NOT plain entry spans. An operation now
     // inherits its service's basis, so publishing it again per operation would be the same fact
@@ -195,6 +221,7 @@ mod tests {
             ts: 1_700_000_000_000_000_000,
             service: "api".into(),
             environment: Some("prod".into()),
+            tenant: None,
             operation: None,
             count: 10,
             span_count: 31,
@@ -268,7 +295,7 @@ mod tests {
 
         assert_eq!(named(&points, "requests").unwrap().value, Some(0.0));
         assert!(
-            named(&points, "duration").is_none(),
+            named(&points, LATENCY_METRIC).is_none(),
             "an empty histogram carries no information"
         );
     }
@@ -277,7 +304,7 @@ mod tests {
     fn the_histogram_matches_the_bounds_the_query_bucketed_by() {
         let r = row();
         let points = points_for(&r);
-        let h = named(&points, "duration").unwrap();
+        let h = named(&points, LATENCY_METRIC).unwrap();
         assert_eq!(h.metric_type, metric_schema::metric_type::HISTOGRAM);
         assert_eq!(h.unit.as_deref(), Some("ns"));
 

@@ -608,6 +608,7 @@ mod tests {
             limit,
             offset,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         }
     }
 

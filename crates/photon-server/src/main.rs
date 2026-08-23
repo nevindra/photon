@@ -94,6 +94,20 @@ const MERGE_EVERY_TICKS: u64 = 5;
 /// Run a whole-file retention purge every Nth compactor tick (~1 hour at COMPACT_INTERVAL 2s).
 const PURGE_EVERY_TICKS: u64 = 1800;
 
+/// Total physical RAM, for auto-sizing the query memory pool. `None` when it cannot be read, in
+/// which case `QueryConfig` falls back to its floor.
+///
+/// Read from `/proc/meminfo` rather than pulling in a system-info crate: this is one number, on
+/// one line, on the platform Photon ships to. Anywhere else it simply returns `None` and the
+/// operator sets `[query].memory_pool_bytes` if the floor is wrong for their box.
+fn total_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    // "MemTotal:       32791236 kB"
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kb.checked_mul(1024)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -121,6 +135,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cloned()
         .or_else(|| std::env::var("PHOTON_CONFIG").ok());
     let cfg = Config::load(explicit)?;
+
+    // Size the one shared DataFusion memory pool before any engine is built — `photon-query`
+    // builds its `RuntimeEnv` lazily on the first query, so this has to land first. See
+    // `photon_core::config::QueryConfig`.
+    let pool_bytes = cfg.query.memory_pool_bytes(total_memory_bytes());
+    photon_query::set_memory_pool_bytes(pool_bytes as usize);
+    eprintln!(
+        "query memory pool: {} MiB{}",
+        pool_bytes / (1024 * 1024),
+        if cfg.query.memory_pool_bytes.is_some() {
+            " (configured)"
+        } else {
+            " (auto-sized from total RAM)"
+        }
+    );
 
     // Shared building blocks.
     let schema = LogSchema::new(&cfg.schema.promoted_attributes);
@@ -556,6 +585,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?));
         let task = rollup::RollupTask::new(
             span_query.clone(),
+            metrics_query.clone(),
             metrics_wal.clone(),
             metric_schema.clone(),
             counters.clone(),

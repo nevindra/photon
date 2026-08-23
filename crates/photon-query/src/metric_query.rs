@@ -9,8 +9,11 @@ use std::collections::BTreeMap;
 
 use arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
-use datafusion::prelude::{cast, col, Expr};
+use datafusion::logical_expr::SortExpr;
+use datafusion::prelude::{cast, col, DataFrame, Expr};
+use futures::StreamExt;
 
 use photon_core::metric_agg::{default_agg, Agg};
 use photon_core::metric_schema;
@@ -45,6 +48,50 @@ pub(crate) const MAX_SERIES: usize = 1000;
 /// response field (already surfaced to the UI for the `MAX_SERIES` truncation) so a caller sees
 /// the same "refine your query" signal either way.
 pub(crate) const MAX_COLLECT_ROWS: usize = 200_000;
+
+/// Collect the first `row_cap + 1` rows of `df` in `sorts` order, bounded in memory whatever the
+/// core count.
+///
+/// The obvious spelling — `.sort(sorts).limit(0, Some(row_cap + 1)).collect()` — bounds nothing.
+/// DataFusion pushes the fetch down into `SortExec` with `preserve_partitioning`, so each of
+/// `target_partitions` partitions builds its own TopK holding `row_cap + 1` rows, and a TopK
+/// cannot spill. On a 16-core box that is 16x the budget the cap names. The three Rust-side
+/// roll-up scans all used it, and a 7-day histogram query died with `Resources exhausted ... for
+/// TopK[6] with 34005380 bytes already allocated for this reservation` while the same query over
+/// 5 days answered in 235 ms — the ceiling was never the row cap, it was the core count.
+/// Coalescing to one partition first does not help: the planner strips a `RepartitionExec` down
+/// to a single partition straight back out.
+///
+/// So drop the fetch and take the rows off the stream instead. A `SortExec` with no fetch is
+/// DataFusion's external sorter, which spills to disk under memory pressure instead of failing,
+/// and pulling `row_cap + 1` rows off the merged stream then dropping it yields exactly what the
+/// fetch would have — the sort order's leading prefix, with the `+ 1` as the overflow trip wire
+/// each caller's row walk reads to set `capped`.
+pub(crate) async fn collect_sorted_prefix(
+    df: DataFrame,
+    sorts: Vec<SortExpr>,
+    row_cap: usize,
+    what: &str,
+) -> Result<Vec<RecordBatch>, PhotonError> {
+    let mut stream = df
+        .sort(sorts)
+        .map_err(|e| PhotonError::Query(format!("{what} sort: {e}")))?
+        .execute_stream()
+        .await
+        .map_err(|e| PhotonError::Query(format!("{what} execute: {e}")))?;
+
+    let mut batches = Vec::new();
+    let mut rows = 0usize;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(|e| PhotonError::Query(format!("{what} collect: {e}")))?;
+        rows += batch.num_rows();
+        batches.push(batch);
+        if rows > row_cap {
+            break;
+        }
+    }
+    Ok(batches)
+}
 
 pub struct MetricSeriesRequest {
     pub metric: String,
@@ -499,22 +546,20 @@ impl MetricsQueryEngine {
             .collect();
         sorts.push(col("__ts").sort(true, false));
 
-        let batches = df
-            .filter(metric_base_predicate(&base))
-            .map_err(|e| PhotonError::Query(format!("pointwise filter: {e}")))?
-            .select(selects)
-            .map_err(|e| PhotonError::Query(format!("pointwise select: {e}")))?
-            .sort(sorts)
-            .map_err(|e| PhotonError::Query(format!("pointwise sort: {e}")))?
-            // Applied AFTER the sort so a truncation keeps a deterministic prefix (the sort
-            // order's leading rows) rather than whatever DataFusion happened to scan first.
-            // `row_cap + 1`: collecting exactly that many rows is the signal that the true
-            // result was larger than `row_cap` (see the row-walk loop below).
-            .limit(0, Some(row_cap + 1))
-            .map_err(|e| PhotonError::Query(format!("pointwise limit: {e}")))?
-            .collect()
-            .await
-            .map_err(|e| PhotonError::Query(format!("pointwise collect: {e}")))?;
+        // The prefix is taken AFTER the sort, so a truncation keeps a deterministic set of rows
+        // (the sort order's leading ones) rather than whatever DataFusion happened to scan first.
+        // `row_cap + 1`: seeing exactly that many rows is the signal that the true result was
+        // larger than `row_cap` (see the row-walk loop below).
+        let batches = collect_sorted_prefix(
+            df.filter(metric_base_predicate(&base))
+                .map_err(|e| PhotonError::Query(format!("pointwise filter: {e}")))?
+                .select(selects)
+                .map_err(|e| PhotonError::Query(format!("pointwise select: {e}")))?,
+            sorts,
+            row_cap,
+            "pointwise",
+        )
+        .await?;
 
         let step_secs = (((end - start).max(1)) as f64 / buckets as f64) / 1e9;
 

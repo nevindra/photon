@@ -189,6 +189,7 @@ pub(crate) fn build_span_query_request(
         limit: limit.min(MAX_LIMIT),
         offset,
         projected_attributes: Vec::new(),
+        required_attributes: Vec::new(),
     })
 }
 

@@ -15,7 +15,7 @@ they are. See [`docs/adr/0002`](../adr/0002-red-rollups-are-published-as-metrics
 | `crates/photon-query/src/red_rollup.rs` | The query: `SpanQueryEngine::red_rollup` → `RollupPass` |
 | `crates/photon-server/src/rollup/mod.rs` | The pass loop, window arithmetic, cardinality logging |
 | `crates/photon-server/src/rollup/points.rs` | `RollupRow` → `MetricPoint`s (the wire contract) |
-| `crates/photon-server/src/rollup/watermark.rs` | The published-through marker, in control-plane SQLite |
+| `crates/photon-server/src/rollup/watermark.rs` | The published-through marker + the latency-ladder row, in control-plane SQLite |
 | `crates/photon-server/src/rollup/otlp.rs` | `MetricPoint` → OTLP, for shipping to a federation central |
 | `crates/photon-api/src/services_rollup.rs` | The **read** side: when to trust the rollup, and how to read it |
 | `crates/photon-server/tests/rollup.rs` | Spans in, metrics out, read back through the metrics engine |
@@ -32,7 +32,7 @@ it) `deployment.environment`; the operation family additionally carries `operati
 | `photon.service.errors` | Sum, delta | `{errors}` | Entry spans with `status_code == 2` |
 | `photon.service.http_4xx` / `.http_5xx` | Sum, delta | `{responses}` | By HTTP status class |
 | `photon.service.apdex.satisfied` / `.tolerating` / `.frustrated` | Sum, delta | `{requests}` | Apdex bands |
-| `photon.service.duration` | Histogram, delta | `ns` | Explicit-bucket latency distribution |
+| `photon.service.latency` | Histogram, delta | `ns` | Explicit-bucket latency distribution |
 | `photon.service.basis` | Gauge | `1` | Present only when the count is **not** entry spans |
 
 `photon.operation.*` mirrors all of the above except `basis`, which is a service-level fact.
@@ -86,6 +86,67 @@ collector retry storm; raising it delays every Backend page's rollup-backed view
 one bucket. The alternative — marking first — would drop a bucket that was actually written, and a
 silent hole is harder to notice than a single doubled minute.
 
+## It backfills its own history on first run
+
+Without a backfill the rollup can only describe the future, and that is not the state most installs
+start in. A fresh control-plane DB over an existing hot tier, an upgrade from a build without the
+rollup, a node re-seeded from a replica — each has months of spans on disk and reports no coverage
+for any of it, so every Backend page over a window wider than "since we started" falls back to
+scanning raw spans. That fallback is correct and it is slow in exactly the way the rollup exists to
+prevent: measured on 300M spans, `/api/services/overview` took 23.1 s over 7 days and 3.4 s over
+24 hours from spans, against 63 ms off the rollup.
+
+So a first run reaches `backfill_days` back (default 30, matching the default `[retention].days`)
+and walks forward, one `CATCH_UP_SLICE_SECS` (1 hour) slice at a time, writing the watermark after
+each. It is resumable — a restart mid-catch-up continues where it stopped — and bounded by what is
+on disk, since slices whose spans have aged out prune to nothing and cost a manifest lookup.
+
+The default is deliberately **not** "the widest window the UI offers". Coverage starts at
+`now - backfill_days` and the widest built-in window *ends* at now, so sizing the two the same puts
+every 7-day query exactly on the boundary: a query starting a minute earlier than coverage is
+ineligible and silently falls back to a raw scan. Over-reaching is cheap; under-reaching is not.
+
+The slice cap is the other half. A pass reads raw spans, so an uncapped catch-up after a long
+outage would put a single multi-day span scan on the read path and write one enormous metrics
+batch.
+
+## The latency ladder, and repairing a rename
+
+`LATENCY_BOUNDS_NS` is a wire contract (see below), so renumbering it requires renaming
+`photon_query::LATENCY_METRIC` in the same change. That is how the old 10s ladder was retired: it
+topped out at 10s, so every span slower than that landed in the `+Inf` overflow bucket and the
+quantile read interpolated at the top bound — a service whose real p50 was two minutes reported
+**exactly 10.000 s**, silently, with nothing marking the number as a floor. The ladder now runs to
+30 minutes in 19 buckets, and the metric is `photon.service.latency` / `photon.operation.latency`
+(it was `…duration`).
+
+The rename does its job and leaves a second problem behind: every bucket already published still
+carries its histogram under the retired name, so a Backend page over that range shows no
+percentiles at all. `RollupTask::repair_latency` closes that gap. A row in
+`rollup_latency_ladder` records which name the histogram is published under and how much of the
+covered range still has to be republished; when the recorded name does not match the current one
+(including when there is no row at all, which is how an install upgrading from before this
+bookkeeping looks), the whole covered range is queued and republished slice by slice, ahead of the
+forward pass on each tick.
+
+**Only the histogram is republished.** The counters under those buckets are still correct, and
+re-emitting them would double every one of them. The histogram is exempt from the publish-once rule
+for one specific reason: a quantile is scale-invariant, so a bucket whose histogram somehow landed
+twice reports the same p50, p90 and p99 as one that landed once. What a double landing does change
+is the absolute sample count — which is why the repair records its own progress watermark
+(`repair_from`, forward-only) instead of relying on that safety net.
+
+**The repair ignores tenant coverage, for the same reason.** A forward pass skips any tenant already
+pushing its own rollup (below), because rolling its mirrored spans up beside its own points would
+double every counter. A repair emits no counter, so `Publish::LatencyOnly` rolls up every tenant.
+Without that a federation **central** could not repair at all: it holds a mirrored tenant's spans
+and deliberately never rolls them up, so the repair would find nothing to publish and every Backend
+page for that tenant would show no percentiles until the Site upgraded, repaired and re-pushed.
+Central heals its own history instead. It does **not** heal the present: the forward pass still
+skips covered tenants, so a central whose Site is on the old build has percentiles for the repaired
+range and none after it. Upgrading the Site is the fix; the Site's own repair tees the republished
+histogram to central.
+
 ## Cardinality
 
 Service level is always rolled up in full: services are few and bounded by how many things you run.
@@ -111,14 +172,14 @@ person can click into.
 ## Reading it back
 
 `photon-api/src/services_rollup.rs` is the only reader. It is a shortcut with a raw-span fallback,
-never a source of truth — see
-[`services-apm.md`](services-apm.md) for the three conditions that must all hold before a request is
-answered from the rollup, and for the `source` field every response carries.
+never a source of truth — see [`services-apm.md`](services-apm.md) for the conditions a request must
+meet, the **hybrid split** that reads the covered prefix off the rollup and the unsettled tail off
+raw spans, and the `source` field every response carries.
 
 ## Config
 
 `[rollup]`, all optional. Env: `PHOTON_ROLLUP_ENABLED`, `_INTERVAL_SECS`, `_LAG_SECS`,
-`_TOP_OPERATIONS`.
+`_TOP_OPERATIONS`, `_BACKFILL_DAYS`.
 
 ```toml
 [rollup]
@@ -126,6 +187,7 @@ enabled        = true   # false = never publish; Backend pages then always scan 
 interval_secs  = 60     # floored at 15 — a pass per bucket; faster buys nothing
 lag_secs       = 600    # floored at one bucket
 top_operations = 50     # per (service, environment); 0 = service level only
+backfill_days  = 30     # how far a first run reaches back; 0 = future only
 ```
 
 The bucket width (60s) is **not** configurable. It is baked into every emitted timestamp, and two
@@ -135,8 +197,11 @@ nodes disagreeing about it would make a federated series unreadable.
 
 Change either and you change the meaning of data already on disk.
 
-1. **`LATENCY_BOUNDS_NS`** (`red_rollup.rs`) — the histogram's `explicit_bounds`. A query spanning a
-   change would interpolate across two different ladders. Add a new metric name instead.
+1. **`LATENCY_BOUNDS_NS`** (`red_rollup.rs`) — the histogram's `explicit_bounds`, 19 buckets from
+   1 ms to 30 minutes. A query spanning a change would interpolate across two different ladders,
+   because `metric_dist::accumulate` takes the canonical bounds from the first row it parses and
+   sums positionally from there. Renumbering it means renaming `LATENCY_METRIC` in the same change
+   and letting the repair pass republish the covered range.
 2. **The histogram JSON shape** — the writer (`points.rs`) and the reader (`photon-query`'s
    `HistPayload`) pin it independently; neither imports the other. A renamed field produces an empty
    histogram and a `null` p50 while every unit test on both sides still passes. That is exactly what

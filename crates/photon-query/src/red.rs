@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrame;
-use datafusion::functions::core::expr_fn::get_field;
 use datafusion::functions::string::expr_fn::starts_with;
 use datafusion::functions_aggregate::expr_fn::{approx_percentile_cont, sum};
 use datafusion::prelude::{col, lit, when, Expr};
@@ -28,7 +27,7 @@ use datafusion::prelude::{col, lit, when, Expr};
 use photon_core::span_schema;
 use photon_core::PhotonError;
 
-use crate::span_engine::span_base_predicate;
+use crate::span_engine::{attr_lookup, span_base_predicate, AttrKeys};
 use crate::{col_ref, SpanQueryEngine, SpanQueryRequest};
 
 /// How RED rows are grouped: per operation (service × operation `name`) or rolled up per service.
@@ -124,9 +123,9 @@ impl SpanQueryEngine {
         let env_promoted = promoted.iter().any(|p| p == ENVIRONMENT);
         let status_promoted = promoted.iter().any(|p| p == HTTP_STATUS_CODE);
         let status_legacy_promoted = promoted.iter().any(|p| p == HTTP_STATUS_CODE_LEGACY);
-        match self.span_survivors_df(&req).await? {
+        match self.span_survivors(&req).await? {
             None => Ok(Vec::new()),
-            Some(df) => {
+            Some((df, attr_keys)) => {
                 red_over(
                     df,
                     span_base_predicate(&req),
@@ -137,6 +136,7 @@ impl SpanQueryEngine {
                     env_promoted,
                     status_promoted,
                     status_legacy_promoted,
+                    &attr_keys,
                 )
                 .await
             }
@@ -198,20 +198,79 @@ pub(crate) const HTTP_STATUS_CODE_LEGACY: &str = "http.status_code";
 /// Each key is looked up by its own promoted/map location — the same choice `red_over` makes
 /// below for `tenant`: `span_record` routes a promoted key OUT of the `attributes` map, so a map
 /// lookup on a promoted key reads NULL.
-pub(crate) fn http_status_expr(current_promoted: bool, legacy_promoted: bool) -> Expr {
-    let current = if current_promoted {
-        col_ref(HTTP_STATUS_CODE)
-    } else {
-        get_field(col_ref(span_schema::ATTRIBUTES), HTTP_STATUS_CODE)
-    };
-    let legacy = if legacy_promoted {
-        col_ref(HTTP_STATUS_CODE_LEGACY)
-    } else {
-        get_field(col_ref(span_schema::ATTRIBUTES), HTTP_STATUS_CODE_LEGACY)
-    };
+pub(crate) fn http_status_expr(
+    current_promoted: bool,
+    legacy_promoted: bool,
+    keys: &AttrKeys,
+) -> Expr {
+    let current = attr_lookup(HTTP_STATUS_CODE, current_promoted, keys);
+    let legacy = attr_lookup(HTTP_STATUS_CODE_LEGACY, legacy_promoted, keys);
     when(current.clone().is_not_null(), current)
         .otherwise(legacy)
         .expect("http status coalesce case")
+}
+
+/// Names of the four per-row values every RED aggregate derives from. They are materialised ONCE by
+/// [`with_red_derived`] in a projection ahead of the aggregate, and the aggregate expressions then
+/// reference the resulting columns instead of re-stating the expressions that built them.
+///
+/// This is not tidiness, it is the read path's single biggest cost. Each candidate block below
+/// mentions `http_status` twice, `t_ns` three times and its mask seven times, and `red_over` builds
+/// three candidate blocks — so an inlined `http_status` appears **six** times in one plan, and each
+/// occurrence is two `get_field` probes into the `attributes` map. That map is 63% of a span
+/// Parquet file's bytes and 96% of its *decoded* bytes (133 MB raw against 5.5 MB for every other
+/// column put together), so paying for it once per row instead of six times is worth roughly 6x on
+/// every Backend page. Measured on 86.6M spans: `/api/red` over 24h went 2133 ms → 318 ms, over 7d
+/// 13371 ms → 2050 ms.
+pub(crate) const DERIVED_HTTP: &str = "__red_http_status";
+pub(crate) const DERIVED_T: &str = "__red_apdex_t";
+pub(crate) const DERIVED_ENTRY: &str = "__red_is_entry";
+pub(crate) const DERIVED_ROOT: &str = "__red_is_root";
+
+/// The four derived columns as expressions, ready to hand to `candidate_aggs` / the mask arguments.
+/// Always used together with [`with_red_derived`], which is what puts them on the frame.
+pub(crate) struct RedDerived {
+    pub http_status: Expr,
+    pub t_ns: Expr,
+    pub entry: Expr,
+    pub root: Expr,
+}
+
+impl RedDerived {
+    pub(crate) fn cols() -> Self {
+        Self {
+            http_status: col(DERIVED_HTTP),
+            t_ns: col(DERIVED_T),
+            entry: col(DERIVED_ENTRY),
+            root: col(DERIVED_ROOT),
+        }
+    }
+}
+
+/// Materialise the four derived columns on `df` so the aggregate that follows evaluates each of
+/// them exactly once per row. See [`DERIVED_HTTP`] for why this matters so much.
+pub(crate) fn with_red_derived(
+    df: DataFrame,
+    thresholds: &HashMap<String, u32>,
+    default_ms: u32,
+    status_promoted: bool,
+    status_legacy_promoted: bool,
+    attr_keys: &AttrKeys,
+) -> Result<DataFrame, PhotonError> {
+    fn map_err(what: &'static str) -> impl Fn(datafusion::error::DataFusionError) -> PhotonError {
+        move |e| PhotonError::Query(format!("red derived {what}: {e}"))
+    }
+    df.with_column(
+        DERIVED_HTTP,
+        http_status_expr(status_promoted, status_legacy_promoted, attr_keys),
+    )
+    .map_err(map_err("http status"))?
+    .with_column(DERIVED_T, threshold_ns_expr(thresholds, default_ms))
+    .map_err(map_err("apdex threshold"))?
+    .with_column(DERIVED_ENTRY, entry_mask())
+    .map_err(map_err("entry mask"))?
+    .with_column(DERIVED_ROOT, root_mask())
+    .map_err(map_err("root mask"))
 }
 
 /// The seven COUNTING per-group aggregates for ONE candidate entry set — count, error count, the
@@ -321,10 +380,14 @@ async fn red_over(
     env_promoted: bool,
     status_promoted: bool,
     status_legacy_promoted: bool,
+    attr_keys: &AttrKeys,
 ) -> Result<Vec<RedRow>, PhotonError> {
-    let t_ns = threshold_ns_expr(thresholds, default_ms);
+    // The four per-row values below are materialised as columns before the aggregate (see
+    // `DERIVED_HTTP`) — inlining them here instead puts six copies of the `attributes` map probe
+    // into one plan and costs ~6x on every Backend page.
+    let d = RedDerived::cols();
+    let (t_ns, http_status) = (d.t_ns.clone(), d.http_status.clone());
     let dur = col_ref(span_schema::DURATION);
-    let http_status = http_status_expr(status_promoted, status_legacy_promoted);
 
     // ADR-0003. A service's Requests are its ENTRY spans, not every span it emits: a service that
     // wraps each stage of its own work in an INTERNAL span is not busier than one doing the same
@@ -343,14 +406,14 @@ async fn red_over(
     // queries would put three DataFusion passes on the read path of every Backend page.
     let mut aggs = candidate_aggs(None, &dur, &t_ns, &http_status, "")?;
     aggs.extend(candidate_aggs(
-        Some(&entry_mask()),
+        Some(&d.entry),
         &dur,
         &t_ns,
         &http_status,
         "_e",
     )?);
     aggs.extend(candidate_aggs(
-        Some(&root_mask()),
+        Some(&d.root),
         &dur,
         &t_ns,
         &http_status,
@@ -372,16 +435,8 @@ async fn red_over(
         RedGroup::Service => {
             // `span_record` routes promoted keys OUT of the attributes map into their own column,
             // so a map lookup on a promoted `tenant` reads NULL — pick the lookup by schema.
-            let tenant_expr = if tenant_promoted {
-                col_ref("tenant")
-            } else {
-                get_field(col_ref(span_schema::ATTRIBUTES), "tenant")
-            };
-            let env_expr = if env_promoted {
-                col_ref(ENVIRONMENT)
-            } else {
-                get_field(col_ref(span_schema::ATTRIBUTES), ENVIRONMENT)
-            };
+            let tenant_expr = attr_lookup("tenant", tenant_promoted, attr_keys);
+            let env_expr = attr_lookup(ENVIRONMENT, env_promoted, attr_keys);
             vec![
                 col_ref("service.name").alias("service"),
                 tenant_expr.alias("tenant"),
@@ -390,23 +445,31 @@ async fn red_over(
         }
     };
 
-    let batches = df
+    let filtered = df
         .filter(predicate)
-        .map_err(|e| PhotonError::Query(format!("red filter: {e}")))?
-        .aggregate(group_exprs, aggs)
-        .map_err(|e| PhotonError::Query(format!("red aggregate: {e}")))?
-        .with_column("eff_n", effective_n)
-        .map_err(|e| PhotonError::Query(format!("red effective-count column: {e}")))?
-        .sort(vec![
-            col("eff_n").sort(false, false), // count desc — keep the busiest groups under the cap
-            col("service").sort(true, false), // stable tiebreak
-        ])
-        .map_err(|e| PhotonError::Query(format!("red sort: {e}")))?
-        .limit(0, Some(MAX_RED_GROUPS + 1))
-        .map_err(|e| PhotonError::Query(format!("red limit: {e}")))?
-        .collect()
-        .await
-        .map_err(|e| PhotonError::Query(format!("red collect: {e}")))?;
+        .map_err(|e| PhotonError::Query(format!("red filter: {e}")))?;
+    let batches = with_red_derived(
+        filtered,
+        thresholds,
+        default_ms,
+        status_promoted,
+        status_legacy_promoted,
+        attr_keys,
+    )?
+    .aggregate(group_exprs, aggs)
+    .map_err(|e| PhotonError::Query(format!("red aggregate: {e}")))?
+    .with_column("eff_n", effective_n)
+    .map_err(|e| PhotonError::Query(format!("red effective-count column: {e}")))?
+    .sort(vec![
+        col("eff_n").sort(false, false), // count desc — keep the busiest groups under the cap
+        col("service").sort(true, false), // stable tiebreak
+    ])
+    .map_err(|e| PhotonError::Query(format!("red sort: {e}")))?
+    .limit(0, Some(MAX_RED_GROUPS + 1))
+    .map_err(|e| PhotonError::Query(format!("red limit: {e}")))?
+    .collect()
+    .await
+    .map_err(|e| PhotonError::Query(format!("red collect: {e}")))?;
 
     let mut rows: Vec<RedRow> = Vec::new();
     for b in &batches {
@@ -621,6 +684,7 @@ mod tests {
             limit: 0,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         }
     }
 
@@ -644,6 +708,7 @@ mod tests {
             false,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -681,6 +746,7 @@ mod tests {
             false,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -724,6 +790,7 @@ mod tests {
             false,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -761,6 +828,7 @@ mod tests {
             false,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -783,6 +851,7 @@ mod tests {
             false,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -822,6 +891,7 @@ mod tests {
             false,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -848,6 +918,7 @@ mod tests {
             false,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -881,6 +952,7 @@ mod tests {
             false,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -954,6 +1026,7 @@ mod tests {
             false,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap()

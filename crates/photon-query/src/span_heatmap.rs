@@ -16,7 +16,7 @@
 //!      y-axis the moment one slow outlier entered the window, and a cell would mean something
 //!      different at 10:00 than at 10:05.
 //!   2. It is the same ladder the rollup stores, so a wide-window heatmap can later be answered
-//!      from `photon.service.duration` without changing what a row means.
+//!      from `photon.service.latency` without changing what a row means.
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;

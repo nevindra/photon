@@ -1154,7 +1154,8 @@ export function mockServiceTimeseries(
 // is bimodal on purpose: a fast path and a slow path, which is exactly the case three percentile
 // lines cannot draw, and therefore the case the mock should show.
 const HEATMAP_BOUNDS_NS = [
-  1e6, 2e6, 5e6, 10e6, 20e6, 50e6, 100e6, 200e6, 500e6, 1e9, 2e9, 5e9, 10e9,
+  1e6, 2e6, 5e6, 10e6, 20e6, 50e6, 100e6, 200e6, 500e6, 1e9, 2e9, 5e9, 10e9, 30e9, 60e9,
+  120e9, 300e9, 600e9, 1800e9,
 ]
 
 export function mockLatencyHeatmap(

@@ -447,7 +447,15 @@ fn concat(schema: &SpanSchema, batches: &[RecordBatch]) -> Result<RecordBatch, P
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema.arrow.clone()));
     }
-    concat_batches(&batches[0].schema(), batches).map_err(|e| PhotonError::Arrow(e.to_string()))
+    // Align to the schema THIS process writes, not to whatever the first batch happens to carry.
+    // A merge pass mixes files written at different times, and once `[schema].promoted_attributes`
+    // changed, their schemas no longer matched — see `crate::align`. Aligning an already-matching
+    // batch clones `Arc`s, so the WAL path pays nothing for it.
+    let aligned: Vec<RecordBatch> = batches
+        .iter()
+        .map(|b| crate::align::align_to(b, &schema.arrow))
+        .collect::<Result<_, _>>()?;
+    concat_batches(&schema.arrow, &aligned).map_err(|e| PhotonError::Arrow(e.to_string()))
 }
 
 fn sort_by_service_and_start_time(batch: &RecordBatch) -> Result<RecordBatch, PhotonError> {

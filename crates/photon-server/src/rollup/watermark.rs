@@ -19,7 +19,36 @@ CREATE TABLE IF NOT EXISTS rollup_watermark (
     bucket_ts       INTEGER NOT NULL,
     first_bucket_ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rollup_latency_ladder (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    metric         TEXT    NOT NULL,
+    repair_from    INTEGER NOT NULL,
+    repair_through INTEGER NOT NULL
+);
 "#;
+
+/// What the latency histogram is published under right now, and how much of the already-covered
+/// range still has to be republished under that name.
+///
+/// The ladder (`photon_query::LATENCY_BOUNDS_NS`) is a wire contract: renumbering it changes what
+/// every stored point means, so a renumbering comes with a rename (`LATENCY_METRIC`). The rename
+/// is what this row tracks — it is how a running install notices that the points it wrote under
+/// the old name are now unreadable, and republishes the histogram for that range.
+///
+/// `repair_from >= repair_through` means there is nothing left to do, which is also the state of
+/// a fresh install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LadderState {
+    pub metric: String,
+    pub repair_from: i64,
+    pub repair_through: i64,
+}
+
+impl LadderState {
+    pub fn pending(&self) -> bool {
+        self.repair_from < self.repair_through
+    }
+}
 
 fn err<E: std::fmt::Display>(e: E) -> PhotonError {
     PhotonError::Io(e.to_string())
@@ -91,6 +120,59 @@ impl Watermark {
         .map_err(err)?;
         Ok(())
     }
+
+    /// The recorded latency-metric name and repair progress, or `None` before the first pass has
+    /// ever recorded one.
+    pub fn ladder(&self) -> Result<Option<LadderState>, PhotonError> {
+        let conn = self.conn.lock().map_err(|e| err(e.to_string()))?;
+        conn.query_row(
+            "SELECT metric, repair_from, repair_through FROM rollup_latency_ladder WHERE id = 1",
+            [],
+            |r| {
+                Ok(LadderState {
+                    metric: r.get(0)?,
+                    repair_from: r.get(1)?,
+                    repair_through: r.get(2)?,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(err(other)),
+        })
+    }
+
+    /// Replace the ladder row outright. Unlike [`write`](Self::write) this has no monotonic guard:
+    /// a rename legitimately resets the repair range, and the range it resets to is decided by the
+    /// caller from the watermark it just read.
+    pub fn set_ladder(&self, state: &LadderState) -> Result<(), PhotonError> {
+        let conn = self.conn.lock().map_err(|e| err(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO rollup_latency_ladder (id, metric, repair_from, repair_through)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                 metric         = excluded.metric,
+                 repair_from    = excluded.repair_from,
+                 repair_through = excluded.repair_through",
+            rusqlite::params![state.metric, state.repair_from, state.repair_through],
+        )
+        .map_err(err)?;
+        Ok(())
+    }
+
+    /// Record that the repair has republished everything below `from`. Only ever moves forwards —
+    /// a slice that somehow resumed earlier must not rewind progress and re-read spans already
+    /// covered.
+    pub fn advance_repair(&self, from: i64) -> Result<(), PhotonError> {
+        let conn = self.conn.lock().map_err(|e| err(e.to_string()))?;
+        conn.execute(
+            "UPDATE rollup_latency_ladder SET repair_from = max(repair_from, ?1) WHERE id = 1",
+            [from],
+        )
+        .map_err(err)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -144,5 +226,57 @@ mod tests {
             Some((3_000, 6_000)),
             "a backfill lowers the floor; it must not raise it"
         );
+    }
+
+    #[test]
+    fn a_fresh_install_has_no_ladder_row() {
+        assert_eq!(mem().ladder().unwrap(), None);
+    }
+
+    #[test]
+    fn the_ladder_row_round_trips_and_the_repair_only_moves_forwards() {
+        let w = mem();
+        w.set_ladder(&LadderState {
+            metric: "latency".into(),
+            repair_from: 1_000,
+            repair_through: 5_000,
+        })
+        .unwrap();
+        let s = w.ladder().unwrap().unwrap();
+        assert!(s.pending());
+
+        w.advance_repair(3_000).unwrap();
+        assert_eq!(w.ladder().unwrap().unwrap().repair_from, 3_000);
+        w.advance_repair(2_000).unwrap();
+        assert_eq!(
+            w.ladder().unwrap().unwrap().repair_from,
+            3_000,
+            "rewinding would re-read spans the repair already covered"
+        );
+
+        w.advance_repair(5_000).unwrap();
+        assert!(!w.ladder().unwrap().unwrap().pending());
+    }
+
+    #[test]
+    fn a_rename_resets_the_repair_range_rather_than_merging_with_it() {
+        // `write`'s monotonic guards are right for coverage and wrong here: the whole point of a
+        // rename is that the previously-repaired range no longer counts.
+        let w = mem();
+        w.set_ladder(&LadderState {
+            metric: "latency".into(),
+            repair_from: 9_000,
+            repair_through: 9_000,
+        })
+        .unwrap();
+        w.set_ladder(&LadderState {
+            metric: "latency_v2".into(),
+            repair_from: 1_000,
+            repair_through: 9_000,
+        })
+        .unwrap();
+        let s = w.ladder().unwrap().unwrap();
+        assert_eq!(s.metric, "latency_v2");
+        assert_eq!((s.repair_from, s.repair_through), (1_000, 9_000));
     }
 }

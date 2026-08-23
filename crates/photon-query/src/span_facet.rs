@@ -164,6 +164,7 @@ mod tests {
             limit: 500,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         }
     }
 

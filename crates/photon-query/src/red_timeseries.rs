@@ -22,7 +22,7 @@ use crate::red::{
     candidate_aggs, entry_mask, http_status_expr, root_mask, RedBasis, HTTP_STATUS_CODE,
     HTTP_STATUS_CODE_LEGACY,
 };
-use crate::span_engine::span_base_predicate;
+use crate::span_engine::{span_base_predicate, AttrKeys};
 use crate::{col_ref, SpanQueryEngine, SpanQueryRequest};
 
 /// One time bucket of RED metrics + Apdex band counts for a single service's spans. `ts` is the
@@ -74,9 +74,9 @@ impl SpanQueryEngine {
         let promoted = self.promoted_attributes();
         let status_promoted = promoted.iter().any(|p| p == HTTP_STATUS_CODE);
         let status_legacy_promoted = promoted.iter().any(|p| p == HTTP_STATUS_CODE_LEGACY);
-        match self.span_survivors_df(&req).await? {
+        match self.span_survivors(&req).await? {
             None => Ok(empty_buckets(start, end, buckets)),
-            Some(df) => {
+            Some((df, attr_keys)) => {
                 red_over_time(
                     df,
                     span_base_predicate(&req),
@@ -86,6 +86,7 @@ impl SpanQueryEngine {
                     threshold_ms,
                     status_promoted,
                     status_legacy_promoted,
+                    &attr_keys,
                 )
                 .await
             }
@@ -141,6 +142,7 @@ async fn red_over_time(
     threshold_ms: u32,
     status_promoted: bool,
     status_legacy_promoted: bool,
+    attr_keys: &AttrKeys,
 ) -> Result<Vec<RedBucket>, PhotonError> {
     let width = bucket_width(start, end, buckets);
 
@@ -162,7 +164,7 @@ async fn red_over_time(
     const MS: i64 = 1_000_000;
     let t_ns = lit(threshold_ms as i64 * MS);
     let dur = col_ref(span_schema::DURATION);
-    let http_status = http_status_expr(status_promoted, status_legacy_promoted);
+    let http_status = http_status_expr(status_promoted, status_legacy_promoted, attr_keys);
 
     // ADR-0003's entry-set cascade, borrowed whole from `crate::red` so the table and the chart
     // can never disagree on what a request is: all three candidate sets are aggregated side by
@@ -425,6 +427,7 @@ mod tests {
             limit: 0,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         }
     }
 
@@ -445,6 +448,7 @@ mod tests {
             500,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -474,6 +478,7 @@ mod tests {
             500,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -497,6 +502,7 @@ mod tests {
             500,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -519,6 +525,7 @@ mod tests {
             500,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -544,6 +551,7 @@ mod tests {
             limit: 0,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         };
         let out = engine
             .red_timeseries(req, 0, 100, 10_000_000, 500)
@@ -610,6 +618,7 @@ mod tests {
             500,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap()
@@ -859,6 +868,7 @@ mod tests {
             500,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();
@@ -883,6 +893,7 @@ mod tests {
             500,
             false,
             false,
+            &AttrKeys::Unknown,
         )
         .await
         .unwrap();

@@ -165,6 +165,9 @@ async fn rig_with_tee(
     let settings: Arc<dyn SettingsStore> = Arc::new(SqliteSettingsStore::open(&db_path).unwrap());
     let task = RollupTask::new(
         SpanQueryEngine::new(hot.clone(), span_schema).unwrap(),
+        // Read side. The pass uses it to find out what a previous life already published, and in
+        // this rig there is no previous life — `backfill_days = 0` keeps it off the tested path.
+        MetricsQueryEngine::new(hot.clone(), metric_schema.clone()).unwrap(),
         metrics_wal.clone(),
         metric_schema.clone(),
         Arc::new(IngestCounters::new()),
@@ -173,6 +176,9 @@ async fn rig_with_tee(
         RollupConfig {
             lag_secs: LAG_SECS,
             top_operations,
+            // No backfill. The rig drives the clock itself and asserts on specific buckets; a
+            // first pass that reached 30 days back would spend every slice on empty time.
+            backfill_days: 0,
             ..Default::default()
         },
         &db_path,
@@ -338,7 +344,7 @@ async fn the_published_histogram_re_quantizes_through_the_metrics_engine() {
     // This is the assertion the whole file exists for: a renamed or retyped field in the emitted
     // histogram JSON makes this `None` while every unit test on both sides still passes.
     let p50 = rig
-        .read(&engine, "photon.service.duration", Agg::P50)
+        .read(&engine, "photon.service.latency", Agg::P50)
         .await
         .expect("the histogram must be readable, not an empty payload");
     // 7 of 10 requests took 3ms, so the median sits in the (2ms, 5ms] bucket. Interpolation puts
@@ -349,7 +355,7 @@ async fn the_published_histogram_re_quantizes_through_the_metrics_engine() {
     );
 
     let p99 = rig
-        .read(&engine, "photon.service.duration", Agg::P99)
+        .read(&engine, "photon.service.latency", Agg::P99)
         .await
         .unwrap();
     assert!(
@@ -380,6 +386,111 @@ async fn a_settled_bucket_is_published_once_and_never_recomputed() {
         rig.read(&engine, "photon.service.requests", Agg::Sum).await,
         Some(10.0),
         "10, not 20 or 30"
+    );
+}
+
+#[tokio::test]
+async fn the_ladder_repair_republishes_the_histogram_and_leaves_the_counters_alone() {
+    let rig = rig(traffic(), 10).await;
+    rig.task
+        .run_once(rig.now_after_the_bucket_settles())
+        .await
+        .unwrap();
+
+    // No ladder row has ever been recorded, which is exactly the state of an install upgrading
+    // from before this bookkeeping existed: everything already covered was measured against the
+    // old bounds and published under the retired name, so the whole covered range is repaired.
+    rig.task.repair_latency().await;
+
+    let engine = rig.metrics_engine().await;
+    assert_eq!(
+        rig.read(&engine, "photon.service.requests", Agg::Sum).await,
+        Some(10.0),
+        "the repair must not re-emit counters — the reader sums a bucket, so 10 would become 20"
+    );
+    assert_eq!(
+        rig.read(&engine, "photon.service.errors", Agg::Sum).await,
+        Some(1.0)
+    );
+    assert_eq!(
+        rig.read(&engine, "photon.service.apdex.satisfied", Agg::Sum)
+            .await,
+        Some(9.0)
+    );
+
+    // A real rename lands the repaired histogram under a name that holds nothing, so nothing
+    // overlaps. This rig cannot stage that — the forward pass already used the current name — so
+    // what it actually reproduces is the crash case: a slice republished after dying between the
+    // write and `advance_repair`. The bucket then holds 20 samples where 10 happened.
+    assert_eq!(
+        rig.read(&engine, "photon.service.latency", Agg::Count)
+            .await,
+        Some(20.0),
+        "the histogram landed twice in this one bucket"
+    );
+    let p50 = rig
+        .read(&engine, "photon.service.latency", Agg::P50)
+        .await
+        .unwrap();
+    assert!(
+        p50 > 2.0 * MS as f64 && p50 <= 5.0 * MS as f64,
+        "and it is survivable because a quantile is scale-invariant: 20 samples of the same shape \
+         read the same p50 as 10, so p50 {p50}ns still lands in the (2ms, 5ms] bucket"
+    );
+}
+
+#[tokio::test]
+async fn a_repaired_range_is_never_repaired_again() {
+    let rig = rig(traffic(), 10).await;
+    rig.task
+        .run_once(rig.now_after_the_bucket_settles())
+        .await
+        .unwrap();
+
+    rig.task.repair_latency().await;
+    // The name now matches what the ladder row records, and the range is marked done. Neither of
+    // the next two ticks has anything to redo.
+    rig.task.repair_latency().await;
+    rig.task.repair_latency().await;
+
+    let engine = rig.metrics_engine().await;
+    assert_eq!(
+        rig.read(&engine, "photon.service.latency", Agg::Count)
+            .await,
+        Some(20.0),
+        "one forward pass plus one repair — not one per tick, which would grow without bound"
+    );
+    assert_eq!(
+        rig.read(&engine, "photon.service.requests", Agg::Sum).await,
+        Some(10.0)
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_install_has_nothing_to_repair() {
+    let rig = rig(traffic(), 10).await;
+
+    // Nothing published yet, so nothing is sitting under a retired name.
+    rig.task.repair_latency().await;
+    assert!(
+        rig.task
+            .run_once(rig.now_after_the_bucket_settles())
+            .await
+            .unwrap()
+            > 0,
+        "and the repair must not have moved the watermark past the bucket"
+    );
+
+    let engine = rig.metrics_engine().await;
+    assert_eq!(
+        rig.read(&engine, "photon.service.latency", Agg::Count)
+            .await,
+        Some(10.0),
+        "10 samples, so the forward pass wrote the only histogram in this bucket"
+    );
+    assert_eq!(
+        rig.read(&engine, "photon.service.requests", Agg::Sum).await,
+        Some(10.0)
     );
 }
 
@@ -495,6 +606,7 @@ async fn the_rollup_and_the_raw_span_path_report_the_same_numbers() {
                 limit: 0,
                 offset: 0,
                 projected_attributes: Vec::new(),
+                required_attributes: Vec::new(),
             },
             RedGroup::Service,
             &Default::default(),
@@ -525,7 +637,7 @@ async fn the_rollup_and_the_raw_span_path_report_the_same_numbers() {
     // Percentiles are the one place exact equality is the wrong bar: raw uses a t-digest, the
     // rollup interpolates a 13-bucket histogram. They must agree on the bucket, not the value.
     let rollup_p50 = rig
-        .read(&engine, "photon.service.duration", Agg::P50)
+        .read(&engine, "photon.service.latency", Agg::P50)
         .await
         .unwrap();
     assert!(
@@ -566,7 +678,7 @@ async fn a_federated_site_ships_its_rollup_to_central() {
         .map(|m| m.name.clone())
         .collect();
     assert!(names.iter().any(|n| n == "photon.service.requests"));
-    assert!(names.iter().any(|n| n == "photon.service.duration"));
+    assert!(names.iter().any(|n| n == "photon.service.latency"));
     assert!(
         names.iter().any(|n| n == "photon.operation.requests"),
         "central needs the operation level too, or a Site's endpoints are invisible there"

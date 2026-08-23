@@ -25,6 +25,8 @@ pub struct Config {
     #[serde(default)]
     pub rollup: RollupConfig,
     #[serde(default)]
+    pub query: QueryConfig,
+    #[serde(default)]
     pub federation: Option<FederationConfig>,
 }
 
@@ -282,6 +284,23 @@ pub struct RollupConfig {
     /// which is correct but slower over wide windows.
     #[serde(default = "RollupConfig::default_enabled")]
     pub enabled: bool,
+    /// How far back a first run reaches to publish buckets for spans that are already on disk.
+    /// `0` disables the backfill and the rollup only ever covers time from its first start.
+    ///
+    /// Without this the rollup could only describe the future. Every install with existing data —
+    /// a fresh control-plane DB over a restored hot tier, an upgrade from a build without the
+    /// rollup, a node re-seeded from a replica — reported no coverage for its own history, so
+    /// every Backend page over a window wider than "since we started" silently fell back to
+    /// scanning raw spans. That fallback is correct and it is slow in exactly the way the rollup
+    /// exists to prevent: on 300M spans, `/api/services/overview` took 23.1 s over 7 days and
+    /// 3.4 s over 24 hours, against 63 ms off the rollup.
+    ///
+    /// The catch-up walks forward one [`RollupConfig::CATCH_UP_SLICE_SECS`] slice at a time,
+    /// writing the watermark after each, so it is resumable and a restart mid-catch-up does not
+    /// restart it. It is bounded by what is on disk: slices whose spans have aged out of retention
+    /// prune to nothing and cost a manifest lookup.
+    #[serde(default = "RollupConfig::default_backfill_days")]
+    pub backfill_days: u64,
 }
 impl RollupConfig {
     /// One pass per bucket. Anything faster re-derives the same numbers.
@@ -290,8 +309,26 @@ impl RollupConfig {
     /// timestamp, and two nodes disagreeing about it would make a federated series unreadable.
     pub const BUCKET_SECS: u64 = 60;
 
+    /// The widest span of time one pass rolls up. A pass reads raw spans, so an uncapped one
+    /// after a long outage (or on a first run with a backfill horizon) would put a single
+    /// multi-day span scan on the read path and write one enormous metrics batch. Capping it
+    /// costs more passes, which is what passes are for.
+    pub const CATCH_UP_SLICE_SECS: i64 = 3600;
+
     fn default_interval_secs() -> u64 {
         60
+    }
+    /// A month, matching the default `[retention].days`: the rollup can then answer every window
+    /// whose data this node still holds.
+    ///
+    /// Deliberately NOT "the widest window the UI offers". Coverage starts at `now - backfill_days`
+    /// and the widest built-in window ENDS at now, so sizing the two the same puts every 7-day
+    /// query exactly on the boundary — a query starting a minute earlier than coverage is
+    /// ineligible and silently falls back to a raw span scan. The backfill must reach further back
+    /// than the windows it is meant to serve. Slices with no data left prune to nothing and cost a
+    /// manifest lookup, so over-reaching is cheap and under-reaching is not.
+    fn default_backfill_days() -> u64 {
+        30
     }
     fn default_lag_secs() -> u64 {
         600
@@ -321,6 +358,54 @@ impl Default for RollupConfig {
             lag_secs: Self::default_lag_secs(),
             top_operations: Self::default_top_operations(),
             enabled: Self::default_enabled(),
+            backfill_days: Self::default_backfill_days(),
+        }
+    }
+}
+
+/// `[query]` — optional. Tunes the read path's one global resource: the DataFusion memory pool
+/// every query engine shares (`photon_query::session`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryConfig {
+    /// Ceiling, in bytes, on the memory ALL concurrent queries may hold at once — not a per-query
+    /// allowance. Omit (the default) to size it from the machine: a quarter of total RAM, clamped
+    /// to [`QueryConfig::MIN_MEMORY_POOL_BYTES`]..=[`QueryConfig::MAX_MEMORY_POOL_BYTES`], falling
+    /// back to the floor when total RAM cannot be read.
+    ///
+    /// It used to be a hard-coded 512 MiB regardless of the host, which is the wrong shape for a
+    /// number that has to cover a whole machine's read path: it was generous on a 2 GB VM and
+    /// absurd on a 30 GB server, where a 7-day histogram query failed with "Resources exhausted"
+    /// while the box had 21 GB free.
+    ///
+    /// Raising this does not make an unbounded query safe — spillable operators (sorts, grouped
+    /// aggregations) degrade to disk at their fair share of the pool, and the pool stays the loud
+    /// backstop for the unspillable ones. It sets how much work fits in RAM before either happens.
+    #[serde(default)]
+    pub memory_pool_bytes: Option<u64>,
+}
+
+impl QueryConfig {
+    /// Never size the pool below this. Under ~256 MiB, ordinary dashboard fan-out spills on every
+    /// query and the read path is slow for no benefit.
+    pub const MIN_MEMORY_POOL_BYTES: u64 = 256 * 1024 * 1024;
+    /// Never size the pool above this without being told to. Photon shares the box with whatever
+    /// it is monitoring; taking 16 GB on a 64 GB host because we can is not a default.
+    pub const MAX_MEMORY_POOL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    /// Fraction of total RAM the auto-sized pool takes.
+    pub const MEMORY_POOL_RAM_DIVISOR: u64 = 4;
+
+    /// The pool size to use, given the machine's total RAM (`None` when it cannot be read).
+    /// An explicit `memory_pool_bytes` wins outright — including a deliberately small one, which
+    /// is how you pin a low-memory node — otherwise auto-size and clamp.
+    pub fn memory_pool_bytes(&self, total_ram_bytes: Option<u64>) -> u64 {
+        if let Some(explicit) = self.memory_pool_bytes {
+            return explicit.max(1);
+        }
+        match total_ram_bytes {
+            Some(total) => (total / Self::MEMORY_POOL_RAM_DIVISOR)
+                .clamp(Self::MIN_MEMORY_POOL_BYTES, Self::MAX_MEMORY_POOL_BYTES),
+            None => Self::MIN_MEMORY_POOL_BYTES,
         }
     }
 }
@@ -482,6 +567,12 @@ impl Config {
         }
         if let Some(v) = get("PHOTON_ROLLUP_TOP_OPERATIONS") {
             self.rollup.top_operations = parse_var("PHOTON_ROLLUP_TOP_OPERATIONS", &v)?;
+        }
+        if let Some(v) = get("PHOTON_ROLLUP_BACKFILL_DAYS") {
+            self.rollup.backfill_days = parse_var("PHOTON_ROLLUP_BACKFILL_DAYS", &v)?;
+        }
+        if let Some(v) = get("PHOTON_QUERY_MEMORY_POOL_BYTES") {
+            self.query.memory_pool_bytes = Some(parse_var("PHOTON_QUERY_MEMORY_POOL_BYTES", &v)?);
         }
         // Durable tier: presence of the endpoint is the toggle. bucket/region are then
         // required (env, or inherited from a base file's [storage.durable]); keys optional.

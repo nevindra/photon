@@ -115,13 +115,18 @@ pub use service_map::{MapEdge, MapNode, ServiceMap};
 mod red_timeseries;
 pub use red_timeseries::RedBucket;
 
+mod red_spark;
+pub use red_spark::{RedSeriesKey, SparkPoint};
+
 mod red_rollup;
-pub use red_rollup::{RollupPass, RollupRow, LATENCY_BOUNDS_NS, OTHER_OPERATION};
+pub use red_rollup::{RollupPass, RollupRow, LATENCY_BOUNDS_NS, LATENCY_METRIC, OTHER_OPERATION};
 
 mod span_search;
 
 mod trace_list;
-pub use trace_list::{TraceSearchResult, TraceSummary};
+pub use trace_list::{
+    TraceSearchResult, TraceSummary, MAX_CANDIDATE_TRACES as MAX_ROLLED_UP_TRACES,
+};
 
 /// Manifest-derived storage summary for one signal (no data scan). `bytes` is the on-disk
 /// size of the Parquet files (skip-index sidecars excluded); an empty manifest yields zeros.
@@ -812,8 +817,9 @@ pub(crate) fn col_ref(name: &str) -> Expr {
 /// Its `RuntimeEnv` — and therefore its **bounded** [`FairSpillPool`]
 /// (`QUERY_MEMORY_POOL_BYTES`) — is a single *process-wide* instance shared by every `session()`
 /// call (see [`shared_runtime`]). Only the `SessionConfig` above is freshly built per session; the
-/// runtime/pool is not. So the 512 MiB ceiling is an **aggregate cap across ALL concurrent
-/// queries**, not a per-query allowance. This matters because opening the UI dashboard fans out
+/// runtime/pool is not. So the ceiling ([`set_memory_pool_bytes`], or [`QUERY_MEMORY_POOL_BYTES`]
+/// when nothing set one) is an **aggregate cap across ALL concurrent queries**, not a per-query
+/// allowance. This matters because opening the UI dashboard fans out
 /// ~10 queries at once: with a fresh pool per session each would carry its own 512 MiB budget,
 /// making aggregate query memory additive and effectively unbounded (N × 512 MiB); one shared pool
 /// puts a hard lid on the sum regardless of fan-out.
@@ -835,22 +841,41 @@ pub(crate) fn session() -> SessionContext {
     session_with_runtime(shared_runtime())
 }
 
-/// Process-wide DataFusion memory-pool budget, in bytes, shared (and fairly divided) across every
-/// concurrent query. 512 MiB: generous enough that any legitimate query working set fits (the whole
-/// `photon-query` test suite runs real queries on KB-scale data, orders of magnitude below this) yet
-/// small enough that even the full dashboard fan-out can't OOM a low-memory single node. There is no
-/// per-deployment config seam yet, so this is a deliberate constant for this pass; a future change
-/// could thread a configurable `[query].memory_pool_bytes` through the runtime.
+/// The pool size used when nothing configured one — the old hard-coded constant, kept as the
+/// fallback so a caller that never calls [`set_memory_pool_bytes`] (every test, and any embedder)
+/// behaves exactly as before.
 pub(crate) const QUERY_MEMORY_POOL_BYTES: usize = 512 * 1024 * 1024;
+
+/// The configured pool size, set once by `photon-server` at startup from `[query]` and the
+/// machine's RAM (see `photon_core::config::QueryConfig`).
+static CONFIGURED_POOL_BYTES: OnceLock<usize> = OnceLock::new();
+
+/// Set the process-wide query memory-pool budget. Call before the first query; afterwards the
+/// runtime is already built and this is a no-op (it returns `false` so a caller can say so rather
+/// than believe a setting took effect).
+///
+/// It is deliberately a setter rather than a parameter on [`session`]: the pool is one shared
+/// [`FairSpillPool`] for the whole process precisely so the ceiling applies to the *sum* of
+/// concurrent queries, and a per-call parameter would let each caller mint its own budget.
+pub fn set_memory_pool_bytes(bytes: usize) -> bool {
+    CONFIGURED_POOL_BYTES.set(bytes.max(1)).is_ok()
+}
 
 /// The one process-wide [`RuntimeEnv`] (holding the single shared [`FairSpillPool`]) that every
 /// `session()` draws on. Built lazily on first query, then reused for the process lifetime — so the
-/// 512 MiB budget is a cap on the *sum* of all concurrent queries (fairly divided among spillable
+/// budget is a cap on the *sum* of all concurrent queries (fairly divided among spillable
 /// consumers), never per-query.
 fn shared_runtime() -> Arc<RuntimeEnv> {
     static SHARED_RUNTIME: OnceLock<Arc<RuntimeEnv>> = OnceLock::new();
     SHARED_RUNTIME
-        .get_or_init(|| runtime_with_memory_pool_bytes(QUERY_MEMORY_POOL_BYTES))
+        .get_or_init(|| {
+            runtime_with_memory_pool_bytes(
+                CONFIGURED_POOL_BYTES
+                    .get()
+                    .copied()
+                    .unwrap_or(QUERY_MEMORY_POOL_BYTES),
+            )
+        })
         .clone()
 }
 
@@ -885,8 +910,25 @@ pub(crate) fn session_with_runtime(runtime: Arc<RuntimeEnv>) -> SessionContext {
             "datafusion.execution.parquet.schema_force_view_types",
             false,
         )
-        .set_bool("datafusion.execution.parquet.pushdown_filters", true)
-        .set_bool("datafusion.execution.parquet.reorder_filters", true)
+        // OFF, deliberately. Row-level filter pushdown lets the Parquet reader skip decoding rows
+        // the predicate rejects, which is a real saving — and in DataFusion 43 it returns ZERO ROWS,
+        // silently, for any plan carrying a `fetch` (a `LIMIT`) over a file set whose physical
+        // schemas do not all match the declared table schema.
+        //
+        // Photon reads every signal with an explicit schema (`ParquetReadOptions::schema`) because
+        // it must: changing `[schema].promoted_attributes` changes the columns new segments are
+        // written with, so for one retention period a query legitimately spans two layouts. That is
+        // exactly the state this breaks in. Measured on the 120M-span replica, over four surviving
+        // metrics files (two written before a promotion, two after): the same filtered frame
+        // reported 29,819 rows to `count()` and 0 rows to `LIMIT 1`. An aggregate or a sort between
+        // the filter and the limit hides it, because the fetch then never reaches the scan — which
+        // is why only three call sites in this crate ever showed it, and why the symptom was
+        // "this metric does not exist" rather than an error.
+        //
+        // Re-enabling it needs the DataFusion bug fixed upstream first;
+        // `a_fetch_plan_over_mixed_schema_files_still_returns_rows` below is the regression test.
+        .set_bool("datafusion.execution.parquet.pushdown_filters", false)
+        .set_bool("datafusion.execution.parquet.reorder_filters", false)
         .set_usize(
             "datafusion.execution.parquet.metadata_size_hint",
             512 * 1024,
@@ -1015,8 +1057,15 @@ mod session_tests {
             !parquet.schema_force_view_types,
             "Utf8 not Utf8View must be preserved"
         );
-        assert!(parquet.pushdown_filters, "pushdown_filters must stay on");
-        assert!(parquet.reorder_filters, "reorder_filters must stay on");
+        // OFF, and it must stay off until the DataFusion bug is fixed upstream: with pushdown on,
+        // a `LIMIT` over files whose physical schemas differ from the declared table schema returns
+        // zero rows instead of the matching ones. See the comment on the flag itself.
+        assert!(
+            !parquet.pushdown_filters,
+            "pushdown_filters must stay OFF — it silently empties fetch plans over mixed-schema \
+             files, which is the state every `promoted_attributes` change puts a node in"
+        );
+        assert!(!parquet.reorder_filters, "reorder_filters follows pushdown");
         assert_eq!(
             parquet.metadata_size_hint,
             Some(512 * 1024),
@@ -1031,6 +1080,100 @@ mod session_tests {
         assert!(
             res.try_grow(QUERY_MEMORY_POOL_BYTES + 1).is_err(),
             "memory pool must be bounded (reject a reservation above its budget), not unbounded"
+        );
+    }
+
+    /// The reason `pushdown_filters` is off, reproduced in miniature.
+    ///
+    /// Two Parquet files, one written before a `[schema].promoted_attributes` change and one after,
+    /// read together under the promoted schema — the ordinary state of every node for one retention
+    /// period after that setting changes. A `filter → select → LIMIT` over the pair must return the
+    /// matching row. With pushdown on it returns nothing at all: not an error, not a partial
+    /// answer, an empty result that reads as "this metric does not exist". `count()` over the same
+    /// filtered frame stays correct either way, which is what makes the failure so quiet — the
+    /// counters on a Backend page are right while its percentiles are missing.
+    #[tokio::test]
+    async fn a_fetch_plan_over_mixed_schema_files_still_returns_rows() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::prelude::{col, lit, ParquetReadOptions};
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The declared (post-promotion) schema, and the older on-disk one that lacks `tenant`.
+        let wide = Arc::new(Schema::new(vec![
+            Field::new("metric_name", DataType::Utf8, false),
+            Field::new("metric_type", DataType::Int32, false),
+            Field::new("tenant", DataType::Utf8, true),
+        ]));
+        let narrow = Arc::new(Schema::new(vec![
+            Field::new("metric_name", DataType::Utf8, false),
+            Field::new("metric_type", DataType::Int32, false),
+        ]));
+
+        let write = |name: &str, batch: RecordBatch| {
+            let path = dir.path().join(name);
+            let file = std::fs::File::create(&path).unwrap();
+            let mut w = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        // The older file holds a different metric, so it contributes no matching row — exactly the
+        // bloom false-positive that drags a stale-schema file into the survivor set.
+        let old = write(
+            "old.parquet",
+            RecordBatch::try_new(
+                narrow,
+                vec![
+                    Arc::new(StringArray::from(vec!["other.metric"])),
+                    Arc::new(Int32Array::from(vec![1])),
+                ],
+            )
+            .unwrap(),
+        );
+        let new = write(
+            "new.parquet",
+            RecordBatch::try_new(
+                wide.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["wanted.metric"])),
+                    Arc::new(Int32Array::from(vec![2])),
+                    Arc::new(StringArray::from(vec![Some("t1")])),
+                ],
+            )
+            .unwrap(),
+        );
+
+        let ctx = session();
+        let df = ctx
+            .read_parquet(
+                vec![old, new],
+                ParquetReadOptions::default().schema(wide.as_ref()),
+            )
+            .await
+            .unwrap()
+            .filter(col("metric_name").eq(lit("wanted.metric")))
+            .unwrap();
+
+        assert_eq!(
+            df.clone().count().await.unwrap(),
+            1,
+            "the aggregate path is unaffected — this is the number the fetch plan must agree with"
+        );
+        let batches = df
+            .select(vec![col("metric_type")])
+            .unwrap()
+            .limit(0, Some(1))
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 1,
+            "a LIMIT over a mixed-schema file set must return the matching row, not an empty result"
         );
     }
 }

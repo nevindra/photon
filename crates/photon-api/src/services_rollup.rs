@@ -2,7 +2,7 @@
 //! instead of re-scanning raw spans (ADR-0002; the writer is `photon-server/src/rollup/`).
 //!
 //! The rollup is a **shortcut, never the source of truth**. Every read path here has a raw-span
-//! fallback, and [`rollup_eligible`] is deliberately conservative: falling back costs latency,
+//! fallback, and [`rollup_split`] is deliberately conservative: falling back costs latency,
 //! answering off the rollup when it cannot really answer costs correctness. When in doubt, say no.
 //!
 //! Three things make a request ineligible, and only the first is in the plan:
@@ -24,8 +24,8 @@ use photon_core::metric_agg::Agg;
 use photon_core::query::{parse, MetricFieldResolver, MetricResolvedQuery, Query, TermKind};
 use photon_core::PhotonError;
 use photon_query::{
-    MetricSeriesRequest, MetricsQueryEngine, RedBasis, RedBucket, RedGroup, RedRow, SeriesResult,
-    SpanQueryRequest,
+    MetricSeriesRequest, MetricsQueryEngine, RedBasis, RedBucket, RedGroup, RedRow, RedSeriesKey,
+    SeriesResult, SpanQueryRequest, SparkPoint,
 };
 
 use crate::AppState;
@@ -77,6 +77,7 @@ pub(crate) const BUCKET_NS: i64 = 60 * 1_000_000_000;
 ///
 /// `bucket_ns` is the requested resolution for a time-series read, or `None` for the un-bucketed
 /// `/api/red` table (which only needs totals, so any resolution serves).
+#[cfg(test)]
 pub(crate) fn rollup_eligible(
     query: &str,
     start_ns: i64,
@@ -84,22 +85,68 @@ pub(crate) fn rollup_eligible(
     bucket_ns: Option<i64>,
     coverage: RollupCoverage,
 ) -> bool {
-    let Some((first, published_through)) = coverage else {
-        return false;
-    };
-    if start_ns < first || end_ns > published_through {
-        return false;
+    rollup_split(query, start_ns, end_ns, bucket_ns, coverage).is_some()
+}
+
+/// How to answer `[start_ns, end_ns]`: `Some(through)` to read `[start_ns, through]` off the
+/// rollup and `(through, end_ns]` off raw spans, or `None` to read the whole thing raw.
+///
+/// The tail is what this function exists for. A rollup bucket is published once its minute has
+/// closed AND `lag_secs` has passed, so `published_through` always trails `now` by ~11 minutes at
+/// the default settings. The rule used to be `end_ns > published_through → ineligible`, which
+/// reads as caution and behaves as a switch: every window the UI actually asks for ends at NOW, so
+/// the rollup was never once used for a live page. It was built to keep the Backend pages off raw
+/// spans and, in normal use, kept them on it — `/api/services/overview` took 3.4 s over 24 hours
+/// and 24.8 s over 7 days answering from spans, against 24 ms off the rollup.
+///
+/// The caution was right about the failure it named, though: reading only the covered prefix and
+/// calling it the answer would drop the last eleven minutes, which on a chart is a service's
+/// traffic falling off a cliff. So the tail is not dropped, it is read from raw spans — eleven
+/// minutes of spans, next to nothing — and merged in.
+///
+/// Two bounds keep that honest:
+///
+/// * The prefix must be the bulk of the window ([`MIN_ROLLUP_SHARE`]). Below that the tail carries
+///   the answer, and a raw scan of a window that short is fast anyway.
+/// * The window must start inside coverage, and the query must only touch keys the rollup carries.
+pub(crate) fn rollup_split(
+    query: &str,
+    start_ns: i64,
+    end_ns: i64,
+    bucket_ns: Option<i64>,
+    coverage: RollupCoverage,
+) -> Option<i64> {
+    let (first, published_through) = coverage?;
+    if start_ns < first {
+        return None;
+    }
+    let through = published_through.min(end_ns);
+    if through <= start_ns {
+        return None;
+    }
+    let window = (end_ns - start_ns).max(1) as f64;
+    if (through - start_ns) as f64 / window < MIN_ROLLUP_SHARE {
+        return None;
     }
     if bucket_ns.is_some_and(|b| b < BUCKET_NS) {
-        return false;
+        return None;
     }
     match parse(query) {
-        Ok(ast) => query_is_carried(&ast),
+        Ok(ast) if query_is_carried(&ast) => Some(through),
         // An unparseable query is the raw path's problem to report, with its byte offset. Silently
         // treating it as "matches everything" here would answer a broken query with real numbers.
-        Err(_) => false,
+        _ => None,
     }
 }
+
+/// How much of the window the rollup must cover before it is worth splitting the read in two.
+///
+/// At 90%, a 24-hour window may leave ~2.4 hours to raw spans and an hour window is answered
+/// entirely from spans — which is the right trade: the settle lag is a fixed ~11 minutes, so the
+/// share the rollup can cover only gets better as the window widens, and a raw scan of an hour is
+/// already fast (166 ms measured). It also bounds how much of a percentile comes from the prefix
+/// alone; see `merge_tail`.
+const MIN_ROLLUP_SHARE: f64 = 0.9;
 
 /// Every term is a plain (non-negated) equality or existence check on a key the rollup carries.
 ///
@@ -122,7 +169,7 @@ fn query_is_carried(q: &Query) -> bool {
 }
 
 /// Compile an eligible span-grammar query into the equivalent metric filter. Only ever called
-/// after [`rollup_eligible`] said yes, so a resolve failure here is a bug, not user input.
+/// after [`rollup_split`] said yes, so a resolve failure here is a bug, not user input.
 pub(crate) fn metric_filter(
     query: &str,
     promoted: &[String],
@@ -179,11 +226,31 @@ pub(crate) async fn red_rows(
         Some(status) => status.coverage().await.unwrap_or(None),
         None => None,
     };
-    if rollup_eligible(query, start, end, bucket_ns, coverage) {
+    if let Some(through) = rollup_split(query, start, end, bucket_ns, coverage) {
         // A rollup read that errors is not fatal: the raw path can still answer, and a Backend
         // page that works slowly beats one that 500s because a shortcut broke.
-        match red_rows_from_rollup(&state.metrics_query, query, start, end, group).await {
-            Ok(rows) => return Ok((rows, RedSource::Rollup)),
+        match red_rows_from_rollup(&state.metrics_query, query, start, through, group).await {
+            Ok(rows) => {
+                if through >= end {
+                    return Ok((rows, RedSource::Rollup));
+                }
+                // The unsettled tail, from spans. A failure here loses the tail, not the answer —
+                // so report the prefix rather than throwing away a good 23-hour read over the last
+                // eleven minutes.
+                let mut tail_req = req.clone();
+                tail_req.start_ts_nanos = through + 1;
+                match state
+                    .span_query
+                    .red_metrics(tail_req, group, thresholds, default_ms)
+                    .await
+                {
+                    Ok(tail) => return Ok((merge_tail(rows, tail), RedSource::Rollup)),
+                    Err(e) => {
+                        eprintln!("photon-api: rollup tail read failed ({e}) — prefix only");
+                        return Ok((rows, RedSource::Rollup));
+                    }
+                }
+            }
             Err(e) => eprintln!("photon-api: rollup read failed ({e}) — falling back to raw spans"),
         }
     }
@@ -192,6 +259,58 @@ pub(crate) async fn red_rows(
         .red_metrics(req, group, thresholds, default_ms)
         .await?;
     Ok((rows, RedSource::RawSpans))
+}
+
+/// Fold the raw-span tail into the rollup prefix, one series at a time.
+///
+/// Counters add, because they are counts of disjoint sets of spans — the prefix and the tail share
+/// no span. Percentiles do NOT: p99 over the prefix and p99 over the tail cannot be combined into
+/// p99 over both, and there is no third number that would let them be. The prefix's percentiles
+/// stand, which is why [`MIN_ROLLUP_SHARE`] exists — they describe at least 90% of the window, and
+/// the alternative (raw-scanning the whole window for an exact percentile) is the cost this whole
+/// path removes. A series the prefix never saw keeps the tail's percentiles, since they are then
+/// the only ones there are.
+///
+/// `basis` comes from the prefix for the same reason it is resolved once per series rather than
+/// per bucket in `red_rollup`: a series that reported Entry over 23 hours and AllSpans over the
+/// last eleven minutes is one series, not two.
+fn merge_tail(prefix: Vec<RedRow>, tail: Vec<RedRow>) -> Vec<RedRow> {
+    let key = |r: &RedRow| {
+        (
+            r.service.clone(),
+            r.tenant.clone(),
+            r.environment.clone(),
+            r.operation.clone(),
+        )
+    };
+    let mut by_key: BTreeMap<_, RedRow> = prefix.into_iter().map(|r| (key(&r), r)).collect();
+    for t in tail {
+        match by_key.get_mut(&key(&t)) {
+            Some(p) => {
+                p.count += t.count;
+                p.span_count += t.span_count;
+                p.error_count += t.error_count;
+                p.satisfied += t.satisfied;
+                p.tolerating += t.tolerating;
+                p.frustrated += t.frustrated;
+                p.http_4xx += t.http_4xx;
+                p.http_5xx += t.http_5xx;
+            }
+            None => {
+                by_key.insert(key(&t), t);
+            }
+        }
+    }
+    let mut rows: Vec<RedRow> = by_key.into_values().collect();
+    // Busiest first, matching `red_over`'s ordering — the merge can reorder by count.
+    rows.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.service.cmp(&b.service))
+            .then_with(|| a.environment.cmp(&b.environment))
+            .then_with(|| a.operation.cmp(&b.operation))
+    });
+    rows
 }
 
 /// One RED row per series, read off the rollup.
@@ -232,7 +351,7 @@ pub(crate) async fn red_rows_from_rollup(
     let pct_futs = [Agg::P50, Agg::P90, Agg::P99].into_iter().map(|agg| {
         read_one(
             engine,
-            format!("{fam}duration"),
+            format!("{fam}{}", photon_query::LATENCY_METRIC),
             agg,
             &filter,
             &keys,
@@ -331,9 +450,21 @@ pub(crate) async fn red_buckets(
         Some(status) => status.coverage().await.unwrap_or(None),
         None => None,
     };
-    if rollup_eligible(query, start, end, Some(width), coverage) {
+    if let Some(through) = rollup_split(query, start, end, Some(width), coverage) {
         match red_buckets_from_rollup(&state.metrics_query, query, start, end, buckets).await {
-            Ok(rows) => return Ok((rows, RedSource::Rollup)),
+            Ok(mut rows) => {
+                // The rollup read fills the whole grid, zeroing buckets it has nothing for. Those
+                // trailing zeros are the unsettled tail, and left alone they draw the service's
+                // traffic falling off a cliff. Overwrite them from spans — see `rollup_split`.
+                match tail_buckets(state, query, &req, start, end, through, width, threshold_ms)
+                    .await
+                {
+                    Ok(Some((from, tail))) => splice_tail(&mut rows, from, tail),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("photon-api: rollup tail read failed ({e}) — prefix only"),
+                }
+                return Ok((rows, RedSource::Rollup));
+            }
             Err(e) => eprintln!("photon-api: rollup read failed ({e}) — falling back to raw spans"),
         }
     }
@@ -342,6 +473,50 @@ pub(crate) async fn red_buckets(
         .red_timeseries(req, start, end, buckets, threshold_ms)
         .await?;
     Ok((rows, RedSource::RawSpans))
+}
+
+/// The unsettled tail of a bucketed read, as raw-span buckets on the SAME grid, plus the grid
+/// index they start at. `None` when the rollup already covers the whole window.
+///
+/// `through` is snapped DOWN to a grid boundary first, so the tail's buckets line up with the
+/// prefix's instead of straddling them — a half-bucket offset would draw a step in the chart at
+/// the seam that no service actually served.
+#[allow(clippy::too_many_arguments)]
+async fn tail_buckets(
+    state: &AppState,
+    _query: &str,
+    req: &SpanQueryRequest,
+    start: i64,
+    end: i64,
+    through: i64,
+    width: i64,
+    threshold_ms: u32,
+) -> Result<Option<(usize, Vec<RedBucket>)>, PhotonError> {
+    if through >= end {
+        return Ok(None);
+    }
+    let from_idx = ((through - start) / width).max(0);
+    let from_ts = start + from_idx * width;
+    let n = (((end - from_ts) + width - 1) / width).max(1) as usize;
+    let mut tail_req = req.clone();
+    tail_req.start_ts_nanos = from_ts;
+    let rows = state
+        .span_query
+        .red_timeseries(tail_req, from_ts, end, n, threshold_ms)
+        .await?;
+    Ok(Some((from_idx as usize, rows)))
+}
+
+/// Overwrite `rows[from..]` with `tail`, keeping each bucket's own timestamp from the grid.
+fn splice_tail(rows: &mut [RedBucket], from: usize, tail: Vec<RedBucket>) {
+    for (i, t) in tail.into_iter().enumerate() {
+        let Some(slot) = rows.get_mut(from + i) else {
+            break;
+        };
+        let ts = slot.ts;
+        *slot = t;
+        slot.ts = ts;
+    }
 }
 
 /// The width of one of `buckets` equal-width buckets spanning `[start, end]` — mirrors
@@ -390,7 +565,7 @@ async fn red_buckets_from_rollup(
     let pct_futs = [Agg::P50, Agg::P90, Agg::P99].into_iter().map(|agg| {
         read_bucketed(
             engine,
-            "photon.service.duration".to_string(),
+            format!("photon.service.{}", photon_query::LATENCY_METRIC),
             agg,
             &filter,
             start_ns,
@@ -496,6 +671,125 @@ struct SeriesKey {
     operation: Option<String>,
 }
 
+/// Per-series sparklines off the rollup — requests and errors per bucket, keyed exactly like the
+/// raw-span pass's [`RedSeriesKey`] so the caller cannot tell the two apart.
+///
+/// The fleet board's rows already come off the rollup. Its sparklines did not, and that one raw
+/// span scan was the whole cost of the page: with the rows served from the rollup in 24 ms,
+/// `/api/services/overview` still took 1,849 ms over 24 hours because the sparkline pass was
+/// re-reading 24 hours of spans underneath it.
+///
+/// Two metrics, not eleven: a sparkline is a shape, and the only shapes it draws are traffic and
+/// errors.
+pub(crate) async fn spark_from_rollup(
+    engine: &MetricsQueryEngine,
+    query: &str,
+    start_ns: i64,
+    end_ns: i64,
+    buckets: usize,
+    group: RedGroup,
+) -> Result<HashMap<RedSeriesKey, Vec<SparkPoint>>, PhotonError> {
+    let filter = metric_filter(query, engine.promoted_attributes())?;
+    let fam = family(group);
+    let keys = group_by(group);
+    let (requests, errors) = futures::try_join!(
+        read_series_bucketed(
+            engine,
+            format!("{fam}requests"),
+            &filter,
+            &keys,
+            start_ns,
+            end_ns,
+            buckets
+        ),
+        read_series_bucketed(
+            engine,
+            format!("{fam}errors"),
+            &filter,
+            &keys,
+            start_ns,
+            end_ns,
+            buckets
+        ),
+    )?;
+
+    let width = bucket_width(start_ns, end_ns, buckets);
+    let mut out: HashMap<RedSeriesKey, Vec<SparkPoint>> = HashMap::new();
+    // Union of both metrics' keys, so a series that recorded errors but no requests still draws.
+    let all_keys: BTreeMap<&SeriesKey, ()> = requests
+        .keys()
+        .chain(errors.keys())
+        .map(|k| (k, ()))
+        .collect();
+    for (key, _) in all_keys {
+        let mut points: Vec<SparkPoint> = (0..buckets)
+            .map(|i| SparkPoint {
+                ts: start_ns + i as i64 * width,
+                count: 0,
+                error_count: 0,
+            })
+            .collect();
+        if let Some(v) = requests.get(key) {
+            for (i, n) in v.iter().enumerate() {
+                points[i].count = *n;
+            }
+        }
+        if let Some(v) = errors.get(key) {
+            for (i, n) in v.iter().enumerate() {
+                points[i].error_count = *n;
+            }
+        }
+        out.insert(
+            RedSeriesKey {
+                service: key.service.clone(),
+                tenant: key.tenant.clone(),
+                environment: key.environment.clone(),
+                operation: key.operation.clone(),
+            },
+            points,
+        );
+    }
+    Ok(out)
+}
+
+/// One counter metric, summed per series PER BUCKET — [`read_one`]'s shape with the window kept
+/// rather than collapsed. Zero-filled to `buckets` so every series shares one x-axis.
+#[allow(clippy::too_many_arguments)]
+async fn read_series_bucketed(
+    engine: &MetricsQueryEngine,
+    metric: String,
+    filter: &Option<MetricResolvedQuery>,
+    keys: &[String],
+    start_ns: i64,
+    end_ns: i64,
+    buckets: usize,
+) -> Result<BTreeMap<SeriesKey, Vec<u64>>, PhotonError> {
+    let res = engine
+        .query_series(MetricSeriesRequest {
+            metric,
+            agg: Some(Agg::Sum),
+            group_by: keys.to_vec(),
+            filter: filter.clone(),
+            start_ts_nanos: start_ns,
+            end_ts_nanos: end_ns,
+            buckets,
+        })
+        .await?;
+    let width = bucket_width(start_ns, end_ns, buckets);
+    let mut out: BTreeMap<SeriesKey, Vec<u64>> = BTreeMap::new();
+    for s in &res.series {
+        let Some(key) = series_key(s) else { continue };
+        let slot = out.entry(key).or_insert_with(|| vec![0; buckets]);
+        for point in &s.points {
+            let Some(v) = point.v else { continue };
+            let idx = ((point.t - start_ns) / width).clamp(0, buckets as i64 - 1) as usize;
+            // Counters are non-negative; a negative would be a corrupt point, not a real dip.
+            slot[idx] += v.max(0.0).round() as u64;
+        }
+    }
+    Ok(out)
+}
+
 /// One metric, aggregated to a single value per series over the whole window.
 async fn read_one(
     engine: &MetricsQueryEngine,
@@ -522,23 +816,24 @@ async fn read_one(
 }
 
 fn series_entry(s: &SeriesResult) -> Option<(SeriesKey, f64)> {
-    let service = s.labels.get("service.name")?.clone();
     let value = s.points.iter().find_map(|p| p.v)?;
-    Some((
-        SeriesKey {
-            service,
-            // An empty label is how a missing attribute comes back; treat it as absent so it does
-            // not render as a Site (or an operation) literally named "".
-            tenant: s.labels.get("tenant").filter(|v| !v.is_empty()).cloned(),
-            environment: s
-                .labels
-                .get("deployment.environment")
-                .filter(|v| !v.is_empty())
-                .cloned(),
-            operation: s.labels.get("operation").filter(|v| !v.is_empty()).cloned(),
-        },
-        value,
-    ))
+    Some((series_key(s)?, value))
+}
+
+/// The series identity carried by a rollup series' labels.
+fn series_key(s: &SeriesResult) -> Option<SeriesKey> {
+    Some(SeriesKey {
+        service: s.labels.get("service.name")?.clone(),
+        // An empty label is how a missing attribute comes back; treat it as absent so it does not
+        // render as a Site (or an operation) literally named "".
+        tenant: s.labels.get("tenant").filter(|v| !v.is_empty()).cloned(),
+        environment: s
+            .labels
+            .get("deployment.environment")
+            .filter(|v| !v.is_empty())
+            .cloned(),
+        operation: s.labels.get("operation").filter(|v| !v.is_empty()).cloned(),
+    })
 }
 
 #[cfg(test)]
@@ -562,10 +857,25 @@ mod tests {
     }
 
     #[test]
-    fn an_unpublished_tail_is_not_eligible() {
-        assert!(
-            !rollup_eligible("", 9 * HOUR, 10 * HOUR + 1, None, COVER),
-            "the tail past the watermark would read as a traffic cliff, not as missing data"
+    fn a_short_unpublished_tail_splits_rather_than_falling_back() {
+        // The tail past the watermark used to disqualify the whole window, because reading it as
+        // zeros looks like a traffic cliff rather than missing data. It is now read from raw
+        // spans and merged on: `rollup_split` returns where the rollup stops and the tail starts.
+        assert_eq!(
+            rollup_split("", 9 * HOUR, 10 * HOUR + 1, None, COVER),
+            Some(10 * HOUR),
+            "the prefix comes off the rollup, the tail off the spans"
+        );
+    }
+
+    #[test]
+    fn a_tail_too_long_to_top_up_falls_back_entirely() {
+        // Past `MIN_ROLLUP_SHARE` the tail is most of the answer, and scanning it costs what
+        // scanning the whole window costs. Splitting there buys nothing and doubles the read.
+        assert_eq!(
+            rollup_split("", 9 * HOUR, 12 * HOUR, None, COVER),
+            None,
+            "a third covered is not worth two reads"
         );
     }
 
@@ -653,6 +963,7 @@ mod tests {
             limit: 0,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         }
     }
 

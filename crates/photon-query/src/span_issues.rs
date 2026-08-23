@@ -139,6 +139,26 @@ pub struct SpanIssueDetail {
     pub events: Vec<IssueEvent>,
 }
 
+/// Mark the request as needing a non-null `error.fingerprint`, which every query in this module
+/// does: the grouping key drops the null-fingerprint group, and only an errored span has one.
+///
+/// Saying so up front is what makes the Issues surface cheap. Ingest writes the key onto errored
+/// spans only, so on a healthy fleet the vast majority of segments never contain it — and the
+/// manifest already records, per segment, which long-tail keys it holds. Declaring the requirement
+/// lets `keep_span_search_candidate` drop those segments before a single Parquet page is read,
+/// instead of scanning them and finding nothing. Measured on 86.6M spans, 564 of 579 span segments
+/// carry no `error.fingerprint` at all.
+fn require_fingerprint(mut req: SpanQueryRequest) -> SpanQueryRequest {
+    if !req
+        .required_attributes
+        .iter()
+        .any(|k| k == ERROR_FINGERPRINT)
+    {
+        req.required_attributes.push(ERROR_FINGERPRINT.to_string());
+    }
+    req
+}
+
 impl SpanQueryEngine {
     /// Top `limit` Backend Issues matching `req`, grouped by `(service.name, error.fingerprint)`
     /// and ordered by occurrence count desc.
@@ -156,7 +176,10 @@ impl SpanQueryEngine {
         // `photon-api`'s `MAX_LIMIT` restated as a literal since `photon-query` cannot depend on
         // `photon-api`.
         let limit = limit.min(1000);
-        let Some(df) = self.span_survivors_df(&req).await? else {
+        let Some(df) = self
+            .span_survivors_df(&require_fingerprint(req.clone()))
+            .await?
+        else {
             return Ok(Vec::new());
         };
         issues_over(df, span_base_predicate(&req), limit).await
@@ -173,7 +196,10 @@ impl SpanQueryEngine {
         sample_n: usize,
     ) -> Result<SpanIssueDetail, PhotonError> {
         let (start, end) = (req.start_ts_nanos, req.end_ts_nanos);
-        let Some(df) = self.span_survivors_df(&req).await? else {
+        let Some(df) = self
+            .span_survivors_df(&require_fingerprint(req.clone()))
+            .await?
+        else {
             return Ok(empty_detail(service, fingerprint));
         };
         let pred = span_base_predicate(&req)

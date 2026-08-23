@@ -278,13 +278,15 @@ with `PHOTON_CONFIG=/etc/photon/photon.toml`); env vars override individual fiel
 | `PHOTON_STORAGE_HOT_DIR` | | `/var/lib/photon/hot` | Hot tier (WAL + Parquet + index) |
 | `PHOTON_STORAGE_DB_PATH` | | `/var/lib/photon/photon.db` | Control-plane SQLite db |
 | `PHOTON_RETENTION_DAYS` | | `30` | Log retention (days, > 0) |
-| `PHOTON_PROMOTED_ATTRIBUTES` | | `service.name,host.name,deployment.environment` | Comma-separated promoted columns (must include `service.name`) |
+| `PHOTON_PROMOTED_ATTRIBUTES` | | `service.name,host.name,deployment.environment,tenant,http.response.status_code` | Comma-separated promoted columns (must include `service.name`). Promotion routes a key out of the wide `attributes` map into its own column — the map is 63% of a span file's bytes and 96% of its decoded bytes, so a query that must probe it pays for all of it. Only affects segments written from now on |
 | `PHOTON_UPTIME_ENABLED` | | `false` | Enable the uptime subsystem with defaults |
 | `PHOTON_APM_DEFAULT_APDEX_THRESHOLD_MS` | | `500` | Default Apdex T (ms) |
 | `PHOTON_ROLLUP_ENABLED` | | `true` | Publish `photon.service.*` / `photon.operation.*` from spans ([rollup.md](../docs/subsystems/rollup.md)) |
 | `PHOTON_ROLLUP_INTERVAL_SECS` | | `60` | How often a rollup pass runs (floored at 15) |
 | `PHOTON_ROLLUP_LAG_SECS` | | `600` | How long a 60s bucket stays open for late spans before it is published once |
 | `PHOTON_ROLLUP_TOP_OPERATIONS` | | `50` | Operation series kept per (service, environment); the tail sums into `__other__` |
+| `PHOTON_ROLLUP_BACKFILL_DAYS` | | `30` | How far a **first** run reaches back to cover spans already on disk. `0` = future only, which makes every Backend page over a wider window scan raw spans |
+| `PHOTON_QUERY_MEMORY_POOL_BYTES` | | auto | Ceiling on the memory **all** concurrent queries share. Default: a quarter of container RAM, clamped to 256 MiB..=4 GiB |
 | `PHOTON_DURABLE_ENDPOINT` | | — | S3 endpoint; **presence enables durable replication** |
 | `PHOTON_DURABLE_BUCKET` | when durable | — | S3 bucket |
 | `PHOTON_DURABLE_REGION` | when durable | — | S3 region |
