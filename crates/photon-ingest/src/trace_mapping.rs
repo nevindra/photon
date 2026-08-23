@@ -88,11 +88,25 @@ pub fn otlp_traces_to_spans(req: ExportTraceServiceRequest) -> Vec<SpanRecord> {
                     None => (None, None, None),
                 };
 
+                let name = Some(span.name).filter(|n| !n.is_empty());
+                // Backend Issues: fingerprint an errored span before its events are serialized.
+                // Written as ordinary attributes, so nothing downstream needs a schema change.
+                if let Some(pairs) = error_attributes(
+                    status_code,
+                    status_message.as_deref(),
+                    name.as_deref(),
+                    &span.events,
+                ) {
+                    for (k, v) in pairs {
+                        attributes.insert(k.to_string(), v);
+                    }
+                }
+
                 out.push(SpanRecord {
                     trace_id: bytes_to_hex(&span.trace_id),
                     span_id: bytes_to_hex(&span.span_id),
                     parent_span_id: bytes_to_hex_opt(&span.parent_span_id),
-                    name: Some(span.name).filter(|n| !n.is_empty()),
+                    name,
                     kind: Some(span.kind),
                     kind_text: kind_text(span.kind),
                     start_time_nanos: start,
@@ -191,6 +205,17 @@ pub fn otlp_traces_into_builder(req: ExportTraceServiceRequest, builder: &mut Sp
                 let parent_span_id = bytes_to_hex_opt(&span.parent_span_id);
                 let name = Some(span.name).filter(|n| !n.is_empty());
                 let kind_text = kind_text(span.kind);
+                // Backend Issues: fingerprint BEFORE `events_json` consumes the events. Appended
+                // last in `merged` below so it wins the dedup against a producer that already sets
+                // an `error.*` key of its own — ours is derived from what the span actually says.
+                let error_attrs: Vec<(String, String)> = error_attributes(
+                    status_code,
+                    status_message.as_deref(),
+                    name.as_deref(),
+                    &span.events,
+                )
+                .map(|pairs| pairs.map(|(k, v)| (k.to_string(), v)).to_vec())
+                .unwrap_or_default();
                 let events = events_json(span.events);
                 let links = links_json(span.links);
 
@@ -226,6 +251,7 @@ pub fn otlp_traces_into_builder(req: ExportTraceServiceRequest, builder: &mut Sp
                 let mut merged: Vec<(usize, &str, &str)> = resource_attrs
                     .iter()
                     .chain(span_attrs.iter())
+                    .chain(error_attrs.iter())
                     .enumerate()
                     .map(|(i, (k, v))| (i, k.as_str(), v.as_str()))
                     .collect();
@@ -235,6 +261,64 @@ pub fn otlp_traces_into_builder(req: ExportTraceServiceRequest, builder: &mut Sp
             }
         }
     }
+}
+
+/// The first `exception` event's parts, borrowed out of the OTLP events.
+///
+/// Read from the OTLP structs BEFORE `events_json` serializes them — the alternative, parsing the
+/// JSON we just produced, would pay for a serialize + parse round trip on every errored span.
+///
+/// Only the FIRST exception event: a span that records a retry loop has one event per attempt, and
+/// they are the same error. Later attempts are still in the stored `events` JSON for anyone reading
+/// the span itself.
+fn first_exception(
+    events: &[opentelemetry_proto::tonic::trace::v1::span::Event],
+) -> Option<photon_core::span_error::Exception<'_>> {
+    use photon_core::span_error as se;
+    let e = events.iter().find(|e| e.name == se::EXCEPTION_EVENT)?;
+    let attr = |key: &str| -> Option<&str> {
+        e.attributes.iter().find(|kv| kv.key == key).and_then(|kv| {
+            // Only a string value is meaningful here; a nested/array `AnyValue` for a message or a
+            // stack trace is not something to stringify into a fingerprint.
+            match kv.value.as_ref()?.value.as_ref()? {
+                opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)
+                    if !s.is_empty() =>
+                {
+                    Some(s.as_str())
+                }
+                _ => None,
+            }
+        })
+    };
+    Some(photon_core::span_error::Exception {
+        kind: attr(se::EXCEPTION_TYPE),
+        message: attr(se::EXCEPTION_MESSAGE),
+        stacktrace: attr(se::EXCEPTION_STACKTRACE),
+    })
+}
+
+/// `error.type` / `error.message` / `error.fingerprint` for a span that looks like an error, or
+/// nothing at all for one that does not (see `photon_core::span_error`).
+///
+/// Cheap by construction: `classify` returns immediately unless `status_code == 2` or an
+/// `exception` event is present, so a healthy service pays one integer comparison per span.
+fn error_attributes(
+    status_code: Option<i32>,
+    status_message: Option<&str>,
+    span_name: Option<&str>,
+    events: &[opentelemetry_proto::tonic::trace::v1::span::Event],
+) -> Option<[(&'static str, String); 3]> {
+    let exception = if status_code == Some(photon_core::span_error::STATUS_ERROR)
+        || events
+            .iter()
+            .any(|e| e.name == photon_core::span_error::EXCEPTION_EVENT)
+    {
+        first_exception(events)
+    } else {
+        return None;
+    };
+    photon_core::span_error::classify(status_code, status_message, span_name, exception)
+        .map(|e| e.attributes())
 }
 
 /// OTLP `SpanKind` enum → display text. Unspecified/unknown → None.
@@ -466,6 +550,128 @@ mod tests {
         assert_eq!(s.start_time_nanos, i64::MAX);
         assert_eq!(s.end_time_nanos, Some(i64::MAX));
         assert_eq!(s.duration_nanos, Some(0));
+    }
+
+    // --- Backend Issues: error fingerprinting at ingest ---------------------------------------
+
+    fn attrs_of(req: ExportTraceServiceRequest) -> std::collections::BTreeMap<String, String> {
+        otlp_traces_to_spans(req).remove(0).attributes
+    }
+
+    #[test]
+    fn an_errored_span_carries_the_three_error_attributes() {
+        let a = attrs_of(request_with(
+            base_span(),
+            vec![kv("service.name", "payments")],
+        ));
+        assert_eq!(a.get("error.type").map(String::as_str), Some("exception"));
+        assert_eq!(a.get("error.message").map(String::as_str), Some("timeout"));
+        assert_eq!(a.get("error.fingerprint").map(|f| f.len()), Some(16));
+    }
+
+    #[test]
+    fn a_healthy_span_gets_none_of_them() {
+        // Not an empty fingerprint — that would collect every healthy span into one phantom Issue.
+        let mut span = base_span();
+        span.events.clear();
+        span.status = Some(Status {
+            message: String::new(),
+            code: 1,
+        });
+        let a = attrs_of(request_with(span, vec![]));
+        assert!(!a.contains_key("error.type"));
+        assert!(!a.contains_key("error.message"));
+        assert!(!a.contains_key("error.fingerprint"));
+    }
+
+    #[test]
+    fn the_status_message_is_the_fallback_when_there_is_no_exception_event() {
+        let mut span = base_span();
+        span.events.clear();
+        let a = attrs_of(request_with(span, vec![]));
+        assert_eq!(a.get("error.type").map(String::as_str), Some("ERROR"));
+        assert_eq!(
+            a.get("error.message").map(String::as_str),
+            Some("gateway timeout")
+        );
+    }
+
+    #[test]
+    fn digit_runs_are_masked_so_a_retry_loop_is_one_issue() {
+        let fp = |msg: &str| {
+            let mut span = base_span();
+            span.events[0].attributes = vec![kv("exception.message", msg)];
+            attrs_of(request_with(span, vec![]))
+                .remove("error.fingerprint")
+                .unwrap()
+        };
+        assert_eq!(fp("chunk 12 failed"), fp("chunk 4891 failed"));
+    }
+
+    #[test]
+    fn the_same_exception_from_two_services_hashes_the_same() {
+        // Service-free by design: Issue identity is `(service, fingerprint)` at query time, so
+        // these stay two Issues — but the shared hash is what shows one bug across three services.
+        let fp = |svc: &str| {
+            attrs_of(request_with(base_span(), vec![kv("service.name", svc)]))
+                .remove("error.fingerprint")
+                .unwrap()
+        };
+        assert_eq!(fp("payments"), fp("checkout"));
+    }
+
+    #[test]
+    fn only_the_first_exception_event_is_read() {
+        // A span recording a retry loop has one event per attempt; they are the same error, and
+        // the later attempts are still in the stored `events` JSON for anyone reading the span.
+        let mut span = base_span();
+        span.events.push(Event {
+            time_unix_nano: 1_495,
+            name: "exception".to_string(),
+            attributes: vec![kv("exception.message", "a completely different failure")],
+            dropped_attributes_count: 0,
+        });
+        let a = attrs_of(request_with(span, vec![]));
+        assert_eq!(a.get("error.message").map(String::as_str), Some("timeout"));
+    }
+
+    #[test]
+    fn a_non_string_exception_attribute_is_ignored_not_stringified() {
+        let mut span = base_span();
+        span.events[0].attributes = vec![
+            KeyValue {
+                key: "exception.message".to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::IntValue(7)),
+                }),
+            },
+            kv("exception.type", "IOError"),
+        ];
+        let a = attrs_of(request_with(span, vec![]));
+        assert_eq!(a.get("error.type").map(String::as_str), Some("IOError"));
+        assert_eq!(a.get("error.message").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn a_producer_set_error_attribute_does_not_win_over_the_derived_one() {
+        // Ours is derived from what the span actually says; a stale `error.type` copied onto every
+        // span by a middleware would otherwise silently regroup the whole service's Issues.
+        let mut span = base_span();
+        span.attributes.push(kv("error.type", "NotThis"));
+        let a = attrs_of(request_with(span, vec![]));
+        assert_eq!(a.get("error.type").map(String::as_str), Some("exception"));
+    }
+
+    #[test]
+    fn the_streaming_path_fingerprints_identically() {
+        // The equivalence gate below covers this too; naming it separately means a regression
+        // reads as "the streaming path stopped fingerprinting", not "batches differ".
+        let mut span = base_span();
+        span.attributes.push(kv("error.type", "NotThis"));
+        assert_streaming_matches_reference(
+            request_with(span, vec![kv("service.name", "payments")]),
+            &["service.name".to_string()],
+        );
     }
 
     // --- Streaming-path equivalence gate ------------------------------------------------------

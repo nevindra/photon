@@ -36,7 +36,7 @@ const actualStep = computed(() => props.step ?? 1)
 const shouldShowSteppers = computed(() => props.showSteppers !== false)
 
 // Input class matches Input.vue exactly
-const inputBaseClass = 'flex h-9 w-full rounded-md border border-input bg-background shadow-sink px-3 py-1 text-sm transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium file:text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50'
+const inputBaseClass = 'flex h-9 w-full rounded-md border border-input bg-surface-1 px-3 py-1 text-sm text-foreground transition-[border-color,box-shadow] duration-150 ease-out file:border-0 file:bg-transparent file:text-sm file:font-medium file:text-foreground placeholder:text-muted-foreground hover:border-foreground/15 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-50'
 </script>
 
 <template>

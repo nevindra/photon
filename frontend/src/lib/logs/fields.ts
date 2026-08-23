@@ -58,6 +58,11 @@ export const FIELDS: FieldDescriptor[] = [
     description: 'Federated tenant (stamped by central)',
     kind: 'match',
   },
+  {
+    name: 'deployment.environment',
+    description: 'Deployment environment (prod / staging / …), as declared by the producer',
+    kind: 'match',
+  },
 ]
 
 // name -> catalog entry, or undefined for unknown/promoted fields.

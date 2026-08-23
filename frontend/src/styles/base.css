@@ -12,45 +12,30 @@
 }
 
 @layer components {
-  /* Physical "key" (.pk) — the shared tactile detail. A solid control sits on a hard
-     bottom lip (offset bevel) and presses in on click, like a physical key. Ambient +
-     highlight reuse the theme-aware --shadow tokens; --pk-lip is the hard bottom edge,
-     overridable per variant (.pk-brand). Reserved for pressable chrome — NOT data rows. */
+  /* Pressable chrome (.pk) — the shared tactile detail on solid controls. The control sits
+     FLAT on the surface (a hairline --shadow-1 ambient, nothing more) and sinks 1px on
+     click. No bevel, no bottom lip, no hover lift: depth is spent on things that actually
+     float (popovers, drawers), not on buttons. Reserved for pressable chrome — NOT data
+     rows, and NOT outline/ghost variants, which are flat by definition. */
   .pk {
-    --pk-lip: 0 0% 0% / 0.16;
-    box-shadow: 0 3px 0 -1px hsl(var(--pk-lip)), var(--shadow-1);
+    box-shadow: var(--shadow-1);
     transition:
       transform var(--motion-press) var(--motion-ease),
       box-shadow var(--motion-lift) var(--motion-ease),
       background-color var(--motion-fast) var(--motion-ease),
-      color var(--motion-fast) var(--motion-ease),
-      filter var(--motion-fast) var(--motion-ease);
-  }
-  .pk-brand {
-    --pk-lip: 191 96% 30%;
-  }
-  .dark .pk {
-    --pk-lip: 0 0% 0% / 0.5;
-  }
-  .dark .pk-brand {
-    --pk-lip: 191 96% 22%;
-  }
-  .pk:hover:not(:disabled):not([data-disabled]) {
-    box-shadow: 0 4px 0 -1px hsl(var(--pk-lip)), var(--shadow-2);
+      border-color var(--motion-fast) var(--motion-ease),
+      color var(--motion-fast) var(--motion-ease);
   }
   .pk:active:not(:disabled):not([data-disabled]) {
-    box-shadow: 0 0 0 0 hsl(var(--pk-lip)), var(--sink);
+    box-shadow: var(--sink);
   }
   .pk:disabled,
   .pk[data-disabled] {
     box-shadow: none;
   }
   @media (prefers-reduced-motion: no-preference) {
-    .pk:hover:not(:disabled):not([data-disabled]) {
-      transform: translateY(-1px);
-    }
     .pk:active:not(:disabled):not([data-disabled]) {
-      transform: translateY(3px);
+      transform: translateY(1px);
     }
   }
 }

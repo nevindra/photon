@@ -9,6 +9,28 @@ A distributed-trace explorer + single-trace waterfall, with log↔trace↔span c
 ## Backend
 
 - **Ingest:** `otlp_traces_to_spans` (`photon-ingest`) maps OTLP → `Span` records → `spans_wal`.
+- **Error fingerprinting at ingest** (`photon_core::span_error`): a span that looks like an error
+  (`status_code == 2`, or an event named `exception`) gains three attributes — `error.type`,
+  `error.message`, `error.fingerprint`. That fingerprint is what makes a **Backend Issue**; it is
+  `rum::fingerprint` verbatim (type + digit-masked message + top stack frame), because a Frontend
+  Issue and a Backend Issue are the same idea about two different runtimes. Three properties are
+  load-bearing:
+  - **A healthy span gets no attributes at all**, not an empty fingerprint — an empty fingerprint
+    would collect every healthy span in the fleet into one enormous phantom Issue. It is also the
+    cost control: `error_attributes` returns before allocating anything, so the alloc guard's
+    baseline (32.2 allocs/span) is unchanged and the price scales with errors, not traffic.
+  - **Only the first exception event and only its top frame.** A retry loop records one event per
+    attempt and they are the same error; one bug reached by two call paths shares a top frame and
+    differs further down, so hashing the whole trace would split it into as many Issues as there are
+    ways to reach it.
+  - **The fingerprint carries no service.** Issue identity is `(service, fingerprint)` at query time
+    (see [`../../CONTEXT.md`](../../CONTEXT.md)), so the same exception in two services is still two
+    Issues — but the shared hash is what lets a reader see one bug across three services rather than
+    three unrelated bugs.
+
+  Spans ingested before this shipped carry no fingerprint and never will: no backfill, no query-time
+  fallback. One honest gap in the history beats two grouping rules for one concept, and the UI states
+  the cut-over rather than hiding it.
 - **Schema** (`photon-core/src/span_schema.rs`): 15 fixed columns. Sorted `(service.name, start_time)`.
 - **Compaction:** `SpanCompactor` → zstd Parquet under `data-spans/` + a spans skip index that blooms
   over `name` tokens **and whole `trace_id` values** (so a lookup by trace ID prunes hard). Free-text
@@ -23,6 +45,28 @@ A distributed-trace explorer + single-trace waterfall, with log↔trace↔span c
     whose spans span **> 1h** from its earliest span can be undercounted in the rollup (its late
     spans fall outside the padded window) — consistent with what `get_trace` can render; widen the
     pad if sub-hour traces stop being the norm.
+
+    **Ranking probes the newest slice first.** Step 2 is `GROUP BY trace_id → min(start_time)`,
+    newest first, `LIMIT MAX_CANDIDATE_TRACES` (2,000) — one hash-table entry per distinct trace
+    id, which is fine at an hour and ruinous at a week. A 3-day window holds 11.4M ids and a 7-day
+    one over 20M, times `target_partitions` partial aggregates, and the 7-day case died outright
+    under the shared query pool ("Failed to allocate … for GroupedHashAggregateStream", HTTP 500
+    after 1.9 s) — while the page only ever keeps the newest 2,000, so the older end was grouped at
+    full cost and thrown away. So the scan starts on the newest 15 minutes and widens ×8 until the
+    page fills or it covers the window: 15m → 2h → 16h → 5d8h → all of it. A busy week fills on the
+    first probe and never groups the other 6 days 23 hours; a quiet one walks to the full window at
+    ~1.14× a single pass (the rounds are a geometric series) and lands on exactly the un-probed
+    answer. Each probe reaches `STEP3_WINDOW_PAD_NANOS` further back than its own start, so a trace
+    straddling the boundary does not report a `min(start_time)` that ranks it as newer than it is.
+
+    **`matched_count` is exact until the cap, then an estimate.** A page short of 2,000 can only
+    happen once the probe covered the whole window, so that page *is* every matching trace and its
+    row count is the total — no second query at all, which is every query a human has narrowed
+    down. When the page fills, the true total is already past anything the view can show, so it is
+    a magnitude rather than a tally: `approx_distinct` answers it from a fixed-size HyperLogLog
+    (kilobytes per partition instead of gigabytes, no spill, ~1% relative error — measured 2,007
+    against an exact 2,001, +0.30%). The response carries `matched_count_estimated` so the UI can
+    render `~11.3M` instead of passing an approximation off as a count.
   - `search_spans` / `search_spans_with_count` — raw span rows (cursor-paginated).
   - `count_matching_spans`, span `facet` / `fields` / `histogram`.
   - `latency` — t-digest percentiles + log-scale (geometric) histogram.

@@ -59,6 +59,40 @@ pub struct SpanResolvedQuery {
     pub terms: Vec<SpanResolvedTerm>,
 }
 
+impl SpanResolvedQuery {
+    /// Long-tail attribute keys a matching row MUST carry. A segment whose manifest entry declares
+    /// its keys and lists none of these cannot hold a single matching row, so the query engine
+    /// prunes the whole file — the same conservative shape as the skip index (a segment that does
+    /// not declare its keys is always kept).
+    ///
+    /// Only un-negated terms count, and only over [`SpanFieldRef::MapAttr`]. `-k:v` is *satisfied*
+    /// by a row with no `k` at all, so a negated term requires nothing; a promoted field lives in
+    /// its own column and never appears in `attribute_keys`. `FreeText`/`Status`/`Kind` name no
+    /// attribute. The terms are AND-ed, so every key collected here is genuinely required.
+    pub fn required_attr_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        for term in &self.terms {
+            if term.negated {
+                continue;
+            }
+            let field = match &term.kind {
+                SpanResolvedKind::Match { field, .. }
+                | SpanResolvedKind::Exists { field }
+                | SpanResolvedKind::Compare { field, .. } => field,
+                SpanResolvedKind::Status { .. }
+                | SpanResolvedKind::Kind { .. }
+                | SpanResolvedKind::FreeText { .. } => continue,
+            };
+            if let SpanFieldRef::MapAttr(name) = field {
+                if !keys.iter().any(|k: &String| k == name) {
+                    keys.push(name.clone());
+                }
+            }
+        }
+        keys
+    }
+}
+
 pub struct SpanFieldResolver {
     promoted: HashSet<String>,
 }

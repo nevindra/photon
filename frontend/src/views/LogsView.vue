@@ -38,7 +38,7 @@ import {
     startMs,
     endMs,
     setCustomRange,
-    tenantQueryTerm,
+    contextQueryTerm,
 } from "@/lib/core/context";
 import { correlate } from "@/lib/core/useCorrelate";
 
@@ -145,12 +145,12 @@ const debouncedQuery = computed(() => debouncedText.value.trim());
 // reference to a `const` declared further down; that's safe because `onPoll` is only ever invoked
 // later (in response to a user action), by which point `searchQuery` is long since initialized.
 // Live tail streams over SSE, bypassing logsQueries.ts entirely — so unlike useSearchLogs/
-// useFacet/useHistogram (which append the active tenant internally), the tenant term has to
-// be folded in here explicitly for Live mode to stay tenant-scoped too.
+// useFacet/useHistogram (which append the global context internally), the Site + Environment
+// terms have to be folded in here explicitly for Live mode to stay scoped too.
 const liveTail = useLiveTail({
     grain: "logs",
     query: computed(() =>
-        [debouncedText.value.trim(), tenantQueryTerm()].filter(Boolean).join(" "),
+        [debouncedText.value.trim(), contextQueryTerm()].filter(Boolean).join(" "),
     ),
     onPoll: (v) => {
         if (v === "once") {
@@ -428,7 +428,7 @@ const aggregatesAsOfSec = computed(() =>
 </script>
 
 <template>
-    <AppShell :mock="api.mock" crumb="Logs">
+    <AppShell :mock="api.mock" crumb="Logs" surface="sheet">
         <template #toolbar>
             <SearchBar
                 :model-value="text"

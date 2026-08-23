@@ -29,6 +29,9 @@ pub(crate) struct GrpcTraceService<W: Wal + Send + Sync + 'static> {
     /// Federation `full` mode: the accepted request is re-encoded and offered here for
     /// best-effort forwarding to central (gRPC never sees the raw wire bytes).
     pub(crate) federation_tee: Option<crate::FederationTee>,
+    /// Deploy detection. `None` = nobody is recording deployments, and the resource walk is
+    /// skipped entirely rather than computed and thrown away.
+    pub(crate) deployments: Option<Arc<dyn crate::deployments::DeploymentWatcher>>,
 }
 
 #[tonic::async_trait]
@@ -67,6 +70,13 @@ impl<W: Wal + Send + Sync + 'static> TraceService for GrpcTraceService<W> {
                 prost::Message::encode_to_vec(&req).into(),
             );
         }
+        // Same hook as the HTTP receiver: resource attributes only, after the tenant stamp.
+        if let Some(watcher) = &self.deployments {
+            for seen in crate::deployments::resource_versions(&req) {
+                watcher.observe(&seen);
+            }
+        }
+
         let mut builder = SpanBatchBuilder::with_capacity(&self.schema, estimate_rows(&req));
         otlp_traces_into_builder(req, &mut builder);
         let batch = builder

@@ -462,6 +462,7 @@ mod engine_tests {
             limit: 0,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         };
         let out = engine.latency(req, 10_000_000).await.unwrap();
         assert!(

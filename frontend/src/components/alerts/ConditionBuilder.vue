@@ -1,9 +1,8 @@
 <script setup lang="ts">
 // The sentence-style condition builder used inside AlertRuleDialog (Task 14). A signal segmented
 // control (Metrics/Logs/Traces/RUM) swaps the field set; the rest reads as plain English with the
-// blanks as dropdowns/inputs, mirroring the approved mockup
-// (.superpowers/brainstorm/37613-1784341076/content/alerts-final.html). `for` (sustained-breach
-// duration) is deliberately NOT here — per the design doc §5, `for_secs` is a column of
+// blanks as dropdowns/inputs, mirroring the approved mockup. `for` (sustained-breach
+// duration) is deliberately NOT here — `for_secs` is a column of
 // `alert_rules`, not part of the per-signal `condition` JSON, so AlertRuleDialog owns that field.
 //
 // Ownership model: this component seeds its local `form`/`signal` state ONCE from the initial
@@ -354,7 +353,7 @@ defineExpose({ isValid, previewSeries })
       </SegmentedItem>
     </Segmented>
 
-    <div class="rounded-lg border border-border bg-muted/40 p-4">
+    <div class="rounded-xl border border-border bg-muted/40 p-4">
       <!-- Metrics -->
       <div v-if="signal === 'metrics'" class="flex flex-wrap items-center gap-x-2 gap-y-2 text-[15px] leading-relaxed">
         <span class="text-muted-foreground">Alert when</span>
@@ -468,7 +467,7 @@ defineExpose({ isValid, previewSeries })
           <input
             v-model="labelFilterDraft"
             placeholder="host.name=web-01…"
-            class="h-7 w-40 rounded-md border border-input bg-background px-2 font-mono text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            class="h-7 w-40 rounded-md border border-input bg-surface-1 px-2 font-mono text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
             @keydown="onLabelFilterKeydown"
             @blur="addLabelFilter"
           >
@@ -497,7 +496,7 @@ defineExpose({ isValid, previewSeries })
           <input
             v-model="groupByDraft"
             placeholder="host.name…"
-            class="h-7 w-32 rounded-md border border-input bg-background px-2 font-mono text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            class="h-7 w-32 rounded-md border border-input bg-surface-1 px-2 font-mono text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
             @keydown="onGroupByKeydown"
             @blur="addGroupBy"
           >

@@ -9,17 +9,18 @@
 //! as `/api/red` and `/api/traces/dependencies`'s sibling `/api/red`.
 //!
 //! **Service-name query escaping.** The per-service filter is built as the bare, unquoted grammar
-//! term `service.name:<service>` (e.g. `service.name:payment-service`), never
-//! `service.name:"<service>"`. Verified against `photon_core::query::parser`: `classify()` only
-//! treats whitespace, a leading `-` (negation), a leading `"` (whole-token quoted phrase), `:`
-//! (field/value split), and `,` (OR-list split) specially — dots and dashes in a *value* have no
-//! special meaning, so `service.name:payment-service` already parses as a single-value `Match`
-//! term with no quoting needed. Quoting would in fact be *wrong* here: the tokenizer only
-//! recognizes a quoted span when the `"` is the token's own leading character (i.e. a bare
-//! quoted phrase, which classifies as `FreeText`, not a field `Match`); inside `field:"value"` the
-//! quotes are never stripped by `classify` (it just calls `body.split_once(':')` on the whole
-//! token), so the resolved `Match` value would literally contain the quote characters and never
-//! match real attribute values. See `photon_core/src/query/parser.rs`'s `tokenize`/`classify`.
+//! term `service.name:<service>` (e.g. `service.name:payment-service`). Dots and dashes in a
+//! *value* have no special meaning to `photon_core::query::parser` — only whitespace, a leading
+//! `-`, a leading `"`, `:` and `,` are special — so no quoting is needed for an ordinary name.
+//!
+//! A name containing a **space or a comma** does need quoting, and `field:"a b"` now means what it
+//! looks like: `classify` strips one surrounding pair of quotes off each value (see
+//! `photon_core/src/query/parser.rs`'s `split_values`/`unquote`). It did not always — the quotes
+//! used to survive into the resolved value, so the term parsed cleanly and matched nothing. Any
+//! caller building a term from an arbitrary name should quote it.
+
+use std::collections::HashMap;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -30,6 +31,7 @@ use serde_json::{json, Value};
 use photon_query::DepRow;
 
 use crate::query_params::{build_span_query_request, clamp_buckets};
+use crate::red::basis_str;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -73,20 +75,30 @@ pub(crate) async fn timeseries(
     let secs_per_bucket = bucket_seconds(start_ns, end_ns, buckets);
     let (threshold_ms, _is_default) = resolve_threshold(&state, &service).await;
 
-    match state
-        .span_query
-        .red_timeseries(req, start_ns, end_ns, buckets, threshold_ms)
-        .await
+    match crate::services_rollup::red_buckets(
+        &state,
+        &service_query(&service, &p.q),
+        req,
+        buckets,
+        threshold_ms,
+    )
+    .await
     {
-        Ok(rows) => Json(
+        Ok((rows, source)) => Json(
             rows.iter()
                 .map(|b| {
                     json!({
+                        // Which read path produced this bucket — see `red.rs`'s `source` field.
+                        "source": source.as_str(),
                         "ts": b.ts / 1_000_000, // bucket start, epoch ms — UI charts plot this raw
                         "rate": b.count as f64 / secs_per_bucket,
                         "error_rate": if b.count > 0 { b.error_count as f64 / b.count as f64 } else { 0.0 },
-                        "count": b.count,
+                        "count": b.count,       // requests: the series' ENTRY spans (ADR-0003)
+                        "span_count": b.span_count, // every span, all kinds
+                        "basis": basis_str(b.basis), // same on every bucket: decided per series
                         "error_count": b.error_count,
+                        "http_4xx": b.http_4xx, // HTTP status class, beside error_count not
+                        "http_5xx": b.http_5xx, // instead of it — see RedRow::http_4xx's doc
                         "p50": b.p50.to_string(),
                         "p90": b.p90.to_string(),
                         "p99": b.p99.to_string(),
@@ -264,6 +276,22 @@ fn service_query(service: &str, extra_q: &str) -> String {
         base
     } else {
         format!("{base} {extra}")
+    }
+}
+
+/// Every per-service Apdex override plus the default, for the routes that judge MANY services at
+/// once (`/api/red`, `/api/services/overview`, `/api/services/:service/operations`). One place, so
+/// three pages cannot end up scoring the same service against different thresholds.
+pub(crate) async fn apdex_settings(state: &AppState) -> (HashMap<String, u32>, u32) {
+    match &state.data {
+        Some(d) => (
+            d.settings.all_apdex_thresholds().await.unwrap_or_default(),
+            d.apdex_default_ms,
+        ),
+        None => (
+            HashMap::new(),
+            photon_core::config::DEFAULT_APDEX_THRESHOLD_MS,
+        ),
     }
 }
 
@@ -507,6 +535,7 @@ mod tests {
         // New: absolute volume + Apdex band counts (already computed on RedBucket).
         for k in [
             "count",
+            "span_count",
             "error_count",
             "satisfied",
             "tolerating",
@@ -515,6 +544,16 @@ mod tests {
             assert!(b0.get(k).is_some(), "missing new key {k}");
             assert!(b0[k].is_number(), "{k} should be a number");
         }
+        // http_4xx/http_5xx: beside error_count, not instead of it (Task 2).
+        for k in ["http_4xx", "http_5xx"] {
+            assert!(b0.get(k).is_some(), "missing new key {k}");
+            assert!(b0[k].is_number(), "{k} should be a number");
+        }
+        // ADR-0003: which entry-set rule produced `count`, so the UI can badge a span-based row.
+        assert!(
+            ["entry", "trace_root", "all_spans"].contains(&b0["basis"].as_str().unwrap()),
+            "basis must be one of the three cascade spellings"
+        );
 
         let (s, v) = get(&app, "/api/services/web/dependencies?start=0&end=100").await;
         assert_eq!(s, axum::http::StatusCode::OK);

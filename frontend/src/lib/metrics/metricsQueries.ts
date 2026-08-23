@@ -7,10 +7,7 @@ import { useQuery, keepPreviousData } from '@tanstack/vue-query'
 import type { UseQueryOptions } from '@tanstack/vue-query'
 import { api } from '@/lib/core/api'
 import type { MetricQueryRequest, MetricQueryResponse } from '@/lib/core/api'
-import { tenantQueryTerm } from '@/lib/core/context'
-
-// Appends the active tenant's grammar term to a metric filter string.
-const withTenant = (filter?: string): string => [filter ?? '', tenantQueryTerm()].filter(Boolean).join(' ')
+import { contextQueryTerm, withContext } from '@/lib/core/context'
 
 export function useMetricCatalog(startNs: MaybeRefOrGetter<string>, endNs: MaybeRefOrGetter<string>) {
   return useQuery({
@@ -55,11 +52,11 @@ export function useMetricSeries(
   options: Partial<UseQueryOptions<MetricQueryResponse>> = {},
 ) {
   return useQuery({
-    queryKey: computed(() => ['metric-series', toValue(seriesKey), tenantQueryTerm()]),
+    queryKey: computed(() => ['metric-series', toValue(seriesKey), contextQueryTerm()]),
     queryFn: ({ signal }) => {
       const req = buildRequest()
       return api.metricQuery(
-        { ...req, queries: req.queries.map((q) => ({ ...q, filter: withTenant(q.filter) })) },
+        { ...req, queries: req.queries.map((q) => ({ ...q, filter: withContext(q.filter) })) },
         { signal },
       )
     },

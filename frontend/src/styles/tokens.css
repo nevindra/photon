@@ -3,29 +3,35 @@
    sparingly — the "Reserved" reach: active-nav, focus ring, links, selection, key
    data highlights, and the explicit `brand` CTA variant. Colours are HSL channel
    triplets so Tailwind can compose them as `hsl(var(--x) / <alpha>)`; the elevation
-   tokens (--shadow-1/2, --sink, --hi) are full CSS values surfaced via Tailwind's
-   boxShadow.
+   tokens (--shadow-1/2, --sink) are full CSS values surfaced via Tailwind's boxShadow.
 
-   Layered surfaces: --surface-1 (cards / panels) and --surface-2 (popovers / drawers /
-   raised) lift off --background; --card maps to --surface-1 and --popover to
-   --surface-2, so chrome reads as elevated. Light is the default; `.dark` on <html>
-   flips to the dark palette (owned by the ThemeToggle). Dark mode sits on a
-   faintly-cool near-black (NOT pure black) so the elevation shadows and surface ramp
-   can read.
+   Separation comes from the CANVAS, not from shadow. --background is a visibly grey
+   sheet and --surface-1 (cards / panels) is pure white on top of it, so a card reads as
+   a card with nothing but a hairline --border and a 1px ambient shadow. Do not lighten
+   --background back toward white: the flat elevation ramp depends on that gap.
+   --surface-2 (popovers / drawers / raised) is the only layer that carries real depth,
+   via --shadow-2. --card maps to --surface-1, --popover to --surface-2. Light is the
+   default; `.dark` on <html> flips the palette (owned by the ThemeToggle). Dark mode sits
+   on a faintly-cool near-black (NOT pure black) so the surface ramp can read.
+
+   Radius: --radius (12px) is the card/panel step. Tailwind derives the whole scale from
+   it — sm 8 / md 10 / lg 12 / xl 14 / 2xl 18 — so controls, panels and popovers stay in
+   one family. Pills (badges, status, chips) use rounded-full and ignore the scale.
 
    Colour policy: near-neutral base everywhere; the cyan brand accent is functional and
    spent sparingly. Severity colour (--sev-*) is reserved for warn / error / fatal ONLY
    and stays visually distinct from the brand — debug/info have NO colour (downstream
    uses --muted-foreground), so the coloured lines are the signal. --success/--success-soft
    is the theme-aware green for healthy / up / good — the positive counterpart to severity,
-   kept separate from --sev-* (which stays warn/error/fatal only). */
+   kept separate from --sev-* (which stays warn/error/fatal only). The *-soft tints are
+   tuned to read as a tinted pill on WHITE (a card), not on the grey canvas. */
 
 :root {
-  /* Surfaces & text — cool near-white canvas, cool near-black ink */
-  --background: 240 20% 98%;
+  /* Surfaces & text — a grey canvas with white paper on top, cool near-black ink */
+  --background: 235 16% 96.5%;
   --foreground: 240 10% 12%;
 
-  /* Layered surfaces — cards/panels lift off the canvas; popovers/drawers sit higher */
+  /* Layered surfaces — cards/panels are the white paper; popovers/drawers sit higher */
   --surface-1: 0 0% 100%;
   --surface-2: 0 0% 100%;
 
@@ -39,13 +45,15 @@
   --primary: 0 0% 9%;
   --primary-foreground: 0 0% 98%;
 
-  --secondary: 240 14% 96%;
+  --secondary: 235 15% 95%;
   --secondary-foreground: 240 10% 12%;
 
-  --muted: 240 14% 96%;
-  --muted-foreground: 240 5% 42%;
+  /* Tints & hovers. --muted is the segmented/tab track and the row-hover wash; it has to
+     read against WHITE, so it sits a step below --background rather than beside it. */
+  --muted: 235 15% 95%;
+  --muted-foreground: 240 5% 45%;
 
-  --accent: 240 14% 96%;
+  --accent: 235 15% 95%;
   --accent-foreground: 240 10% 12%;
 
   --destructive: 0 84.2% 60.2%;
@@ -55,23 +63,22 @@
   --brand: 191 94% 38%;
   --brand-strong: 191 90% 33%;
   --brand-foreground: 0 0% 100%;
-  --brand-soft: 190 92% 95%;
+  --brand-soft: 190 88% 94%;
 
   /* Hairlines, inputs, focus ring (ring retargets to brand) */
-  --border: 240 12% 90%;
-  --input: 240 12% 90%;
+  --border: 235 13% 91%;
+  --input: 235 13% 91%;
   --ring: 191 94% 38%;
 
-  --radius: 0.5rem;
+  --radius: 0.75rem;
 
-  /* Elevation / sink / highlight — full CSS values (Tailwind boxShadow).
-     The --hi top-highlight is baked into --shadow-1/2 so a single `shadow-1`
-     utility carries both the drop shadow and the inset highlight; --hi stays
-     standalone for elements that want only the highlight (e.g. segmented). */
-  --hi: inset 0 1px 0 rgb(255 255 255 / .8);
-  --shadow-1: 0 6px 20px -8px rgb(20 22 45 / .12), 0 2px 5px -2px rgb(20 22 45 / .08), var(--hi);
-  --shadow-2: 0 16px 34px -12px rgb(20 22 45 / .20), 0 4px 10px -4px rgb(20 22 45 / .12), var(--hi);
-  --sink: inset 0 1px 2px rgb(20 22 45 / .10);
+  /* Elevation — full CSS values (Tailwind boxShadow). Deliberately flat: --shadow-1 is a
+     hairline ambient shadow that only stops a white card dissolving into the canvas, NOT a
+     lift. --shadow-2 is the one real elevation, reserved for things that float over the
+     page (popovers, drawers, dialogs, dragged items). --sink is the pressed-in state. */
+  --shadow-1: 0 1px 2px 0 rgb(18 20 28 / 0.04), 0 1px 3px 0 rgb(18 20 28 / 0.03);
+  --shadow-2: 0 10px 30px -10px rgb(18 20 28 / 0.18), 0 2px 8px -3px rgb(18 20 28 / 0.1);
+  --sink: inset 0 1px 2px rgb(18 20 28 / 0.06);
 
   /* Motion — one vocabulary for every transition. */
   --motion-fast: 120ms;
@@ -85,24 +92,25 @@
   --sev-error: 0 72% 51%;
   --sev-warn: 32 81% 35%;
   --sev-fatal: 262 83% 58%;
-  --sev-error-soft: 0 86% 97%;
-  --sev-warn-soft: 48 96% 95%;
-  --sev-fatal-soft: 258 90% 98%;
+  --sev-error-soft: 0 80% 96%;
+  --sev-warn-soft: 42 92% 94%;
+  --sev-fatal-soft: 258 88% 96.5%;
 
   /* Success / healthy / up / good — the positive counterpart to severity
      (severity stays warn/error/fatal only). Foreground/solid + soft tint. */
-  --success: 152 56% 38%;
-  --success-soft: 152 55% 94%;
+  --success: 152 56% 34%;
+  --success-soft: 152 48% 93%;
 }
 
 .dark {
-  /* Faintly-cool near-black canvas (NOT pure black) so elevation reads */
+  /* Faintly-cool near-black canvas (NOT pure black) so the surface ramp reads */
   --background: 240 8% 7%;
   --foreground: 0 0% 96%;
 
-  /* Layered surfaces — raised planes above the near-black canvas */
-  --surface-1: 240 6% 10%;
-  --surface-2: 240 6% 13%;
+  /* Layered surfaces — raised planes above the near-black canvas. Dark mode has no white
+     paper to lean on, so the ramp itself carries the separation the shadows do in light. */
+  --surface-1: 240 6% 11%;
+  --surface-2: 240 6% 14%;
 
   --card: var(--surface-1);
   --card-foreground: 0 0% 96%;
@@ -116,10 +124,10 @@
   --secondary: 240 6% 16%;
   --secondary-foreground: 0 0% 96%;
 
-  --muted: 240 6% 13%;
+  --muted: 240 6% 15%;
   --muted-foreground: 240 5% 64%;
 
-  --accent: 240 6% 16%;
+  --accent: 240 6% 17%;
   --accent-foreground: 0 0% 96%;
 
   --destructive: 0 62.8% 30.6%;
@@ -129,28 +137,27 @@
   --brand: 190 90% 44%;
   --brand-strong: 189 92% 56%;
   --brand-foreground: 196 100% 7%;
-  --brand-soft: 190 60% 12%;
+  --brand-soft: 190 60% 14%;
 
-  --border: 240 5% 17%;
-  --input: 240 5% 17%;
+  --border: 240 5% 18%;
+  --input: 240 5% 18%;
   --ring: 190 90% 44%;
 
-  /* Elevation / sink / highlight — deeper shadows for the dark canvas. */
-  --hi: inset 0 1px 0 rgb(255 255 255 / .05);
-  --shadow-1: 0 10px 26px -10px rgb(0 0 0 / .60), 0 2px 6px -2px rgb(0 0 0 / .50), var(--hi);
-  --shadow-2: 0 18px 40px -12px rgb(0 0 0 / .72), 0 4px 12px -4px rgb(0 0 0 / .50), var(--hi);
-  --sink: inset 0 1px 3px rgb(0 0 0 / .55);
+  /* Elevation — same flat ramp, deepened for the dark canvas. */
+  --shadow-1: 0 1px 2px 0 rgb(0 0 0 / 0.4);
+  --shadow-2: 0 14px 34px -12px rgb(0 0 0 / 0.7), 0 3px 10px -4px rgb(0 0 0 / 0.45);
+  --sink: inset 0 1px 2px rgb(0 0 0 / 0.45);
 
   /* Brighter severity foregrounds; low-luminance soft tints that read subtly on
      a near-black surface. */
   --sev-error: 0 84% 68%;
   --sev-warn: 38 92% 60%;
   --sev-fatal: 263 90% 74%;
-  --sev-error-soft: 0 63% 15%;
-  --sev-warn-soft: 38 70% 13%;
-  --sev-fatal-soft: 263 55% 18%;
+  --sev-error-soft: 0 63% 16%;
+  --sev-warn-soft: 38 70% 14%;
+  --sev-fatal-soft: 263 55% 19%;
 
   /* Success — brighter green for the dark canvas; low-luminance soft tint. */
   --success: 152 58% 46%;
-  --success-soft: 152 40% 14%;
+  --success-soft: 152 40% 15%;
 }

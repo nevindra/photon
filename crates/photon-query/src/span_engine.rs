@@ -21,6 +21,101 @@ use crate::{
     cached_manifest, col_ref, session, ManifestCache, PRUNE_CHUNKS, PRUNE_PARALLEL_MIN_CANDIDATES,
 };
 
+/// What the manifest knows about the long-tail attribute keys carried by the files that survived
+/// pruning — the input to [`attr_lookup`], which is what keeps the `attributes` map column out of a
+/// plan that cannot possibly need it.
+///
+/// Why this is worth a type. A span Parquet's `attributes.entries.values` column is 63% of the
+/// file's bytes and **96% of its decoded bytes** (133 MB raw against 5.5 MB for every other column
+/// put together). Referencing the map *at all* therefore costs about the same no matter how many
+/// keys are probed: measured on 86.6M spans over 24h, `/api/red` grouped by service took 2139 ms
+/// with three probes, 1858 ms with one, and 435 ms with none. So the only useful optimisation is
+/// removing the last probe, and the manifest already records which keys each segment contains.
+///
+/// [`Unknown`](Self::Unknown) is the conservative arm and the default whenever anything is missing:
+/// `FileEntry::attribute_keys` is empty for segments written before the field existed, and an empty
+/// list is indistinguishable from "this segment genuinely has no long-tail keys". Treating empty as
+/// Unknown keeps the probe — correct, just not accelerated — which is the same direction every
+/// other pruner in this crate errs in (a missing `.idx` keeps the file).
+#[derive(Debug, Clone)]
+pub(crate) enum AttrKeys {
+    /// At least one surviving file did not declare its keys, so any key might be present.
+    Unknown,
+    /// The union of long-tail keys across every surviving file. A key absent from this set is
+    /// provably absent from every row the query can read.
+    Known(std::collections::HashSet<String>),
+}
+
+impl AttrKeys {
+    /// Could a row readable by this query carry `key` in its attributes map? `Unknown` always says
+    /// yes.
+    pub(crate) fn may_contain(&self, key: &str) -> bool {
+        match self {
+            AttrKeys::Unknown => true,
+            AttrKeys::Known(keys) => keys.contains(key),
+        }
+    }
+
+    /// Fold one surviving file's declared keys in. An empty list collapses the whole set to
+    /// `Unknown` — see the type docs for why empty cannot be read as "no keys".
+    fn absorb(&mut self, entry: &FileEntry) {
+        match self {
+            AttrKeys::Unknown => {}
+            AttrKeys::Known(_) if entry.attribute_keys.is_empty() => *self = AttrKeys::Unknown,
+            AttrKeys::Known(keys) => keys.extend(entry.attribute_keys.iter().cloned()),
+        }
+    }
+
+    fn merge(&mut self, other: AttrKeys) {
+        match (&mut *self, other) {
+            (AttrKeys::Unknown, _) => {}
+            (_, AttrKeys::Unknown) => *self = AttrKeys::Unknown,
+            (AttrKeys::Known(a), AttrKeys::Known(b)) => a.extend(b),
+        }
+    }
+}
+
+impl Default for AttrKeys {
+    fn default() -> Self {
+        AttrKeys::Known(std::collections::HashSet::new())
+    }
+}
+
+/// Read one attribute, from wherever the schema put it, keeping the `attributes` map out of the
+/// plan whenever the manifest proves no surviving file needs it.
+///
+/// Getting this right is worth more than anything else on the Backend read path. The map is 63% of
+/// a span Parquet file's bytes and 96% of its *decoded* bytes, and decoding it is CPU-bound and
+/// perfectly parallel — measured on 300M spans, `/api/red` over 7 days spent 12.3 s at 15.1 of 16
+/// cores, and the identical query with every map probe removed took 2.2 s. Four cases:
+///
+/// * **Promoted, and no surviving file still carries it in the map** — read the column, never
+///   touch the map. This is what promoting a key is *for*.
+/// * **Promoted, but some surviving file predates the promotion** — coalesce the two. Promotion
+///   only changes how NEW segments are written (`SpanBatchBuilder::append` routes promoted keys
+///   out of the map), so for one retention period a query spans both layouts: an old file has NULL
+///   in the column and the value in the map, a new one has it the other way round. Reading only
+///   the column here would silently report NULL for every span written before the config changed.
+/// * **Long-tail, and some surviving file declares it** — probe the map. Correct and unavoidable.
+/// * **Long-tail, and no surviving file declares it** — the probe would return NULL for every row,
+///   so emit a typed NULL literal and leave the map column out of the plan entirely.
+pub(crate) fn attr_lookup(key: &str, promoted: bool, keys: &AttrKeys) -> Expr {
+    let map_probe =
+        || datafusion::functions::core::expr_fn::get_field(col_ref(span_schema::ATTRIBUTES), key);
+    match (promoted, keys.may_contain(key)) {
+        (true, false) => col_ref(key),
+        (true, true) => datafusion::functions::expr_fn::coalesce(vec![col_ref(key), map_probe()]),
+        (false, false) => lit(datafusion::scalar::ScalarValue::Utf8(None)),
+        (false, true) => map_probe(),
+    }
+}
+
+/// The files that survived pruning, plus what the manifest knows about their attribute keys.
+pub(crate) struct SpanSurvivors {
+    pub paths: Vec<String>,
+    pub attr_keys: AttrKeys,
+}
+
 /// ±window applied to a `get_trace` time hint when selecting manifest candidates. A trace's
 /// spans cluster within seconds of the originating row, so one hour is comfortably conservative:
 /// it prunes files without risking a real span. A trace longer than this — or a hint far from the
@@ -62,6 +157,28 @@ pub struct SpanQueryRequest {
     /// Attribute keys to project onto trace-rollup rows (root-span attributes).
     /// Empty (default) ⇒ no attribute-map decode, hot path unchanged.
     pub projected_attributes: Vec<String>,
+    /// Long-tail attribute keys the CALLER knows a matching row must carry, on top of whatever
+    /// `query` already demands. Set it when the requirement is structural rather than something
+    /// the user typed: `span_issues` groups on a non-null `error.fingerprint`, so every segment
+    /// without that key is dead weight. See [`SpanQueryRequest::required_attr_keys`].
+    pub required_attributes: Vec<String>,
+}
+
+impl SpanQueryRequest {
+    /// Every long-tail attribute key a matching row must carry — the caller's
+    /// [`required_attributes`](Self::required_attributes) plus the un-negated map terms in the
+    /// grammar query. Feeds file-level pruning in `keep_span_search_candidate`.
+    pub(crate) fn required_attr_keys(&self) -> Vec<String> {
+        let mut keys = self.required_attributes.clone();
+        if let Some(q) = &self.query {
+            for k in q.required_attr_keys() {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+        }
+        keys
+    }
 }
 
 #[derive(Clone)]
@@ -257,22 +374,26 @@ impl SpanQueryEngine {
     /// No service filter param: spans filter service via the grammar (`service:x`), and the
     /// skip index's service range is a min/max, not something the grammar's arbitrary predicate
     /// can safely prune against here — correctness over pruning, per the design brief.
-    pub(crate) fn span_prune(&self, req: &SpanQueryRequest) -> Result<Vec<String>, PhotonError> {
+    pub(crate) fn span_prune(&self, req: &SpanQueryRequest) -> Result<SpanSurvivors, PhotonError> {
         let manifest = self.load_spans_manifest()?;
         let text_tokens = span_text_tokens(req);
-        let mut surviving: Vec<String> = Vec::new();
+        let mut out = SpanSurvivors {
+            paths: Vec::new(),
+            attr_keys: AttrKeys::default(),
+        };
         for entry in manifest.candidates(req.start_ts_nanos, req.end_ts_nanos) {
             if !self.keep_span_search_candidate(entry, req, text_tokens.as_deref())? {
                 continue;
             }
-            surviving.push(
+            out.attr_keys.absorb(entry);
+            out.paths.push(
                 self.hot_dir
                     .join(&entry.path)
                     .to_string_lossy()
                     .into_owned(),
             );
         }
-        Ok(surviving)
+        Ok(out)
     }
 
     /// [`span_prune`](Self::span_prune), fanned across the blocking pool in [`PRUNE_CHUNKS`]
@@ -287,7 +408,10 @@ impl SpanQueryEngine {
     /// is byte-identical to the sequential prune's. Nothing downstream may depend on that (there
     /// is an `ORDER BY` in every plan), but keeping it deterministic means a parallel prune can
     /// never be the reason two identical queries disagree.
-    async fn span_prune_fanned(&self, req: &SpanQueryRequest) -> Result<Vec<String>, PhotonError> {
+    async fn span_prune_fanned(
+        &self,
+        req: &SpanQueryRequest,
+    ) -> Result<SpanSurvivors, PhotonError> {
         let manifest = self.load_spans_manifest()?;
         let total = manifest
             .candidates(req.start_ts_nanos, req.end_ts_nanos)
@@ -311,10 +435,14 @@ impl SpanQueryEngine {
             tasks.push(spawn_blocking(move || {
                 let text_tokens = span_text_tokens(&req);
                 let candidates = manifest.candidates(req.start_ts_nanos, req.end_ts_nanos);
-                let mut kept: Vec<String> = Vec::new();
+                let mut kept = SpanSurvivors {
+                    paths: Vec::new(),
+                    attr_keys: AttrKeys::default(),
+                };
                 for entry in &candidates[lo..hi] {
                     if engine.keep_span_search_candidate(entry, &req, text_tokens.as_deref())? {
-                        kept.push(
+                        kept.attr_keys.absorb(entry);
+                        kept.paths.push(
                             engine
                                 .hot_dir
                                 .join(&entry.path)
@@ -323,16 +451,20 @@ impl SpanQueryEngine {
                         );
                     }
                 }
-                Ok::<Vec<String>, PhotonError>(kept)
+                Ok::<SpanSurvivors, PhotonError>(kept)
             }));
         }
 
-        let mut surviving = Vec::new();
+        let mut surviving = SpanSurvivors {
+            paths: Vec::new(),
+            attr_keys: AttrKeys::default(),
+        };
         for task in tasks {
-            surviving.extend(
-                task.await
-                    .map_err(|e| PhotonError::Query(format!("span prune task panicked: {e}")))??,
-            );
+            let chunk = task
+                .await
+                .map_err(|e| PhotonError::Query(format!("span prune task panicked: {e}")))??;
+            surviving.paths.extend(chunk.paths);
+            surviving.attr_keys.merge(chunk.attr_keys);
         }
         Ok(surviving)
     }
@@ -349,19 +481,30 @@ impl SpanQueryEngine {
         &self,
         req: &SpanQueryRequest,
     ) -> Result<Option<DataFrame>, PhotonError> {
+        Ok(self.span_survivors(req).await?.map(|(df, _)| df))
+    }
+
+    /// [`span_survivors_df`](Self::span_survivors_df) plus the manifest's view of the survivors'
+    /// long-tail attribute keys, for the read paths that build map lookups: passing the
+    /// [`AttrKeys`] to [`attr_lookup`] lets a probe for a key no surviving file declares collapse
+    /// to a NULL literal, which keeps the `attributes` column out of the scan entirely.
+    pub(crate) async fn span_survivors(
+        &self,
+        req: &SpanQueryRequest,
+    ) -> Result<Option<(DataFrame, AttrKeys)>, PhotonError> {
         let surviving = self.span_prune_fanned(req).await?;
-        if surviving.is_empty() {
+        if surviving.paths.is_empty() {
             return Ok(None);
         }
         let ctx = session();
         let df = ctx
             .read_parquet(
-                surviving,
+                surviving.paths,
                 ParquetReadOptions::default().schema(self.schema.arrow.as_ref()),
             )
             .await
             .map_err(|e| PhotonError::Query(format!("failed to read spans parquet files: {e}")))?;
-        Ok(Some(df))
+        Ok(Some((df, surviving.attr_keys)))
     }
 
     /// Decide whether a candidate file survives skip-index pruning for `search_spans` /
@@ -384,6 +527,23 @@ impl SpanQueryEngine {
         // exact pair, so this is a cheap belt-and-suspenders re-check, not new pruning power.
         if entry.max_ts_nanos < req.start_ts_nanos || entry.min_ts_nanos > req.end_ts_nanos {
             return Ok(false);
+        }
+
+        // Required long-tail keys (`req.required_attr_keys`, plus whatever the grammar's un-negated
+        // map terms demand). A segment that declares its keys and lists none of them cannot hold a
+        // matching row, so drop it whole — this is what makes the Backend Issues surface cheap:
+        // `error.fingerprint` exists in a handful of segments and every healthy one is skipped
+        // instead of scanned. `attribute_keys` is empty on segments written before the field
+        // existed and is indistinguishable from "no long-tail keys at all", so an empty list keeps
+        // the file — same conservative direction as a missing `.idx` below.
+        if !entry.attribute_keys.is_empty() {
+            let missing_required = req
+                .required_attr_keys()
+                .into_iter()
+                .any(|k| entry.attribute_keys.binary_search(&k).is_err());
+            if missing_required {
+                return Ok(false);
+            }
         }
 
         // Every search token must be possibly-present in the bloom. No tokens to search → keep
@@ -485,6 +645,7 @@ mod tests {
             limit: 10,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         }
     }
 

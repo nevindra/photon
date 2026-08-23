@@ -374,6 +374,48 @@ export function contextAt(query: string, caret: number): CompletionContext {
 // freetext and compare terms all yield field:null). `values` is the OR list with
 // empty segments skipped, matching listTokens' leniency (so `f:a,,b` -> ['a','b'],
 // `f:` -> [], `f:*` -> ['*']).
+function splitOutsideQuotes(rest: string): string[] {
+  const out: string[] = []
+  let inQuotes = false
+  let start = 0
+  for (let i = 0; i < rest.length; i++) {
+    const ch = rest[i]
+    if (ch === '"') inQuotes = !inQuotes
+    else if (ch === ',' && !inQuotes) {
+      out.push(rest.slice(start, i))
+      start = i + 1
+    }
+  }
+  out.push(rest.slice(start))
+  return out
+}
+
+/**
+ * One grammar term (`field:value`) built from an arbitrary value, or `null` when the grammar
+ * cannot express it. The frontend mirror of photon-api's `grammar_term`.
+ *
+ * Quoting a value with whitespace or a comma is not optional: the parser splits terms on
+ * whitespace and OR-lists on commas, so `service.name:my api` becomes a service plus a stray
+ * free-text word and the query quietly describes a different set of rows. A value containing a
+ * `"` has no representation at all — there is no escape — so it yields `null` and the caller drops
+ * the term rather than sending one that matches nothing.
+ */
+export function grammarTerm(field: string, value: string | null | undefined): string | null {
+  if (!value || value.includes('"')) return null
+  return /[\s,]/.test(value) ? `${field}:"${value}"` : `${field}:${value}`
+}
+
+/**
+ * A `field:` value as a person reads it — one surrounding pair of quotes stripped.
+ *
+ * Display only. `photon-core`'s parser treats those quotes as grouping (the only way to express a
+ * value containing a space), so a chip that shows them is showing punctuation the user did not
+ * mean to type.
+ */
+export function displayValue(value: string): string {
+  return value.length >= 2 && value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value
+}
+
 function parseFieldTerm(termText: string): ParsedFieldTerm {
   const negated = termText.startsWith('-') && termText.length > 1
   const body = negated ? termText.slice(1) : termText
@@ -381,10 +423,11 @@ function parseFieldTerm(termText: string): ParsedFieldTerm {
   const colonIdx = body.indexOf(':')
   if (colonIdx > 0) {
     const field = body.slice(0, colonIdx)
-    const values = body
-      .slice(colonIdx + 1)
-      .split(',')
-      .filter((v) => v !== '')
+    // Split on commas OUTSIDE quotes, matching photon-core's parser: `name:"GET /a,b"` is one
+    // value, not two. Values are kept VERBATIM (quotes and all) because these strings are written
+    // straight back into the query by `toggleFieldValue`/`removeField` — unquoting here would
+    // corrupt a value containing a space the moment somebody toggled a neighbouring one.
+    const values = splitOutsideQuotes(body.slice(colonIdx + 1)).filter((v) => v !== '')
     return { negated, field, values }
   }
   return { negated, field: null, values: [] }

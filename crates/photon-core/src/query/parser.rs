@@ -71,6 +71,35 @@ fn tokenize(input: &str) -> Result<Vec<(usize, String)>, ParseError> {
     Ok(out)
 }
 
+/// Split a `field:` value list on commas that are not inside a quoted span, so
+/// `name:"GET /a,b","POST /c"` is two values and not three.
+fn split_values(rest: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut in_quotes = false;
+    let mut start = 0usize;
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                out.push(&rest[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&rest[start..]);
+    out
+}
+
+/// Strip one matching pair of surrounding double quotes. A value with only one quote, or with
+/// quotes in the middle, is left exactly as written — guessing there would corrupt a real value.
+fn unquote(v: &str) -> String {
+    match (v.strip_prefix('"'), v.len() >= 2) {
+        (Some(inner), true) => inner.strip_suffix('"').unwrap_or(v).to_string(),
+        _ => v.to_string(),
+    }
+}
+
 /// Classify one token. Order: quoted phrase → `field:...` → `field<op>n` → bare word.
 /// Colon is checked before comparison operators so a value like `a>b` in `k:a>b` is a value,
 /// not a comparison.
@@ -108,7 +137,13 @@ fn classify(token: &str, offset: usize) -> Result<Term, ParseError> {
                 },
             });
         }
-        let values: Vec<String> = rest.split(',').map(|s| s.to_string()).collect();
+        // Split the OR-list on commas OUTSIDE quotes, then unquote each value — `"` around a
+        // value is grouping, not part of it. Without the unwrap, `service.name:"my api"` searches
+        // for a service whose name literally begins and ends with a quote character, which no
+        // producer emits: the term parses cleanly and silently matches nothing, which is the worst
+        // shape a filter bug can take. Quoting is the ONLY way to express a value containing a
+        // space or a comma, and operation names (`GET /v1/charges`) routinely contain both.
+        let values: Vec<String> = split_values(rest).into_iter().map(unquote).collect();
         if values.iter().any(|v| v.is_empty()) {
             return Err(ParseError {
                 message: "empty value in list".into(),
@@ -277,6 +312,70 @@ mod tests {
                     text: "timeout".into()
                 }
             )]
+        );
+    }
+
+    #[test]
+    fn a_quoted_value_drops_its_quotes() {
+        // Quoting is the only way to express a value with a space in it. Keeping the quotes made
+        // the term parse cleanly and match nothing — a filter bug with no error message.
+        let q = parse(r#"service.name:"my api""#).unwrap();
+        assert_eq!(
+            q.terms[0].kind,
+            TermKind::Match {
+                field: "service.name".into(),
+                values: vec!["my api".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_comma_inside_quotes_is_part_of_the_value_not_a_list_separator() {
+        let q = parse(r#"name:"GET /a,b""#).unwrap();
+        assert_eq!(
+            q.terms[0].kind,
+            TermKind::Match {
+                field: "name".into(),
+                values: vec!["GET /a,b".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_quoted_or_list_still_splits_on_the_outer_commas() {
+        let q = parse(r#"name:"GET /a","POST /b""#).unwrap();
+        assert_eq!(
+            q.terms[0].kind,
+            TermKind::Match {
+                field: "name".into(),
+                values: vec!["GET /a".into(), "POST /b".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_negated_quoted_value_is_still_negated() {
+        let q = parse(r#"-service.name:"my api""#).unwrap();
+        assert!(q.terms[0].negated);
+        assert_eq!(
+            q.terms[0].kind,
+            TermKind::Match {
+                field: "service.name".into(),
+                values: vec!["my api".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_value_with_an_inner_quote_is_left_exactly_as_written() {
+        // Guessing here would corrupt a real value: only a matching surrounding PAIR is grouping.
+        let q = parse(r#"k:a"b"c"#).unwrap();
+        assert_eq!(
+            q.terms[0].kind,
+            TermKind::Match {
+                field: "k".into(),
+                values: vec![r#"a"b"c"#.into()],
+            }
         );
     }
 

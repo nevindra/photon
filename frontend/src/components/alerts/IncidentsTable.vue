@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // AlertsView's "incidents" tab body (Task 15). Reference layout: the approved "Variant 1" Incidents
-// mockup (.superpowers/brainstorm/…/alerts-final.html) — one card, a "Triggered now" group (red pill
+// mockup — one card, a "Triggered now" group (red pill
 // + a subtle left accent bar) above a "Resolved · 24h" group, no full-width banner, no Silence action
 // (v1 non-goal). Mirrors AlertRuleRow.vue's just-landed conventions (Task 13) for a consistent look
 // across the two tabs: `signalColor`/`StatusPill` for chips/pills, and the same svc:/app:/group_by
@@ -118,7 +118,7 @@ function durationLabel(ms: number): string {
       title="No incidents"
       description="Nothing has triggered recently."
     />
-    <div v-else class="overflow-hidden rounded-lg border border-border bg-card shadow-1">
+    <div v-else class="overflow-hidden rounded-xl border border-border bg-card shadow-1">
       <div
         class="flex items-center gap-1.5 border-b border-border bg-muted/40 px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
         data-testid="incidents-group-triggered"

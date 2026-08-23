@@ -320,6 +320,7 @@ mod forwarder_tests {
             signals: None,
             interval_secs: 30,
             queue_batches: 16,
+            push_service_rollup: true,
         }
     }
 

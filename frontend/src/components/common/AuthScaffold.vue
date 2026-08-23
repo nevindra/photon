@@ -17,7 +17,7 @@ defineProps({
     </div>
 
     <div
-      class="relative w-full max-w-[400px] rounded-lg border border-border bg-surface-1 p-8 shadow-2"
+      class="relative w-full max-w-[400px] rounded-2xl border border-border bg-surface-1 p-8 shadow-2"
     >
       <div class="flex items-center gap-3">
         <div class="relative">

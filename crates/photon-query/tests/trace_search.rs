@@ -333,6 +333,7 @@ fn req(sort: SpanSort, limit: usize, offset: usize, query: Option<&str>) -> Span
         limit,
         offset,
         projected_attributes: Vec::new(),
+        required_attributes: Vec::new(),
     }
 }
 
@@ -668,6 +669,7 @@ async fn straddling_trace_spans_before_the_window_are_rolled_up_fully() {
         limit: 100,
         offset: 0,
         projected_attributes: Vec::new(),
+        required_attributes: Vec::new(),
     };
     let res = engine(tmp.path()).search_traces(r).await.unwrap();
 
@@ -690,10 +692,15 @@ async fn straddling_trace_spans_before_the_window_are_rolled_up_fully() {
 
 #[tokio::test]
 async fn ranking_caps_rollup_at_max_candidate_traces_while_matched_count_is_full() {
-    // Bounded-memory boundary: with 2001 distinct traces (> the 2000 cap), `matched_count` still
-    // reports the full distinct total, but only the newest 2000 are ranked/rolled up (DataFusion
-    // `LIMIT` — never an unbounded Rust Vec). `limit` is set above the cap so paging can't be the
-    // limiter; the oldest trace (smallest start) is the one dropped by the cap.
+    // Bounded-memory boundary: with 2001 distinct traces (> the 2000 cap), only the newest 2000
+    // are ranked/rolled up (DataFusion `LIMIT` — never an unbounded Rust Vec), and `matched_count`
+    // still describes the whole match, not the page. `limit` is set above the cap so paging can't
+    // be the limiter; the oldest trace (smallest start) is the one dropped by the cap.
+    //
+    // Above the cap that total is an ESTIMATE. An exact `COUNT(DISTINCT trace_id)` runs in a
+    // non-spillable aggregate and died with "Resources exhausted" on a 7-day window; HyperLogLog
+    // has fixed-size state and ~1% relative error, and `matched_count_estimated` says which kind
+    // of number the caller got.
     let tmp = TempDir::new().unwrap();
     let count = MAX_TRACES_OVER_CAP;
     let mut records = Vec::with_capacity(count);
@@ -721,12 +728,20 @@ async fn ranking_caps_rollup_at_max_candidate_traces_while_matched_count_is_full
         limit: 5000, // above the cap, so the 2000 ceiling comes from the ranking, not paging
         offset: 0,
         projected_attributes: Vec::new(),
+        required_attributes: Vec::new(),
     };
     let res = engine(tmp.path()).search_traces(r).await.unwrap();
 
-    assert_eq!(
-        res.matched_count, count as u64,
-        "matched_count reports the full distinct total (COUNT(DISTINCT trace_id))"
+    assert!(
+        res.matched_count_estimated,
+        "a ranked page that filled the cap cannot know the exact total cheaply, and must say so"
+    );
+    let err = (res.matched_count as f64 - count as f64).abs() / count as f64;
+    assert!(
+        err < 0.02,
+        "matched_count still describes the whole match: {} against {count} ({:.2}% off)",
+        res.matched_count,
+        err * 100.0
     );
     assert_eq!(
         res.traces.len(),
@@ -840,6 +855,7 @@ async fn fanned_prune_still_drops_out_of_window_files() {
         limit: PRUNE_FANOUT_SEGMENTS,
         offset: 0,
         projected_attributes: Vec::new(),
+        required_attributes: Vec::new(),
     };
     let res = engine(tmp.path()).search_traces(r).await.unwrap();
 

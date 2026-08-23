@@ -17,6 +17,15 @@ import {
   mockTracesHistogram,
   mockTracesLatency,
   mockRed,
+  mockLatencyHeatmap,
+  mockBackendIssues,
+  mockBackendIssueFacets,
+  mockBackendIssueDetail,
+  mockServiceMap,
+  mockDeployments,
+  mockSlos,
+  mockSloBudget,
+  mockServiceUsage,
   mockMetricCatalog,
   mockMetricMetadata,
   mockMetricLabels,
@@ -276,17 +285,323 @@ export interface LatencyResult {
   p99: string
 }
 export type RedGroup = 'operation' | 'service'
+/// Which read path produced a row: the `photon.service.*` rollup, or a raw span scan.
+/// See docs/subsystems/rollup.md.
+export type RedSource = 'rollup' | 'raw'
 export interface RedRow {
   service: string
   tenant?: string | null
+  /** `deployment.environment`; present for `group=service` only. */
+  environment?: string | null
   operation: string | null
+  count: number
+  rate: number
+  /** Every span the service emitted, all kinds — beside `count`, never instead of it (ADR-0003). */
+  span_count?: number
+  /** Which cascade rule produced `count`. `all_spans` earns a `span-based` badge. */
+  basis?: 'entry' | 'trace_root' | 'all_spans'
+  error_count: number
+  error_rate: number
+  http_4xx?: number
+  http_5xx?: number
+  satisfied?: number
+  tolerating?: number
+  frustrated?: number
+  apdex?: number | null
+  p50: string
+  p90: string
+  p99: string
+  source?: RedSource
+}
+
+// --- Services index (`GET /api/services/overview`) ---
+/** `[epoch ms, value]`, the shape the chart components already read. */
+export type SparkPoint = [number, number]
+/**
+ * One Site as the index's band needs it: registry facts only.
+ *
+ * No per-Site totals here on purpose — they live in `rows`, which the fleet merge walks anyway.
+ * Two separately-computed copies of "how many requests did jkt serve" is how a band and the table
+ * under it start disagreeing inside one response.
+ */
+export interface OverviewSite {
+  name: string
+  status: 'up' | 'stale' | 'down'
+  last_seen_ms: number
+  mode: string | null
+  ui_url: string | null
+}
+export interface OverviewRow extends RedRow {
+  spark: SparkPoint[]
+  error_spark: SparkPoint[]
+}
+export interface ServicesOverview {
+  source: RedSource
+  window: { start: string; end: string; buckets: number }
+  sites: OverviewSite[]
+  rows: OverviewRow[]
+}
+export interface ServiceOperations {
+  source: RedSource
+  window: { start: string; end: string; buckets: number }
+  rows: OverviewRow[]
+}
+/**
+ * A latency heatmap: `[timeBucketIndex, bandIndex, count]` cells over a fixed latency ladder.
+ *
+ * Cells are SPARSE — an empty cell is absent, not zero. `bounds` are the ladder's inclusive upper
+ * edges as nanosecond STRINGS (JS-safe); band `bounds.length` is everything above the last edge.
+ * `open_spans` are spans that never closed, counted apart from every band because "under 1ms" and
+ * "never finished" are opposite facts.
+ */
+export type HeatCell = [number, number, number]
+export interface LatencyHeatmap {
+  /** Bucket START timestamps, epoch ms. */
+  columns: number[]
+  bounds: string[]
+  cells: HeatCell[]
+  open_spans: number
+}
+
+// --- Backend Issues (`GET /api/services[/:service]/errors*`) ---
+/**
+ * One Backend Issue: every errored span sharing `(service, fingerprint)` in the window.
+ *
+ * Identity is the PAIR. The fingerprint hashes the exception and nothing about where it ran, so
+ * the same exception in two services is two Issues — two owners, two deploys, two fixes. Rows on
+ * the fleet list therefore always name their own service.
+ *
+ * `traces` is the backend's answer to RUM's `sessions`: how many requests went wrong, where
+ * `count` also counts a retry loop inside one of them.
+ */
+export interface BackendIssue {
+  service: string
+  fingerprint: string
+  error_type: string
+  message: string
+  count: number
+  traces: number
+  /** Distinct operations this Issue reaches. `> 1` means one fault, several call sites. */
+  operations: number
+  /** Epoch NANOSECOND strings (JS-safe), like every other span timestamp on this surface. */
+  first_seen: string
+  last_seen: string
+  trace_id?: string | null
+}
+export interface BackendIssuesResult {
+  /** Absent on the fleet-wide list — there, each row names its own service. */
+  service?: string
+  window: { start: string; end: string }
+  errors: BackendIssue[]
+}
+export interface BackendIssueFacetsResult {
+  service: string
+  facets: Record<string, FacetResult>
+}
+export interface BackendIssueTag {
+  field: string
+  values: FacetValue[]
+}
+/** One occurrence: a single errored span, with everything needed to jump to it. */
+export interface BackendIssueEvent {
+  timestamp: string
+  trace_id: string
+  span_id: string
+  operation: string
+  kind: string
+  duration_nanos: string | null
+  status_message: string
+  host: string
+  environment: string
+}
+/** `[epoch ms, occurrences]` — already in the shape the chart components read. */
+export type IssuePoint = [number, number]
+export interface BackendIssueDetail {
+  service: string
+  fingerprint: string
+  error_type: string
+  message: string
+  first_seen: string
+  last_seen: string
+  occurrences: number
+  traces: number
+  operations: number
+  series: IssuePoint[]
+  tags: BackendIssueTag[]
+  /** `null` when the producer set `status = ERROR` without recording an exception. */
+  sample_stack: string | null
+  events: BackendIssueEvent[]
+}
+
+// --- Service map (`GET /api/services/map`) ---
+/**
+ * One service in the topology. Counts are over ALL its spans in the window, not just the ones on
+ * edges — a node's size should mean "how busy is this", not "how connected is this".
+ */
+export interface ServiceMapNode {
+  service: string
   count: number
   rate: number
   error_count: number
   error_rate: number
+  /** Spans with no parent — trace roots. Where work enters the system. */
+  roots: number
+  is_entry: boolean
+}
+/**
+ * One directed call edge. Latency is the CALLEE's own span duration, not the caller's wall-clock:
+ * the difference is network and queueing, and mixing the two would make the number mean neither.
+ */
+export interface ServiceMapEdge {
+  from: string
+  to: string
+  count: number
+  rate: number
+  error_count: number
+  error_rate: number
+  /** Nanosecond strings (JS-safe). */
   p50: string
-  p90: string
+  p95: string
   p99: string
+}
+export interface ServiceMapResult {
+  window: { start: string; end: string }
+  /** The focused service, or `null` for the fleet map. */
+  service: string | null
+  nodes: ServiceMapNode[]
+  edges: ServiceMapEdge[]
+  /** Spans actually read. Lets a thin map be told apart from a truncated one. */
+  scanned: number
+  /** `true` when the scan cap bit — edges are then incomplete, and the UI must say so. */
+  capped: boolean
+}
+
+// --- Deployments (`GET/POST /api/deployments`) ---
+/**
+ * One release.
+ *
+ * `source` is how the row was FIRST noticed, not what it now contains: a `detected` row that CI
+ * later enriched keeps `detected`, and the presence of `commit_sha`/`author`/`message` is what says
+ * CI got involved. `detected_at_ms` is the first sighting by whichever side saw it first, and is
+ * never rewritten — a late CI post must not move a deploy marker away from the moment the graph
+ * actually changed.
+ */
+export interface Deployment {
+  id: string
+  service: string
+  environment: string
+  tenant: string
+  version: string
+  /** Unix MILLISECONDS (this table stores ms, unlike the ns-string span windows). */
+  detected_at_ms: number
+  source: 'detected' | 'ci'
+  commit_sha: string | null
+  author: string | null
+  message: string | null
+  url: string | null
+}
+export interface DeploymentsResult {
+  deployments: Deployment[]
+}
+// --- Per-service data usage (`GET /api/usage/services`) ---
+/** One signal's contribution for one service. */
+export interface ServiceUsageSignal {
+  rows: number
+  /** ESTIMATED bytes: this service's rows × the signal's mean bytes/row. Never measured. */
+  bytes: number
+}
+export interface ServiceUsageRow {
+  service: string
+  signals: { logs: ServiceUsageSignal; traces: ServiceUsageSignal }
+  rows_total: number
+  bytes_total: number
+}
+export interface ServiceUsageSignalBasis {
+  store_rows: number
+  store_bytes: number
+  bytes_per_row: number
+  /**
+   * `false` means this signal contributes to no row's total — NOT that it is empty. Metrics are
+   * `false`: a metric series is keyed by name, and host metrics, RUM vitals and the service
+   * rollup's own output do not belong to a service at all.
+   */
+  attributed: boolean
+  capped: boolean
+}
+export interface ServiceUsageResult {
+  window: { start: string; end: string }
+  rows: ServiceUsageRow[]
+  /** Always `true`. Kept on the wire so a reader cannot mistake these bytes for measured ones. */
+  estimated: boolean
+  signals: {
+    logs: ServiceUsageSignalBasis
+    traces: ServiceUsageSignalBasis
+    metrics: ServiceUsageSignalBasis
+  }
+  notes: { metrics: string }
+}
+
+// --- SLOs, error budgets and burn rate (`/api/services/:service/slos*`) ---
+export type SloKind = 'availability' | 'latency'
+export interface Slo {
+  id: string
+  service: string
+  environment: string
+  /** `""` = the whole service; a name holds one endpoint to a tighter line than the service. */
+  operation: string
+  name: string
+  kind: SloKind
+  /** Fraction of good events promised, 0 < target < 1. 0.999 is three nines. */
+  target: number
+  /** Latency SLOs only; `0` on an availability SLO. */
+  threshold_ms: number
+  window_days: number
+}
+export interface SloInput {
+  name: string
+  environment?: string
+  operation?: string
+  kind: SloKind
+  target: number
+  threshold_ms?: number
+  window_days: number
+}
+/** One burn-rate window pair. `firing` requires BOTH windows — see `docs/subsystems/services-apm.md`. */
+export interface BurnWindow {
+  long: string
+  short: string
+  long_rate: number
+  short_rate: number
+  threshold: number
+  firing: boolean
+}
+export interface SloBudget {
+  slo: Slo
+  /** The window actually measured, epoch ms. When `partial`, less than the SLO's nominal window. */
+  window_start_ms: number
+  window_end_ms: number
+  /** `true` when the rollup does not cover the whole SLO window. */
+  partial: boolean
+  total_events: number
+  bad_events: number
+  sli: number | null
+  budget_events: number
+  remaining_events: number
+  remaining_fraction: number | null
+  exhausts_in_secs: number | null
+  fast: BurnWindow
+  slow: BurnWindow
+  /** Latency SLOs: the histogram edge the count was actually taken at. */
+  measured_threshold_ms: number | null
+}
+
+export interface DeploymentFilter {
+  service?: string
+  environment?: string
+  tenant?: string
+  /** Epoch NANOSECOND strings, like every other window param. */
+  start?: string
+  end?: string
 }
 
 // --- Metrics ---
@@ -439,17 +754,58 @@ export interface ServiceTimeseriesRange {
   buckets?: number
   q?: string
 }
+/**
+ * One bucket of `/api/services/:service/timeseries`.
+ *
+ * This type was missing two thirds of what the route returns — the counts, the Apdex bands, the
+ * entry-set basis — which meant the detail page could only draw rates and percentiles even though
+ * everything else was already on the wire.
+ */
 export interface ServiceTimeseriesBucket {
+  /** Bucket start, epoch ms. */
   ts: number
+  source?: RedSource
   rate: number
   error_rate: number
+  /** Requests served in the bucket: the series' ENTRY spans (ADR-0003). */
+  count: number
+  /** Every span in the bucket, all kinds — beside `count`, never instead of it. */
+  span_count: number
+  /** Which cascade rule produced `count`. The same value on every bucket of one series. */
+  basis?: 'entry' | 'trace_root' | 'all_spans'
+  error_count: number
+  http_4xx: number
+  http_5xx: number
   p50: string
   p90: string
   p99: string
+  apdex: number | null
+  satisfied: number
+  tolerating: number
+  frustrated: number
+}
+/**
+ * One downstream call target: a database (`system` set) or an external peer (`system` null).
+ *
+ * NOT a Service — it has no page of its own, no health, and no spans it owns. `CONTEXT.md` is
+ * explicit about the distinction, which is why these rows live apart from the service map's edges
+ * even though `/services/:service/dependencies` draws both in one picture.
+ */
+export interface DepRow {
+  name: string
+  system: string | null
+  count: number
+  rate: number
+  error_count: number
+  error_rate: number
+  /** Nanosecond strings (JS-safe). */
+  p50: string
+  p95: string
+  p99: string
 }
 export interface ServiceDependencies {
-  database: unknown[]
-  external: unknown[]
+  database: DepRow[]
+  external: DepRow[]
 }
 export interface ServiceSettings {
   apdex_threshold_ms: number
@@ -674,9 +1030,8 @@ export interface InfraProcessesResult {
 }
 
 // --- Alerts (webhook alert & notification engine) ---
-// Field names/shapes mirror docs/superpowers/specs/2026-07-18-webhook-alert-notifications-design.md
-// §5 (data model) and §5.1 (per-signal `condition` JSON) exactly — the backend (not yet built)
-// is expected to match this contract.
+// Field names/shapes mirror the alerts data model and its per-signal `condition` JSON exactly —
+// see docs/subsystems/alerts.md.
 export type AlertSignal = 'metrics' | 'logs' | 'traces' | 'rum'
 export type AlertCmp = 'gt' | 'gte' | 'lt' | 'lte'
 export type AlertSeverity = 'info' | 'warning' | 'critical'
@@ -1192,6 +1547,142 @@ export const api = {
     }
   },
 
+  // The whole Services index in one request. N per-row calls at a 15s poll would be unusable the
+  // moment a fleet has thirty services, which is why this route exists at all.
+  async servicesOverview(query: string, startNs: string, endNs: string, buckets: number, opts: RequestOpts = {}): Promise<ServicesOverview> {
+    try {
+      return await http
+        .get('services/overview', {
+          searchParams: { q: query, start: startNs, end: endNs, buckets },
+          signal: opts.signal,
+        })
+        .json<ServicesOverview>()
+    } catch (e: any) {
+      if (e.status === 400) throw e // bad query — surface it, don't mock
+      api.mock = true
+      const rows = (mockRed(query, startNs, endNs, 'service') as RedRow[]).map((r) => ({
+        ...r,
+        spark: [] as SparkPoint[],
+        error_spark: [] as SparkPoint[],
+      }))
+      return { source: 'raw', window: { start: startNs, end: endNs, buckets }, sites: [], rows }
+    }
+  },
+
+  async serviceOperations(service: string, query: string, startNs: string, endNs: string, buckets: number, opts: RequestOpts = {}): Promise<ServiceOperations> {
+    try {
+      return await http
+        .get(`services/${encodeURIComponent(service)}/operations`, {
+          searchParams: { q: query, start: startNs, end: endNs, buckets },
+          signal: opts.signal,
+        })
+        .json<ServiceOperations>()
+    } catch (e: any) {
+      if (e.status === 400) throw e // bad query — surface it, don't mock
+      api.mock = true
+      const rows = (mockRed(query, startNs, endNs, 'operation') as RedRow[]).map((r) => ({
+        ...r,
+        spark: [] as SparkPoint[],
+        error_spark: [] as SparkPoint[],
+      }))
+      return { source: 'raw', window: { start: startNs, end: endNs, buckets }, rows }
+    }
+  },
+
+  async serviceOperationHeatmap(service: string, operation: string, query: string, startNs: string, endNs: string, buckets: number, opts: RequestOpts = {}): Promise<LatencyHeatmap> {
+    try {
+      return await http
+        .get(`services/${encodeURIComponent(service)}/operations/${encodeURIComponent(operation)}/heatmap`, {
+          searchParams: { q: query, start: startNs, end: endNs, buckets },
+          signal: opts.signal,
+        })
+        .json<LatencyHeatmap>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      api.mock = true
+      return mockLatencyHeatmap(startNs, endNs, buckets) as LatencyHeatmap
+    }
+  },
+
+  // --- Backend Issues. `service` omitted = the fleet-wide list. ---
+
+  async backendIssues(service: string | null, q: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<BackendIssuesResult> {
+    const path = service ? `services/${encodeURIComponent(service)}/errors` : 'services/errors'
+    try {
+      return await http
+        .get(path, { searchParams: { q, start: startNs, end: endNs }, signal: opts.signal })
+        .json<BackendIssuesResult>()
+    } catch (e: any) {
+      if (e.status === 400) throw e // bad query — surface it, don't mock
+      api.mock = true
+      return mockBackendIssues(service, q, startNs, endNs) as BackendIssuesResult
+    }
+  },
+
+  async backendIssueFacets(service: string, q: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<BackendIssueFacetsResult> {
+    try {
+      return await http
+        .get(`services/${encodeURIComponent(service)}/errors/facets`, {
+          searchParams: { q, start: startNs, end: endNs },
+          signal: opts.signal,
+        })
+        .json<BackendIssueFacetsResult>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      api.mock = true
+      return mockBackendIssueFacets(service) as BackendIssueFacetsResult
+    }
+  },
+
+  async backendIssueDetail(service: string, fingerprint: string, q: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<BackendIssueDetail> {
+    try {
+      return await http
+        .get(`services/${encodeURIComponent(service)}/errors/${encodeURIComponent(fingerprint)}`, {
+          searchParams: { q, start: startNs, end: endNs },
+          signal: opts.signal,
+        })
+        .json<BackendIssueDetail>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      api.mock = true
+      return mockBackendIssueDetail(service, fingerprint, startNs, endNs) as BackendIssueDetail
+    }
+  },
+
+  /**
+   * The service topology. `service` narrows to edges touching it in BOTH directions; `null` is the
+   * fleet map. Note it is a separate param, never folded into `q` — scoping the scan to one service
+   * would delete the parent spans the join needs and the map would come back empty.
+   */
+  async deployments(filter: DeploymentFilter = {}, opts: RequestOpts = {}): Promise<DeploymentsResult> {
+    const searchParams: Record<string, string> = {}
+    for (const [k, v] of Object.entries(filter)) if (v) searchParams[k] = v
+    try {
+      return await http.get('deployments', { searchParams, signal: opts.signal }).json<DeploymentsResult>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      // A 404 here means "this node has no deployments table", which is a real answer, not a
+      // fallback case — but the mock path exists so the offline UI still has a timeline to draw.
+      api.mock = true
+      return mockDeployments(filter) as DeploymentsResult
+    }
+  },
+
+  async serviceMap(service: string | null, q: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<ServiceMapResult> {
+    try {
+      return await http
+        .get('services/map', {
+          searchParams: { q, start: startNs, end: endNs, ...(service ? { service } : {}) },
+          signal: opts.signal,
+        })
+        .json<ServiceMapResult>()
+    } catch (e: any) {
+      if (e.status === 400) throw e // bad query — surface it, don't mock
+      api.mock = true
+      return mockServiceMap(service, startNs, endNs) as ServiceMapResult
+    }
+  },
+
   async metricCatalog(startNs: string, endNs: string, { search, type }: MetricCatalogFilter = {}, opts: RequestOpts = {}): Promise<MetricCatalogEntry[]> {
     const searchParams: Record<string, string | number> = { start: startNs, end: endNs }
     if (search) searchParams.search = search
@@ -1378,6 +1869,62 @@ export const api = {
     } catch {
       api.mock = true
       return { database: [], external: [] }
+    }
+  },
+
+  async serviceUsage(startNs: string, endNs: string, limit = 50, opts: RequestOpts = {}): Promise<ServiceUsageResult> {
+    try {
+      return await http
+        .get('usage/services', {
+          searchParams: { start: startNs, end: endNs, limit: String(limit) },
+          signal: opts.signal,
+        })
+        .json<ServiceUsageResult>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      api.mock = true
+      return mockServiceUsage(startNs, endNs, limit) as ServiceUsageResult
+    }
+  },
+
+  async slos(service: string, opts: RequestOpts = {}): Promise<{ slos: Slo[] }> {
+    try {
+      return await http.get(`services/${encodeURIComponent(service)}/slos`, { signal: opts.signal }).json<{ slos: Slo[] }>()
+    } catch {
+      api.mock = true
+      return { slos: mockSlos(service) as Slo[] }
+    }
+  },
+
+  async createSlo(service: string, input: SloInput, opts: RequestOpts = {}): Promise<{ slo: Slo }> {
+    // No mock fallback and no swallowed 400: a create that silently "succeeded" against nothing is
+    // worse than an error, because the user then believes the objective exists.
+    return await http
+      .post(`services/${encodeURIComponent(service)}/slos`, { json: input, signal: opts.signal })
+      .json<{ slo: Slo }>()
+  },
+
+  async updateSlo(service: string, id: string, input: SloInput, opts: RequestOpts = {}): Promise<{ slo: Slo }> {
+    return await http
+      .patch(`services/${encodeURIComponent(service)}/slos/${encodeURIComponent(id)}`, {
+        json: input, signal: opts.signal,
+      })
+      .json<{ slo: Slo }>()
+  },
+
+  async deleteSlo(service: string, id: string, opts: RequestOpts = {}): Promise<void> {
+    await http.delete(`services/${encodeURIComponent(service)}/slos/${encodeURIComponent(id)}`, { signal: opts.signal })
+  },
+
+  async sloBudget(service: string, id: string, opts: RequestOpts = {}): Promise<SloBudget> {
+    try {
+      return await http
+        .get(`services/${encodeURIComponent(service)}/slos/${encodeURIComponent(id)}/budget`, { signal: opts.signal })
+        .json<SloBudget>()
+    } catch (e: any) {
+      if (e.status === 400 || e.status === 404) throw e
+      api.mock = true
+      return mockSloBudget(service, id) as SloBudget
     }
   },
 

@@ -113,7 +113,7 @@ onUnmounted(() => {
 <template>
   <Spinner v-if="storageLoading" size="sm">Loading…</Spinner>
   <div v-else class="flex flex-col gap-4">
-    <div class="flex items-start gap-2 rounded-lg border border-sev-error/40 bg-sev-error-soft px-4 py-3 text-xs">
+    <div class="flex items-start gap-2 rounded-xl border border-sev-error/40 bg-sev-error-soft px-4 py-3 text-xs">
       <TriangleAlert class="mt-0.5 size-4 shrink-0 text-sev-error" />
       <p class="text-sev-error/90">
         Purges are <span class="font-semibold">immediate and permanent</span>. Deleting data here also

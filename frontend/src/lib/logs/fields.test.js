@@ -4,7 +4,7 @@ import { SEVERITIES } from '@/lib/core/format'
 import { tokenize } from '@/lib/core/queryLang'
 
 describe('FIELDS catalog', () => {
-  it('is exactly the six fixed fields, in a stable order', () => {
+  it('is exactly the seven fixed fields, in a stable order', () => {
     expect(FIELDS.map((f) => f.name)).toEqual([
       'service',
       'level',
@@ -12,6 +12,7 @@ describe('FIELDS catalog', () => {
       'trace_id',
       'span_id',
       'tenant',
+      'deployment.environment',
     ])
   })
 

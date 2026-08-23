@@ -669,16 +669,22 @@ pub(crate) async fn summary(State(st): State<AppState>) -> Response {
         Ok(l) => l,
         Err(e) => return err_500(e),
     };
+    Json(summaries_for(&st, &list).await).into_response()
+}
+
+/// The per-tenant liveness snapshot, extracted so `services_overview.rs`'s Site band reuses this
+/// logic instead of re-deriving it. Two pages disagreeing about whether a Site is up would be
+/// worse than either being wrong.
+pub(crate) async fn summaries_for(st: &AppState, list: &[Tenant]) -> Vec<TenantSummary> {
     let promoted = st.metrics_query.promoted_attributes().to_vec();
     let now = now_ms();
     // 4 engine queries per tenant — run tenants concurrently instead of 4N serial awaits.
     // ponytail: still 4 queries/tenant; fold into one group_by=["tenant"] pass if N grows.
-    let out = futures::future::join_all(
+    futures::future::join_all(
         list.iter()
             .map(|t| build_tenant_summary(&st.metrics_query, t, &promoted, now)),
     )
-    .await;
-    Json(out).into_response()
+    .await
 }
 
 #[cfg(test)]

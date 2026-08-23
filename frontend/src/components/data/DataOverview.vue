@@ -120,7 +120,7 @@ const ingestionSeries = computed(() =>
     <div
       v-if="fed?.enabled"
       data-testid="federation-status"
-      class="rounded-lg border border-border bg-surface-1 p-4"
+      class="rounded-xl border border-border bg-surface-1 p-4"
     >
       <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="flex items-center gap-2">

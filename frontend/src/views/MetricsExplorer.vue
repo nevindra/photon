@@ -323,6 +323,7 @@ defineExpose({ metric, agg, groupBy, filter, mode, viz });
         active="metrics"
         :mock="api.mock"
         crumb="Metrics"
+        surface="sheet"
         :live="mode === 'explore'"
         :live-mode="liveTail.mode.value"
         :live-status="liveTail.status.value"
@@ -465,7 +466,7 @@ defineExpose({ metric, agg, groupBy, filter, mode, viz });
                                 v-if="showYLogToggle"
                                 type="button"
                                 data-testid="ylog-toggle"
-                                class="ml-3 self-center rounded-lg border px-2 py-1 text-[11px] font-mono transition-colors"
+                                class="ml-3 self-center rounded-md border px-2 py-1 text-[11px] font-mono transition-colors"
                                 :class="
                                     yLog
                                         ? 'border-brand/50 bg-brand/10 text-foreground'

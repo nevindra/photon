@@ -68,6 +68,18 @@ public API, adding a dependency, or touching the query/chart data path.
 - **Prometheus classic-histogram families:** folded at query time (not ingest). `le` is always
   consumed by the aggregation and never a group-by dimension. Supported percentiles are p50/p90/p99
   (no p95).
+- **`promoted_attributes` is a read-path lever, not cosmetics.** A span Parquet's long-tail
+  `attributes` map is 63% of the file's bytes and **96% of its decoded bytes**, so referencing it at
+  all costs roughly the same however many keys are probed. Promotion is what gets a query off it;
+  `span_engine::attr_lookup` picks the cheapest correct form per key and drops the map column
+  entirely when the manifest proves no surviving file carries it. Changing the list only affects
+  segments written from then on — a query spanning the change reads both layouts correctly, and the
+  speed arrives once the older segments age out.
+- **Parquet filter pushdown stays OFF.** Photon reads with an explicit schema, and in DataFusion 43
+  pushdown over files whose schemas differ from it empties any `LIMIT` plan — silently. The failure
+  hides behind any sort or aggregate, so it shows up as "this metric does not exist" on exactly the
+  three call sites that filter straight into a limit. See
+  [`architecture.md`](architecture.md) and the regression test in `photon-query/src/lib.rs`.
 - **Two independent auth systems, never conflated:** OTLP **ingest** uses a shared service **bearer
   token** (`[ingest].token`); human **UI** users use **argon2 password + signed session cookie**.
   RUM's public beacon (`POST /api/rum`) uses a **third** model — per-app public key + Origin
@@ -84,21 +96,39 @@ public API, adding a dependency, or touching the query/chart data path.
 - **No Pinia.** Server state lives in **TanStack Query** (a request cache); within-view state lives
   in **URL params** (`useUrlState.js`, `?tab=`, route params). App-wide state is a few ad-hoc
   reactive-ref modules — the module-singleton pattern, not a store: `lib/auth.js`, `lib/theme.js`,
-  and `lib/context.ts` — the sanctioned home for app-wide **time window** (`timeRange`/`customRange`,
-  plus derived `startNs`/`endNs`) and **entity scope** (`scope`, e.g. a service or RUM app). Do not
-  add a global store, and do not duplicate time/scope state locally in a view — read it from
-  `context.ts`.
-- **URL query-key ownership is split and merge-preserving.** `lib/context.ts` is the *sole* owner of
-  the `range`/`from`/`to`/`scope` keys; `useUrlState.js` owns only `svc`/`sev`/`q` (per-view
+  and `lib/core/context.ts` — the sanctioned home for the three app-wide context dimensions: the
+  **time window** (`timeRange`/`customRange`, plus derived `startNs`/`endNs`), the **Site**
+  (`tenant`), and the **environment** (`environment`, i.e. `deployment.environment`). Do not add a
+  global store, and do not duplicate any of it locally in a view — read it from `context.ts`.
+- **URL query-key ownership is split and merge-preserving.** `lib/core/context.ts` is the *sole*
+  owner of the `range`/`from`/`to`/`tenant`/`env` keys; `useUrlState.ts` owns only `svc`/`sev`/`q` (per-view
   service/severity/text filters). Each module's URL sync (`history.replaceState`) deletes and
   rewrites *only* the keys it owns, leaving the rest of `location.search` untouched — so editing a
   view's text filter never clobbers the current time window, and changing the time range never drops
   a view's filters. `lib/useCorrelate.ts`'s `correlate()` follows the same discipline when building
-  cross-signal links: it always injects the current time+scope alongside the destination's own query
-  params. Give any new URL-backed state a single owning module and touch only that module's keys.
+  cross-signal links: it always injects the current time+tenant+env alongside the destination's own
+  query params. Give any new URL-backed state a single owning module and touch only that module's keys.
+- **Every query composable appends the global context through `withContext()`.** The Site and
+  environment dimensions filter by contributing grammar terms (`tenant:x`,
+  `deployment.environment:y`) to the `q`/`filter` string a composable sends, and `contextQueryTerm()`
+  is the single cache-key slot they re-key on — one slot, not one per dimension, so adding a fourth
+  dimension later doesn't widen every key. Never hand-roll the join at a call site: a composable that
+  appends one dimension but not the other renders a page that silently ignores a picker, which is
+  worse than not having the picker. The one sanctioned exception is `lib/core/environments.ts`, which
+  facets `deployment.environment` and must not filter by it — see
+  [frontend.md](frontend.md#the-environment-dimension).
 - **`ui/` primitives are `<script setup lang="ts">`; views and domain components are, by default,
   plain JS `<script setup>`.** The only plain-JS files under `ui/` are the Photon-authored composites
   (`facet/`, `nav-tabs/`, `peek-drawer/`, `select-menu/`, `sparkline/`).
+- **Style comes from the tokens, never from eyeballed utilities.** Colour, elevation and radius live
+  in `styles/tokens.css` + `tailwind.config.js`; components consume them. Elevation is three steps
+  only — `shadow-1` (hairline ambient on chrome), `shadow-2` (things that actually float: popovers,
+  drawers, dialogs, tooltips), `shadow-sink` (pressed) — so don't reach for stock Tailwind
+  `shadow-sm`/`md`/`lg`. Radius is one family off `--radius`: `rounded-sm` 6 (menu rows, checkboxes),
+  `rounded-md` 10 (controls), `rounded-lg` 12 (panels, switcher tracks), `rounded-xl` 14 (cards),
+  `rounded-2xl` 18 (dialogs); pills use `rounded-full`. Pick by what the thing *is*. Separation comes
+  from white paper on a grey canvas, so a table on a `surface="canvas"` view must own a panel
+  (`rounded-xl border border-border bg-card shadow-1`) — see `docs/frontend.md`.
 - **TypeScript adoption is new-files-only.** Every *new* frontend file — new `lib/` modules, new
   components, new test files — is authored in TypeScript: `.ts` for plain modules
   (`lib/context.ts`, `lib/useCorrelate.ts`), `<script setup lang="ts">` for new components

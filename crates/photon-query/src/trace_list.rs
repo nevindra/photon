@@ -7,12 +7,13 @@
 //! Precomputed per-trace rollups are deferred (design brief); v1 recomputes them per query:
 //! 1. Prune + open the surviving spans Parquet (`span_survivors_df`); `None` → empty result.
 //! 2. **Matched trace ids (ranked in DataFusion, bounded memory):** apply the grammar predicate,
-//!    then from that one filtered handle run two bounded queries — `COUNT(DISTINCT trace_id)` for
-//!    `matched_count` (the full distinct total, independent of the cap/paging), and
-//!    `GROUP BY trace_id → min(start_time)` sorted `min_start DESC` (id-tiebroken) `LIMIT`
+//!    then `GROUP BY trace_id → min(start_time)` sorted `min_start DESC` (id-tiebroken) `LIMIT`
 //!    [`MAX_CANDIDATE_TRACES`] for the ranked page. Only the cap-many ranked rows ever reach Rust,
 //!    instead of collecting every distinct id into a `Vec` (a documented v1 limitation:
 //!    sort/slowest accuracy is bounded by the cap; a capped scan is logged, never silent).
+//!    `matched_count` falls out of that page's row count when it does not fill, and comes from a
+//!    fixed-size `approx_distinct` when it does — never from an exact distinct over the window,
+//!    which is what used to make a 7-day search cost gigabytes and return 500.
 //! 3. **Whole-trace spans:** fetch every span of the capped trace ids (`trace_id IN (...)`, no
 //!    grammar filter) so the rollups reflect the entire trace, not only the matching spans — over a
 //!    window narrowed to the kept traces' earliest-matching-span span ± [`STEP3_WINDOW_PAD_NANOS`],
@@ -32,10 +33,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::array::{
-    Array, Int32Array, Int64Array, MapArray, StringArray, TimestampNanosecondArray,
+    Array, Int32Array, Int64Array, MapArray, StringArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::record_batch::RecordBatch;
-use datafusion::functions_aggregate::expr_fn::{count_distinct, min};
+use datafusion::functions_aggregate::expr_fn::{approx_distinct, min};
 use datafusion::prelude::{col, lit, Expr};
 
 use photon_core::span_schema;
@@ -44,11 +45,21 @@ use photon_core::PhotonError;
 use crate::span_engine::span_base_predicate;
 use crate::{col_ref, SpanQueryEngine, SpanQueryRequest, SpanSort};
 
-/// The rollup scan is capped at this many traces. `matched_count` still reports the full distinct
-/// count, but only the newest `MAX_CANDIDATE_TRACES` are rolled up / sorted / paged. A documented
-/// v1 limitation (sort/slowest accuracy is bounded by the cap); the future optimization is
-/// precomputed per-trace rollups so the whole match set can be ranked cheaply.
-const MAX_CANDIDATE_TRACES: usize = 2000;
+/// The rollup scan is capped at this many traces: only the newest `MAX_CANDIDATE_TRACES` are
+/// rolled up / sorted / paged. A documented v1 limitation (sort/slowest accuracy is bounded by the
+/// cap); the future optimization is precomputed per-trace rollups so the whole match set can be
+/// ranked cheaply. Filling this cap is also what flips `matched_count` from exact to estimated.
+pub const MAX_CANDIDATE_TRACES: usize = 2000;
+
+/// Where step 2's ranked-page scan starts probing: the newest 15 minutes of the request window.
+/// Sized so a busy deployment fills [`MAX_CANDIDATE_TRACES`] on the first probe (2,000 traces in
+/// 15 minutes is ~2.2 traces/second) while a quiet one does not waste many rounds getting there.
+const RANK_PROBE_INITIAL_NANOS: i64 = 15 * 60 * 1_000_000_000;
+
+/// How much wider each unsuccessful probe reaches. At x8, a 15-minute probe walks 15m → 2h → 16h →
+/// 5d 8h → the whole window in five rounds, and the rounds are a geometric series: even the worst
+/// case (every probe scanned, none filling the page) totals ~1.14x one full-window pass.
+const RANK_PROBE_GROWTH: i64 = 8;
 
 /// ±window added around the kept traces' earliest-matching-span span when narrowing step 3's
 /// whole-trace scan (see `search_traces`). Mirrors `span_engine::TRACE_TIME_HINT_PADDING_NANOS`
@@ -94,14 +105,17 @@ pub struct TraceSummary {
     pub root_attributes: BTreeMap<String, String>,
 }
 
-/// The trace-list result: the (sorted + paged) summaries plus the full distinct-trace match count
-/// (independent of paging and of the rollup cap).
+/// The trace-list result: the (sorted + paged) summaries plus how many traces matched.
 pub struct TraceSearchResult {
     /// The page of trace summaries.
     pub traces: Vec<TraceSummary>,
-    /// Distinct traces matching the request across the full pruned set (not limited by paging or
-    /// [`MAX_CANDIDATE_TRACES`]).
+    /// Distinct traces matching the request across the full pruned set (not limited by paging).
+    /// Exact while the match set fits [`MAX_CANDIDATE_TRACES`]; a HyperLogLog estimate beyond it —
+    /// see `matched_count_estimated` and the comment in `search_traces`.
     pub matched_count: u64,
+    /// `true` when `matched_count` is the estimate rather than an exact count, so a caller can
+    /// render it as `~11.3M` instead of presenting it as a tally.
+    pub matched_count_estimated: bool,
 }
 
 /// A minimal decoded span, used only for the in-Rust rollup.
@@ -119,77 +133,38 @@ struct RawSpan {
 }
 
 impl SpanQueryEngine {
-    /// Prune → aggregate matched trace ids → fetch their whole-trace spans → roll up in Rust →
-    /// sort + page. Returns an empty result (with `matched_count == 0`) when nothing survives
-    /// pruning or nothing matches the predicate.
-    pub async fn search_traces(
+    /// Step 2's ranked page over `[scan_start, req.end]`: `GROUP BY trace_id -> min(start_time)`,
+    /// newest first, capped at [`MAX_CANDIDATE_TRACES`]. Re-prunes rather than filtering the
+    /// full-window handle, so a narrow probe reads a narrow set of Parquet files.
+    ///
+    /// `covers_full` says the probe reached the start of the request window, in which case the
+    /// scan is exactly the request window and the answer is the un-probed one. Otherwise the scan
+    /// reaches [`STEP3_WINDOW_PAD_NANOS`] further back than the probe: a trace that straddles
+    /// `scan_start` would otherwise report its first span *inside* the probe as its
+    /// `min(start_time)` and rank as newer than it is. The pad makes that min true for any trace
+    /// shorter than an hour, which is every trace that is not itself a bug — the same pad, for the
+    /// same reason, as step 3's whole-trace window.
+    async fn rank_matched_traces(
         &self,
-        req: SpanQueryRequest,
-    ) -> Result<TraceSearchResult, PhotonError> {
-        let df = match self.span_survivors_df(&req).await? {
-            Some(df) => df,
-            None => {
-                return Ok(TraceSearchResult {
-                    traces: Vec::new(),
-                    matched_count: 0,
-                })
-            }
+        req: &SpanQueryRequest,
+        scan_start: i64,
+        covers_full: bool,
+    ) -> Result<Vec<RecordBatch>, PhotonError> {
+        let mut probe_req = req.clone();
+        probe_req.start_ts_nanos = if covers_full {
+            req.start_ts_nanos
+        } else {
+            scan_start.saturating_sub(STEP3_WINDOW_PAD_NANOS)
         };
+        probe_req.limit = 0;
+        probe_req.offset = 0;
+        probe_req.projected_attributes = Vec::new();
 
-        // Step 2 — matched trace ids, ranked, plus the full distinct match count. Both derive from
-        // one filtered handle (`filtered`) over the pruned survivors, so the grammar predicate and
-        // the file set are shared (one prune/open, two bounded collects). Instead of collecting
-        // every distinct id into a Rust `Vec`:
-        //   * `matched_count` = `COUNT(DISTINCT trace_id)` — one row. SQL `COUNT(DISTINCT)` already
-        //     skips null trace_ids, matching the old null-skipping loop.
-        //   * the ranked page = `GROUP BY trace_id → min(start_time)`, `min_start DESC` (id-tiebroken)
-        //     `LIMIT MAX_CANDIDATE_TRACES` — at most the cap-many rows ever reach Rust.
-        // The ranking's `min_start DESC, id ASC` order + `LIMIT` selects the identical *set* of ids
-        // the old Rust `sort_by` + `truncate` did (a total order on distinct ids), so results are
-        // unchanged; the two bounded collects just replace the unbounded `Vec`.
-        let filtered = df
-            .clone()
-            .filter(span_base_predicate(&req))
-            .map_err(|e| PhotonError::Query(format!("trace match filter: {e}")))?;
-
-        let count_batches = filtered
-            .clone()
-            .aggregate(
-                vec![],
-                vec![count_distinct(col_ref(span_schema::TRACE_ID)).alias("n")],
-            )
-            .map_err(|e| PhotonError::Query(format!("trace match count aggregate: {e}")))?
-            .collect()
-            .await
-            .map_err(|e| PhotonError::Query(format!("trace match count collect: {e}")))?;
-        let matched_count = match count_batches.first() {
-            Some(b) if b.num_rows() > 0 => b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .filter(|c| !c.is_null(0))
-                .map(|c| c.value(0) as u64)
-                .unwrap_or(0),
-            _ => 0,
+        let Some(df) = self.span_survivors_df(&probe_req).await? else {
+            return Ok(Vec::new());
         };
-        if matched_count == 0 {
-            return Ok(TraceSearchResult {
-                traces: Vec::new(),
-                matched_count: 0,
-            });
-        }
-
-        // A capped rollup scan is logged, never silent; `matched_count` still reports the full total.
-        if matched_count > MAX_CANDIDATE_TRACES as u64 {
-            eprintln!(
-                "photon-query: search_traces rolling up only the newest {MAX_CANDIDATE_TRACES} of \
-                 {matched_count} matched traces (v1 cap); matched_count reports the full total"
-            );
-        }
-
-        // Rank + cap in DataFusion — newest traces first (`min_start DESC`), id-tiebroken for
-        // determinism, `LIMIT MAX_CANDIDATE_TRACES`. Only these ≤ cap rows are materialized.
-        let ranked_batches = filtered
+        df.filter(span_base_predicate(&probe_req))
+            .map_err(|e| PhotonError::Query(format!("trace match filter: {e}")))?
             .aggregate(
                 vec![col_ref(span_schema::TRACE_ID).alias("trace_id")],
                 vec![min(col_ref(span_schema::START_TIME)).alias("ts")],
@@ -206,7 +181,123 @@ impl SpanQueryEngine {
             .map_err(|e| PhotonError::Query(format!("trace match limit: {e}")))?
             .collect()
             .await
-            .map_err(|e| PhotonError::Query(format!("trace match collect: {e}")))?;
+            .map_err(|e| PhotonError::Query(format!("trace match collect: {e}")))
+    }
+
+    /// Prune → aggregate matched trace ids → fetch their whole-trace spans → roll up in Rust →
+    /// sort + page. Returns an empty result (with `matched_count == 0`) when nothing survives
+    /// pruning or nothing matches the predicate.
+    pub async fn search_traces(
+        &self,
+        req: SpanQueryRequest,
+    ) -> Result<TraceSearchResult, PhotonError> {
+        let df = match self.span_survivors_df(&req).await? {
+            Some(df) => df,
+            None => {
+                return Ok(TraceSearchResult {
+                    traces: Vec::new(),
+                    matched_count: 0,
+                    matched_count_estimated: false,
+                })
+            }
+        };
+
+        // Step 2 — the ranked page of matched trace ids, and how many matched in total.
+        //
+        // The page is `GROUP BY trace_id -> min(start_time)`, `min_start DESC` (id-tiebroken)
+        // `LIMIT MAX_CANDIDATE_TRACES` — at most cap-many rows ever reach Rust. Its
+        // `min_start DESC, id ASC` order + `LIMIT` selects the identical *set* of ids the
+        // pre-DataFusion Rust `sort_by` + `truncate` did (a total order on distinct ids).
+        //
+        // What it does NOT do any more is run that group-by across the whole request window. One
+        // hash-table entry per distinct trace id is fine at an hour and ruinous at a week: a
+        // 3-day window holds 11.4M ids, a 7-day window over 20M, times `target_partitions`
+        // partial aggregates, and the 7-day case died outright under the shared query pool —
+        // "Failed to allocate ... for GroupedHashAggregateStream", HTTP 500 after 1.9 s. Since
+        // the page only ever keeps the NEWEST cap-many traces, the older end of a wide window is
+        // grouped at full cost and then thrown away.
+        //
+        // So probe the newest slice first and widen only until the page fills (see
+        // `rank_matched_traces` for the pad that keeps a straddling trace's `min(start_time)`
+        // true). On a busy week the first 15-minute probe already yields 2,000 traces and the
+        // other 6 days 23 hours are never grouped at all; on a quiet one the probe grows until it
+        // covers the window, which costs ~1.14x a single full pass and lands on exactly the
+        // result the un-probed query gave.
+        let full_start = req.start_ts_nanos;
+        let full_end = req.end_ts_nanos;
+        let mut probe = RANK_PROBE_INITIAL_NANOS;
+        let (ranked_batches, ranked_rows) = loop {
+            let probe_start = full_end.saturating_sub(probe);
+            let covers_full = probe_start <= full_start;
+            let batches = self
+                .rank_matched_traces(&req, probe_start.max(full_start), covers_full)
+                .await?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if rows >= MAX_CANDIDATE_TRACES || covers_full {
+                break (batches, rows);
+            }
+            probe = probe.saturating_mul(RANK_PROBE_GROWTH);
+        };
+
+        // `matched_count`: exact when the page did not fill, estimated when it did.
+        //
+        // A page short of the cap can only happen once the probe has covered the whole window, so
+        // that page IS every matching trace and its row count is the exact total — no second
+        // query at all. This is the case for essentially every query a human has narrowed down.
+        //
+        // When the page fills, the true total is already past anything the view can show (only
+        // the capped page is rolled up and paged), so it is a magnitude, not a tally.
+        // `approx_distinct` answers it from a fixed-size HyperLogLog — kilobytes per partition
+        // instead of gigabytes, no spill, ~1% relative error — and `estimated` rides along so the
+        // caller can render `~11.3M` rather than passing an approximation off as a count. The
+        // null filter matches `COUNT(DISTINCT)`'s null-skipping, which the ranked page gets from
+        // its own `is_not_null`.
+        let estimated = ranked_rows >= MAX_CANDIDATE_TRACES;
+        let matched_count = if !estimated {
+            ranked_rows as u64
+        } else {
+            let count_batches = df
+                .clone()
+                .filter(span_base_predicate(&req))
+                .map_err(|e| PhotonError::Query(format!("trace match count filter: {e}")))?
+                .filter(col_ref(span_schema::TRACE_ID).is_not_null())
+                .map_err(|e| PhotonError::Query(format!("trace match count null filter: {e}")))?
+                .aggregate(
+                    vec![],
+                    vec![approx_distinct(col_ref(span_schema::TRACE_ID)).alias("n")],
+                )
+                .map_err(|e| PhotonError::Query(format!("trace match count aggregate: {e}")))?
+                .collect()
+                .await
+                .map_err(|e| PhotonError::Query(format!("trace match count collect: {e}")))?;
+            match count_batches.first() {
+                Some(b) if b.num_rows() > 0 => b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .filter(|c| !c.is_null(0))
+                    .map(|c| c.value(0))
+                    // Never claim fewer matches than the page already holds.
+                    .map(|n| n.max(ranked_rows as u64))
+                    .unwrap_or(ranked_rows as u64),
+                _ => ranked_rows as u64,
+            }
+        };
+        if matched_count == 0 {
+            return Ok(TraceSearchResult {
+                traces: Vec::new(),
+                matched_count: 0,
+                matched_count_estimated: false,
+            });
+        }
+
+        // A capped rollup scan is logged, never silent.
+        if estimated {
+            eprintln!(
+                "photon-query: search_traces rolling up only the newest {MAX_CANDIDATE_TRACES} of \
+                 ~{matched_count} matched traces (v1 cap); matched_count is a HyperLogLog estimate"
+            );
+        }
 
         // Collect the capped ids and the min/max of their earliest-matching-span starts — the two
         // bounds that narrow step 3's whole-trace window (see `STEP3_WINDOW_PAD_NANOS`).
@@ -243,6 +334,7 @@ impl SpanQueryEngine {
             return Ok(TraceSearchResult {
                 traces: Vec::new(),
                 matched_count,
+                matched_count_estimated: estimated,
             });
         }
 
@@ -265,6 +357,7 @@ impl SpanQueryEngine {
             limit: 0,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         };
         let whole_df = match self.span_survivors_df(&whole_req).await? {
             Some(d) => d,
@@ -385,6 +478,7 @@ impl SpanQueryEngine {
         Ok(TraceSearchResult {
             traces,
             matched_count,
+            matched_count_estimated: estimated,
         })
     }
 }

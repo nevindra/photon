@@ -48,7 +48,7 @@ impl SpanQueryEngine {
 
 /// GROUP BY `value_expr`, COUNT, drop the NULL (absent-field) group, order by count desc, and
 /// fetch `limit + 1` so the caller can tell whether the field's cardinality exceeded `limit`.
-async fn facet_over(
+pub(crate) async fn facet_over(
     df: DataFrame,
     predicate: Expr,
     value_expr: Expr,
@@ -164,6 +164,7 @@ mod tests {
             limit: 500,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         }
     }
 

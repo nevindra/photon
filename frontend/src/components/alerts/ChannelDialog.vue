@@ -182,7 +182,7 @@ const testPill = computed<{ tone: 'success' | 'error' | 'neutral'; label: string
           </FormField>
           <FormField label="Headers" for="channel-headers" :optional="true" :error="headersError ?? undefined" hint='Extra request headers as JSON, e.g. {"Authorization":"Bearer …"}'>
             <textarea id="channel-headers" v-model="form.headersText" rows="3" placeholder='{"Authorization":"Bearer …"}'
-              class="flex w-full rounded-md border border-input bg-background px-3 py-1.5 font-mono text-xs shadow-sink transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+              class="flex w-full rounded-md border border-input bg-surface-1 px-3 py-1.5 font-mono text-xs transition-[border-color,box-shadow] duration-150 ease-out placeholder:text-muted-foreground hover:border-foreground/15 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/20" />
           </FormField>
         </template>
 

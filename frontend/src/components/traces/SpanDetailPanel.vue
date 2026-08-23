@@ -206,7 +206,7 @@ async function copyRaw() {
   <aside
     v-if="span"
     data-testid="span-panel"
-    class="flex w-[360px] shrink-0 flex-col border-l border-border bg-background"
+    class="flex w-[360px] shrink-0 flex-col border-l border-border bg-surface-1"
   >
     <div class="flex items-start justify-between gap-2 border-b border-border px-4 py-3">
       <div class="min-w-0">

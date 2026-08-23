@@ -1,7 +1,6 @@
 //! photon-server: the single binary. Wires ingest + WAL + compactor + query + API together.
 //!
-//! Implemented per the `photon-server` section of
-//! `docs/superpowers/plans/2026-07-01-photon-interface-contracts.md`.
+//! Its place in the crate graph is described in `docs/architecture.md`.
 //!
 //! # Modes
 //!
@@ -50,6 +49,9 @@ mod alerts_source;
 /// Tenant-side federation: the summary pusher (always on when `[federation]` is present) and,
 /// in `full` mode, the OTLP tee/forwarder that mirrors raw batches to central.
 mod federation;
+/// The `photon.service.*` rollup: spans → per-service RED published as ordinary metrics, so
+/// the Backend pages can read a wide window without re-scanning raw spans (ADR-0002).
+mod rollup;
 /// Adapter that mirrors uptime up/down transitions onto the shared alerts store + channels while
 /// preserving the legacy per-monitor webhook. Kept as a module so it can carry its own tests.
 mod uptime_bridge;
@@ -92,6 +94,20 @@ const MERGE_EVERY_TICKS: u64 = 5;
 /// Run a whole-file retention purge every Nth compactor tick (~1 hour at COMPACT_INTERVAL 2s).
 const PURGE_EVERY_TICKS: u64 = 1800;
 
+/// Total physical RAM, for auto-sizing the query memory pool. `None` when it cannot be read, in
+/// which case `QueryConfig` falls back to its floor.
+///
+/// Read from `/proc/meminfo` rather than pulling in a system-info crate: this is one number, on
+/// one line, on the platform Photon ships to. Anywhere else it simply returns `None` and the
+/// operator sets `[query].memory_pool_bytes` if the floor is wrong for their box.
+fn total_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    // "MemTotal:       32791236 kB"
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kb.checked_mul(1024)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -119,6 +135,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cloned()
         .or_else(|| std::env::var("PHOTON_CONFIG").ok());
     let cfg = Config::load(explicit)?;
+
+    // Size the one shared DataFusion memory pool before any engine is built — `photon-query`
+    // builds its `RuntimeEnv` lazily on the first query, so this has to land first. See
+    // `photon_core::config::QueryConfig`.
+    let pool_bytes = cfg.query.memory_pool_bytes(total_memory_bytes());
+    photon_query::set_memory_pool_bytes(pool_bytes as usize);
+    eprintln!(
+        "query memory pool: {} MiB{}",
+        pool_bytes / (1024 * 1024),
+        if cfg.query.memory_pool_bytes.is_some() {
+            " (configured)"
+        } else {
+            " (auto-sized from total RAM)"
+        }
+    );
 
     // Shared building blocks.
     let schema = LogSchema::new(&cfg.schema.promoted_attributes);
@@ -410,6 +441,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         counters.clone(),
     );
     ingest.tenant_tokens = tenant_tokens.clone();
+
+    // Deploy detection: one store, two doors. The trace receivers call `observe` (an in-memory
+    // set lookup that only touches SQLite for a version nobody has seen yet), and the API reads
+    // the same table for the release timeline. Opened before the API so both share one handle —
+    // two `SqliteDeploymentStore`s over one file would each keep their own seen-set and re-announce
+    // each other's versions.
+    let deployment_store = Arc::new(photon_api::deployments::SqliteDeploymentStore::open(
+        &cfg.storage.db_path,
+    )?);
+    ingest.deployments = Some(Arc::new(DeploymentDetector {
+        store: deployment_store.clone(),
+    }));
+
     let span_query = SpanQueryEngine::new(cfg.storage.hot_dir.clone(), span_schema.clone())?;
     let metrics_query =
         MetricsQueryEngine::new(cfg.storage.hot_dir.clone(), metric_schema.clone())?;
@@ -485,6 +529,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ingest.federation_tee = Some(tee);
         federation_rx = Some(rx);
     }
+    // Shipping this Site's rollup to central needs a tee in BOTH modes, and `full` mode's tee
+    // does not already cover it: that one mirrors accepted OTLP batches, and the rollup writes
+    // straight to the local metrics WAL without ever passing through OTLP ingest. So in summary
+    // mode create a metrics-only tee (and its forwarder) for the rollup alone; in full mode the
+    // tee already exists and the rollup just shares it.
+    let mut rollup_tee = None;
+    match rollup::tee_plan(cfg.federation.as_ref(), ingest.federation_tee.is_some()) {
+        rollup::TeePlan::None => {}
+        rollup::TeePlan::Share => rollup_tee = ingest.federation_tee.clone(),
+        rollup::TeePlan::Create => {
+            let batches = cfg
+                .federation
+                .as_ref()
+                .map(|f| f.queue_batches)
+                .unwrap_or(1024);
+            let (tee, rx) = FederationTee::channel_for(batches, &[TeeSignal::Metrics]);
+            federation_stats_dropped = Some(tee.dropped.clone());
+            rollup_tee = Some(tee);
+            federation_rx = Some(rx);
+        }
+    }
+
     let federation_stats = Arc::new(federation::FederationStats {
         dropped: federation_stats_dropped.unwrap_or_default(),
         ..Default::default()
@@ -504,6 +570,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             federation_stats.clone(),
         );
+    }
+
+    // The `photon.service.*` rollup pass. Reads spans, publishes per-service (and per-operation)
+    // RED as metrics, one bucket written exactly once — see `rollup/mod.rs` for why it cannot
+    // simply re-roll its lag window. Off only when `[rollup].enabled = false`, in which case the
+    // Backend read paths always scan raw spans: correct, just slower over a wide window.
+    //
+    // Spawned after the federation block on purpose: it needs the tee that block builds.
+    let mut rollup_status: Option<Arc<dyn photon_api::services_rollup::RollupStatus>> = None;
+    if cfg.rollup.enabled {
+        rollup_status = Some(Arc::new(rollup::WatermarkStatus::open(
+            &cfg.storage.db_path,
+        )?));
+        let task = rollup::RollupTask::new(
+            span_query.clone(),
+            metrics_query.clone(),
+            metrics_wal.clone(),
+            metric_schema.clone(),
+            counters.clone(),
+            settings.clone(),
+            cfg.apm.default_apdex_threshold_ms,
+            cfg.rollup.clone(),
+            &cfg.storage.db_path,
+            rollup_tee,
+        )?;
+        supervise("rollup", tokio::spawn(task.run()));
     }
 
     // photon-api cannot depend on photon-server, so expose the pusher/tee to the API through the
@@ -605,7 +697,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_usage(usage.clone(), repl_status.clone())
     .with_rum(rum_api)
     .with_tenant_store(tenant_api)
-    .with_federation_status(Some(federation_status));
+    .with_federation_status(Some(federation_status))
+    // Coverage only, not the data: the API reads `photon.service.*` through its own metrics
+    // engine, and asks this only whether the requested window has actually been published.
+    .with_rollup_status(rollup_status)
+    .with_deployments(Some(deployment_store))
+    // SLOs live in the same control-plane DB. They read the rollup and nothing else, so a node
+    // with no rollup coverage yet answers "partial" rather than falling back to a raw-span scan
+    // across a 30-day window.
+    .with_slos(Some(Arc::new(photon_api::slo::SqliteSloStore::open(
+        &cfg.storage.db_path,
+    )?)));
 
     println!("photon-server listening: otlp-grpc={grpc_addr} otlp-http={http_addr} api={api_addr}");
 
@@ -613,6 +715,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::try_join!(ingest.serve(grpc_addr, http_addr), api.serve(api_addr))?;
 
     Ok(())
+}
+
+/// Bridges `photon-ingest`'s `DeploymentWatcher` seam onto `photon-api`'s deployments table.
+///
+/// The two crates cannot see each other (photon-ingest sits below photon-api in the graph), so the
+/// adapter lives here, where both are visible — the same shape as `RumWalSink`.
+///
+/// `observe` is synchronous and runs on the ingest path. That is safe because the store answers an
+/// already-known version from an in-memory `HashSet` without any I/O, which is every batch after the
+/// first; the rare miss is one small SQLite insert, measured in microseconds and happening once per
+/// genuinely new release. Spawning a task per batch to avoid that would cost more than it saves.
+struct DeploymentDetector {
+    store: Arc<photon_api::deployments::SqliteDeploymentStore>,
+}
+
+impl photon_ingest::deployments::DeploymentWatcher for DeploymentDetector {
+    fn observe(&self, seen: &photon_ingest::deployments::SeenVersion) {
+        let key = photon_api::deployments::DeploymentKey {
+            service: seen.service.clone(),
+            environment: seen.environment.clone(),
+            tenant: seen.tenant.clone(),
+            version: seen.version.clone(),
+        };
+        if self.store.already_seen(&key) {
+            return;
+        }
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // A failed insert is logged and dropped, never propagated: a deployment record is
+        // observability about observability, and losing one must not fail an ingest request that
+        // has perfectly good spans in it.
+        if let Err(e) = self.store.record_detected_sync(&key, at_ms) {
+            eprintln!("photon-server: warning: could not record deployment: {e}");
+        }
+    }
 }
 
 /// Print an argon2id PHC hash of `password` using an OS-random salt.

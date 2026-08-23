@@ -119,8 +119,21 @@ safe because segment IDs make it idempotent.
 Vitals → gauge `MetricPoint`s and JS errors → `LogRecord`s → the `RumSink` (implemented in
 photon-server over the metrics + logs `BroadcastingWal`s). Vitals land in the metrics store, errors
 in the logs store. **Uptime write path (separate engine):** scheduler → probe results/incidents →
-embedded SQLite via `UptimeStore` (no WAL/Parquet). See [`subsystems/rum.md`](subsystems/rum.md) and
-the per-feature docs in [`subsystems/`](subsystems/).
+embedded SQLite via `UptimeStore` (no WAL/Parquet).
+
+**Service-rollup write path (read engine → write path, no new storage):** every `[rollup].interval_secs`,
+`photon-server/src/rollup/` runs `SpanQueryEngine::red_rollup` over the spans in one settled 60s
+bucket and appends the result to the **metrics** WAL as ordinary `photon.service.*` (per service)
+and `photon.operation.*` (per operation) `MetricPoint`s — the only place a query engine feeds a
+write path. Two invariants ride on it: each bucket is published **exactly once**, guarded by a
+watermark in the control-plane SQLite DB (the metrics reader SUMS the points in a bucket, it does
+not de-duplicate, so a re-emitted bucket multiplies every counter); and the operation level is
+bounded by folding all but the busiest `top_operations` per `(service, environment)` into one
+`__other__` series **inside the GROUP BY**, so the aggregate can never build more groups than that
+cap allows. See [`subsystems/rollup.md`](subsystems/rollup.md).
+
+See [`subsystems/rum.md`](subsystems/rum.md) and the per-feature docs in
+[`subsystems/`](subsystems/).
 
 ## Read / query path
 
@@ -128,17 +141,34 @@ the per-feature docs in [`subsystems/`](subsystems/).
 
 1. **Manifest** selects candidate files by time overlap and per-file promoted-column value ranges.
 2. **Skip index** (`.idx` sidecar) prunes further by min/max ranges and token bloom membership.
-3. **DataFusion** columnar-scans only the survivors, predicates pushed down. Free-text log search is
+3. **DataFusion** columnar-scans only the survivors. Free-text log search is
    bloom-pruned then confirmed with a `strpos(body, text) > 0` substring scan — **there is no
    inverted index.**
 
+**Row-level Parquet filter pushdown is OFF** (`datafusion.execution.parquet.pushdown_filters`,
+`photon-query/src/lib.rs`), and it must stay off. Every signal is read with an *explicit* schema
+(`ParquetReadOptions::schema`) because it has to be: changing `[schema].promoted_attributes` changes
+the columns new segments are written with, so for one retention period a query legitimately spans
+two layouts. In DataFusion 43, pushdown over a file set whose physical schemas do not all match the
+declared schema makes any plan carrying a `fetch` (a `LIMIT`) return **zero rows** — not an error,
+not a partial answer, an empty result. Measured on the 120M-span replica across four surviving
+metrics files, two written before a promotion and two after: the same filtered frame reported 29,819
+rows to `count()` and 0 rows to `LIMIT 1`.
+
+An aggregate or a sort between the filter and the limit hides it, because the fetch then never
+reaches the scan — which is why only three call sites in `photon-query` ever showed it
+(`metric_meta_probe`, `service_map`, `service_dependencies`) and why the symptom was "this metric
+does not exist" rather than a failure. The counters on a Backend page stayed right while its
+percentiles vanished. `a_fetch_plan_over_mixed_schema_files_still_returns_rows` (`lib.rs`) is the
+regression test; the flag can go back on when the bug is fixed upstream.
+
 Every engine's `SessionContext` (the shared `session()` factory in `photon-query/src/lib.rs`) draws on
-**one process-wide, bounded DataFusion memory pool** (`FairSpillPool`, `QUERY_MEMORY_POOL_BYTES` =
-512 MiB) — a single `Arc<RuntimeEnv>` built lazily via `OnceLock` and shared by every session (only
-each session's `SessionConfig` / Parquet tuning is freshly built). So 512 MiB is an **aggregate cap
+**one process-wide, bounded DataFusion memory pool** (`FairSpillPool`) — a single `Arc<RuntimeEnv>`
+built lazily via `OnceLock` and shared by every session (only
+each session's `SessionConfig` / Parquet tuning is freshly built). So the ceiling is an **aggregate cap
 across ALL concurrent queries**, not a per-query allowance: opening the UI dashboard fans out ~10
 queries at once, and a fresh pool per session would make that budget additive and effectively
-unbounded (N × 512 MiB). Its job is to keep the remaining intrinsically-unbounded query path — a
+unbounded (N × pool). Its job is to keep the remaining intrinsically-unbounded query path — a
 facet `GROUP BY value` on a high-cardinality field (holds every distinct value in a hash table before
 the `LIMIT`) — from OOM-killing a low-memory single node. As a `FairSpillPool` it does this two ways:
 a heavy **spillable** operator (sort, grouped aggregation) that exceeds its fair share **degrades to
@@ -158,8 +188,24 @@ straddling the row-cap boundary keeps only its time-ascending prefix, so *its ow
 bound from turning into cross-query starvation: the budget is divided evenly among concurrent
 spillable consumers (`(pool_size - unspillable) / num_spillers`), so one expensive query can't
 monopolize it and push unrelated ones into `ResourcesExhausted` — it hits its own fair-share ceiling
-and spills to disk instead. It is not a config surface yet; a future change could make it
-per-deployment tunable.
+and spills to disk instead.
+
+**Sizing it.** `photon-server` sets the pool once at startup, before any engine is built, from
+`[query].memory_pool_bytes` (`photon_core::config::QueryConfig`) — omit it and the size is a quarter
+of total RAM read from `/proc/meminfo`, clamped to 256 MiB..=4 GiB, falling back to the floor where
+RAM cannot be read. It used to be a hard-coded 512 MiB regardless of the host, which is the wrong
+shape for a number covering a whole machine's read path: generous on a 2 GB VM, absurd on a 30 GB
+server, where a 7-day histogram query failed with "Resources exhausted" while the box had 21 GB
+free. `photon_query::set_memory_pool_bytes` is a setter rather than a `session()` parameter on
+purpose — a per-call parameter would let each caller mint its own budget, which is exactly what one
+shared pool exists to prevent. Nothing calls it in tests, so they keep the old 512 MiB constant.
+
+Pool exhaustion is a **500, not a 400.** `engine_query_failure` (`photon-api/src/search.rs`) splits
+engine errors: a rejected request (unsupported aggregation, `rate` on a gauge, an unknown group-by
+column) is the caller's fault and stays 400, while an I/O failure or `Resources exhausted` is ours.
+`/api/red` and `/api/metrics/query` used to answer both with 400, which is not a cosmetic mislabel —
+a 400 says "your query is malformed", so a server out of query memory looked exactly like a user
+typo, and nothing in an access log or an uptime check told the two apart.
 
 Per-signal engines:
 
@@ -227,7 +273,7 @@ read path (fetch evicted files from durable on query) is deliberately unimplemen
 target the hot window fits on local NVMe.
 
 A shared **SQLite control-plane DB** (`[storage].db_path`) holds UI user accounts, uptime monitors,
-and the RUM app registry (`rum_apps` table) — always used, required for login and by the always-on
+the RUM app registry (`rum_apps` table), the detected-release table (`deployments`) and service SLOs (`service_slos`) — always used, required for login and by the always-on
 uptime subsystem. RUM apps are registered/edited/rotated/removed at runtime (UI or the
 `/api/rum/apps*` management API — see [`subsystems/rum.md`](subsystems/rum.md)), not via config;
 there is no `[[rum.apps]]` config surface anymore.
@@ -253,7 +299,7 @@ backend can't be silently replaced with demo data.
 - **Live tail (SSE):** `GET /api/stream/logs`, `GET /api/stream/spans`.
 - **Traces / spans:** `GET /api/traces/:trace_id`, `POST /api/traces/search`, `POST /api/spans/search`,
   `GET /api/traces/fields|facet|histogram|latency`.
-- **Services (APM):** `GET /api/red`, `GET /api/services/:service/timeseries|dependencies|settings` (`timeseries`/`dependencies` take an optional `q` grammar param AND-ed with the service term — the UI's tenant filter).
+- **Services (APM):** `GET /api/services/overview` (the whole index in one request — the Site band plus one row per `(service, Site, environment)` with sparklines; `source` says `rollup` or `raw`), `GET /api/red`, `GET /api/services/:service/timeseries|dependencies|settings` (`timeseries`/`dependencies` take an optional `q` grammar param AND-ed with the service term — the UI's tenant filter), `GET /api/services/:service/operations` (one row per operation with per-row sparklines, `source`-aware), `GET /api/services/:service/operations/:operation/heatmap` (the latency distribution over time, on the rollup's fixed ladder), `GET /api/services/errors` (fleet-wide Backend Issues — errored spans grouped by `error.fingerprint`; every row names its own service), `GET /api/services/:service/errors|errors/facets|errors/:fingerprint` (the per-service list, its six facet fields, and one Issue's detail; identity is `(service, fingerprint)`, never the fingerprint alone), `GET /api/services/map` (the topology — every service-to-service edge from one scan; optional `service` narrows to edges touching it in both directions, applied AFTER the edges exist because scoping the scan would delete the parent spans the join needs; the `MAX_MAP_SPANS` scan cap is reported as `capped`, never silent), `GET/POST /api/deployments` (releases — `GET` filters by `service`/`environment`/`tenant` and an ns-string `start`/`end` window; `POST` is CI enrichment, upserting on `(service, environment, tenant, version)` while leaving `detected_at_ms` and `source` write-once). `GET/POST /api/services/:service/slos`, `PATCH/DELETE /api/services/:service/slos/:id`, `GET /api/services/:service/slos/:id/budget` (error budget + multi-window burn rate; rollup-only, so a window the rollup does not cover is reported `partial`).
 - **Metrics:** `POST /api/metrics/query`, `GET /api/metrics/catalog|metadata/:name|labels`.
 - **Infrastructure (host/GPU resource monitoring):** `GET /api/infra/hosts`,
   `GET /api/infra/hosts/:host`, `GET /api/infra/hosts/:host/processes`,
@@ -276,7 +322,7 @@ backend can't be silently replaced with demo data.
   `GET/PATCH/DELETE /api/alerts/channels/:id`, `POST /api/alerts/channels/:id/test` (send a sample
   webhook), `GET /api/alerts/incidents` (`?status=triggered|resolved&rule_id=&limit=`) — see
   [`subsystems/alerts.md`](subsystems/alerts.md).
-- **Data / usage / retention:** `GET /api/storage`, `GET /api/usage/series`, `GET/PUT /api/retention`,
+- **Data / usage / retention:** `GET /api/storage`, `GET /api/usage/series`, `GET /api/usage/services` (per-service footprint — an ESTIMATE, `service rows × the signal's mean bytes/row`, because Parquet sorts by `service.name` and compresses a service's rows together; metrics are reported `attributed: false` with the reason, since a metric series is keyed by name and most belong to a host, a browser app or the rollup rather than a service), `GET/PUT /api/retention`,
   `POST /api/data/purge`.
 - **Federation (central + tenant):** `GET /api/tenants` (central list all), `POST /api/tenants`
   (central create), `PATCH/DELETE /api/tenants/:name` (central update/remove),
@@ -309,7 +355,11 @@ bodies, so streaming is never buffered.
   timestamp)`, spans `(service.name, start_time)`, metrics `(metric_name, service.name, host.name,
   timestamp)`) — this is what makes min/max pruning effective and compresses well. The compactor's
   lexsort order _is_ the query engine's pruning contract. `service.name` is promoted and is the logs
-  primary sort key — it cannot be un-promoted. The metrics skip index additionally ranges over
+  primary sort key — it cannot be un-promoted. `deployment.environment` is promoted by default too
+  (it is a global UI filter, read on every page — see [frontend.md](frontend.md#the-environment-dimension));
+  Parquet written before that default simply lacks the column, which is fine in both directions: the
+  grammar resolves the key to the long-tail map when it isn't a promoted column, and a missing
+  skip-index range degrades to "keep the file". There is no migration. The metrics skip index additionally ranges over
   `host.name` (binary sidecar format v2; a missing host block in an older v1 sidecar decodes as
   `None`, which — per the no-false-negative rule below — keeps the file rather than pruning it).
 - **`search` is two-pass (late materialization).** Pass 1 applies the predicate but projects only
@@ -327,8 +377,12 @@ bodies, so streaming is never buffered.
 The search bar speaks a small query language defined **once** in `photon-core/src/query/`
 (`parse` → AST → `FieldResolver` → `eval`; pure, no DataFusion) and compiled two ways: to an
 in-memory predicate (`eval`) and to a DataFusion filter (in `photon-query`) — one source of truth for
-filter semantics. Syntax: `field:value` (exact), `field:v1,v2` (OR-list), `field:*` (exists),
+filter semantics. Syntax: `field:value` (exact), `field:"a b"` (quoted value — the only way to express a value containing
+a space or a comma; the quotes are grouping and are stripped), `field:v1,v2` (OR-list, split on
+commas OUTSIDE quotes), `field:*` (exists),
 `-field:v` (negate), `field>=n` / `>` / `<` / `<=` (numeric compare), and `"quoted text"` or bare
 words (case-sensitive body substring). Terms are AND-ed; parse errors carry a byte `offset` so the UI
-can underline the bad token. The frontend has a display-only mirror (`lib/queryLang.js`) that never
-validates.
+can underline the bad token. There is **no escape** for a `"` inside a value, so a caller building a
+term from an arbitrary name uses `photon-api`'s `grammar_term` (or the frontend's `grammarTerm`),
+which quotes when needed and returns `None` rather than emitting a term that would parse cleanly and
+match nothing. The frontend has a display-only mirror (`lib/core/queryLang.ts`).

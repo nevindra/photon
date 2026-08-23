@@ -2,7 +2,7 @@
 // picking a template in TemplatePickerDialog either Applies it (POST /api/alerts/rules straight
 // from templateToRuleInput) or Customizes it (opens AlertRuleDialog pre-seeded). `build(target)`
 // substitutes the install-specific entity into the right field per target type. See
-// docs/superpowers/specs/2026-07-18-alert-rule-templates-design.md.
+// docs/subsystems/alerts.md.
 import type { AlertCondition, AlertRuleInput, AlertSeverity } from '@/lib/core/api'
 
 export type TemplateTarget = 'service' | 'app' | 'host' | 'global'

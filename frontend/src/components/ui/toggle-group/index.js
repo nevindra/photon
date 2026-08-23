@@ -8,13 +8,13 @@ export const TOGGLE_GROUP_KEY = Symbol('toggleGroup')
 
 /** Shared toggle styling (inlined here since we do not ship a standalone Toggle). */
 export const toggleVariants = cva(
-  'inline-flex items-center justify-center gap-2 rounded-md text-sm font-medium transition-[background-color,box-shadow,transform] hover:bg-muted hover:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 data-[state=on]:bg-surface-1 dark:data-[state=on]:bg-secondary data-[state=on]:shadow-1 data-[state=on]:text-foreground [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0',
+  'inline-flex items-center justify-center gap-2 rounded-md text-sm font-medium text-muted-foreground transition-[background-color,box-shadow,color] duration-150 ease-out hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 data-[state=on]:bg-surface-1 dark:data-[state=on]:bg-secondary data-[state=on]:shadow-1 data-[state=on]:ring-1 data-[state=on]:ring-inset data-[state=on]:ring-border data-[state=on]:text-foreground [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0',
   {
     variants: {
       variant: {
         default: 'bg-transparent',
         outline:
-          'border border-input bg-transparent shadow-sm hover:bg-accent hover:text-accent-foreground',
+          'border border-border bg-surface-1 shadow-1 hover:bg-muted hover:text-foreground',
       },
       size: {
         default: 'h-9 min-w-9 px-2',

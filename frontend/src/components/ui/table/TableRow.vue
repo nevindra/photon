@@ -8,7 +8,7 @@ defineProps<{
 </script>
 
 <template>
-  <tr :class="cn('border-b border-border transition-colors hover:bg-muted data-[state=selected]:bg-brand-soft data-[state=selected]:shadow-[inset_2.5px_0_0_hsl(var(--brand))]', $props.class)">
+  <tr :class="cn('border-b border-border transition-colors hover:bg-muted/60 data-[state=selected]:bg-brand-soft data-[state=selected]:shadow-[inset_2.5px_0_0_hsl(var(--brand))]', $props.class)">
     <slot />
   </tr>
 </template>

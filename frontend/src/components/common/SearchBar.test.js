@@ -233,8 +233,8 @@ describe('SearchBar — autocomplete', () => {
     const { wrapper, bar, input } = mountBar()
     await input.trigger('focus')
     // Nothing is selected by default now, so the FIRST ArrowDown lands on item 0; reaching the
-    // first example (past the 6 fields, index 6) takes 7 presses.
-    for (let i = 0; i < 7; i++) await input.trigger('keydown', { key: 'ArrowDown' })
+    // first example (past the 7 fields, index 7) takes 8 presses.
+    for (let i = 0; i < 8; i++) await input.trigger('keydown', { key: 'ArrowDown' })
     await input.trigger('keydown', { key: 'Enter' })
 
     const emitted = bar.emitted('update:modelValue')

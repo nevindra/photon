@@ -70,17 +70,23 @@ export default {
           soft: 'hsl(var(--success-soft))',
         },
       },
+      // One radius family derived from --radius (12px), so a menu row, a button, a card and a
+      // popover all curve alike: sm 6 (inner bits — menu rows, checkboxes, swatches) /
+      // md 10 (controls) / lg 12 (panels, tracks) / xl 14 (cards) / 2xl 18 (overlays).
+      // Pills use rounded-full and sit outside the scale.
       borderRadius: {
-        lg: 'var(--radius)',
+        sm: 'calc(var(--radius) - 6px)',
         md: 'calc(var(--radius) - 2px)',
-        sm: 'calc(var(--radius) - 4px)',
+        lg: 'var(--radius)',
+        xl: 'calc(var(--radius) + 2px)',
+        '2xl': 'calc(var(--radius) + 6px)',
       },
-      // Elevation / sink / highlight — utilities shadow-1, shadow-2, shadow-sink, shadow-hi.
+      // Elevation / sink — utilities shadow-1 (hairline ambient), shadow-2 (real float),
+      // shadow-sink (pressed in).
       boxShadow: {
         1: 'var(--shadow-1)',
         2: 'var(--shadow-2)',
         sink: 'var(--sink)',
-        hi: 'var(--hi)',
       },
       fontFamily: {
         sans: ['Inter Variable', 'ui-sans-serif', 'system-ui', 'sans-serif'],

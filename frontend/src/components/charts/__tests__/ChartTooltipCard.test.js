@@ -22,7 +22,7 @@ describe('ChartTooltipCard', () => {
     // The swatch renders the caller's Tailwind background class.
     expect(w.html()).toContain('bg-sev-error')
     // Canonical light-bordered surface.
-    expect(w.get('div').classes()).toEqual(expect.arrayContaining(['bg-popover', 'border', 'shadow-lg']))
+    expect(w.get('div').classes()).toEqual(expect.arrayContaining(['bg-popover', 'border', 'shadow-2']))
   })
 
   it('supports a raw CSS-colour swatch (line-series strokes)', () => {

@@ -7,11 +7,7 @@ import type { MaybeRefOrGetter } from 'vue'
 import { useQuery, keepPreviousData } from '@tanstack/vue-query'
 import { api } from '@/lib/core/api'
 import type { LogSearchRequest } from '@/lib/core/api'
-import { tenantQueryTerm } from '@/lib/core/context'
-
-// Appends the active tenant's grammar term to a query string — the single point where the
-// tenant context dimension filters logs (entity scopes stay decorative: chip + URL only).
-const withTenant = (q: string): string => [q, tenantQueryTerm()].filter(Boolean).join(' ')
+import { contextQueryTerm, withContext } from '@/lib/core/context'
 
 // Distinct service names. Rarely changes, so a long staleTime avoids refetching on every mount.
 export function useServices() {
@@ -56,10 +52,10 @@ export function useSearchLogs(
   options: Record<string, unknown> = {},
 ) {
   return useQuery({
-    queryKey: computed(() => ['search-logs', toValue(searchKey), tenantQueryTerm()]),
+    queryKey: computed(() => ['search-logs', toValue(searchKey), contextQueryTerm()]),
     queryFn: ({ signal }) => {
       const req = buildRequest()
-      return api.search({ ...req, query: withTenant(req.query) }, { signal })
+      return api.search({ ...req, query: withContext(req.query) }, { signal })
     },
     placeholderData: keepPreviousData,
     ...options,
@@ -82,10 +78,10 @@ export function useFacet(
       String(toValue(startNs)),
       String(toValue(endNs)),
       toValue(limit),
-      tenantQueryTerm(),
+      contextQueryTerm(),
     ]),
     queryFn: ({ signal }) =>
-      api.facet(toValue(field), withTenant(toValue(query)), toValue(startNs), toValue(endNs), toValue(limit), { signal }),
+      api.facet(toValue(field), withContext(toValue(query)), toValue(startNs), toValue(endNs), toValue(limit), { signal }),
     enabled: computed(() => !!toValue(field)),
     staleTime: 30_000,
     gcTime: 5 * 60_000,
@@ -107,10 +103,10 @@ export function useHistogram(
       String(toValue(startNs)),
       String(toValue(endNs)),
       toValue(buckets),
-      tenantQueryTerm(),
+      contextQueryTerm(),
     ]),
     queryFn: ({ signal }) =>
-      api.histogram(withTenant(toValue(query)), toValue(startNs), toValue(endNs), toValue(buckets), { signal }),
+      api.histogram(withContext(toValue(query)), toValue(startNs), toValue(endNs), toValue(buckets), { signal }),
     staleTime: 30_000,
     gcTime: 5 * 60_000,
     placeholderData: keepPreviousData,

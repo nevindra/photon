@@ -26,6 +26,10 @@ const props = defineProps({
   stacked: { type: Boolean, default: false }, // accumulate series into cumulative bands (a filled TOTAL)
   refLines: { type: Array, default: () => [] }, // [{ y, label, color, style? }] — y in value units
   bands: { type: Array, default: () => [] }, //   [{ x0Ms, x1Ms, label?, color }]
+  // [{ xMs, label, color }] — dashed vertical lines at a moment in time (deploy markers). Same
+  // contract BarChart already exposes, so a deploy line looks identical on a volume bar chart and
+  // on the latency lines beside it.
+  markers: { type: Array, default: () => [] },
   highlightKey: { type: String, default: null },
   loading: { type: Boolean, default: false },
   compact: { type: Boolean, default: false }, // mini mode: no axes/legend, tight padding, small height
@@ -102,6 +106,11 @@ const bandsForBase = computed(() =>
   (props.bands || []).map((b) => ({ x0: msToSec(b.x0Ms), x1: msToSec(b.x1Ms), label: b.label, color: b.color })),
 )
 
+// Markers cross in as ms, same as bands; BaseChart wants the x-scale's units (seconds).
+const markersForBase = computed(() =>
+  (props.markers || []).map((m) => ({ x: msToSec(m.xMs ?? m.x), label: m.label, color: m.color })),
+)
+
 // BaseChart select is in x-scale units (seconds for a time axis) → zoom carries ms.
 function onSelect({ minX, maxX }) {
   emit('zoom', { startMs: minX * 1000, endMs: maxX * 1000 })
@@ -116,6 +125,7 @@ function onSelect({ minX, maxX }) {
     :tooltip-data="tooltipData"
     :ref-lines="refLines"
     :bands="bandsForBase"
+    :markers="markersForBase"
     :loading="loading"
     :height="height"
     @select="onSelect"

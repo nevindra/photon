@@ -227,14 +227,14 @@ function openRoute({ app, route }) {
               :dist="v.dist"
             />
           </div>
-          <p v-else class="rounded-lg border border-border bg-card px-4 py-6 text-center text-xs text-muted-foreground">
+          <p v-else class="rounded-xl border border-border bg-card px-4 py-6 text-center text-xs text-muted-foreground">
             No Core Web Vitals reported in this range.
           </p>
         </section>
 
         <!-- Apps table + live issues / slowest routes -->
         <section class="grid grid-cols-1 gap-3 lg:grid-cols-3">
-          <div class="flex flex-col rounded-lg border border-border bg-surface-1 p-3 lg:col-span-2">
+          <div class="flex flex-col rounded-xl border border-border bg-surface-1 p-3 lg:col-span-2">
             <header class="mb-1 flex items-center justify-between gap-2">
               <h3 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Apps · ranked by health</h3>
               <span class="font-mono text-[11px] tabular-nums text-muted-foreground">{{ formatNumber(appRows.length) }}</span>
@@ -243,7 +243,7 @@ function openRoute({ app, route }) {
           </div>
 
           <div class="flex flex-col gap-3">
-            <div class="flex flex-col rounded-lg border border-border bg-surface-1 p-3">
+            <div class="flex flex-col rounded-xl border border-border bg-surface-1 p-3">
               <header class="mb-1 flex items-center justify-between gap-2">
                 <h3 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Live issues</h3>
                 <button
@@ -259,7 +259,7 @@ function openRoute({ app, route }) {
               <p v-else class="py-6 text-center text-xs text-muted-foreground">No JS errors in this range.</p>
             </div>
 
-            <div class="flex flex-col rounded-lg border border-border bg-surface-1 p-3">
+            <div class="flex flex-col rounded-xl border border-border bg-surface-1 p-3">
               <header class="mb-1 flex items-center gap-2">
                 <h3 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Slowest routes · LCP</h3>
               </header>

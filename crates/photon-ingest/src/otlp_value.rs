@@ -31,6 +31,18 @@ pub(crate) fn any_value_into_string(v: AnyValue) -> String {
     }
 }
 
+/// Borrow an `AnyValue`'s string, or `None` for any other kind.
+///
+/// Deliberately NOT the stringifying [`any_value_into_string`]: a caller that wants a string
+/// attribute (a service version, an environment name) wants the producer's string, and coercing an
+/// int or a nested list into one invents a value nobody set.
+pub(crate) fn any_value_str(v: &AnyValue) -> Option<&str> {
+    match &v.value {
+        Some(Value::StringValue(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
 /// Nibble → lowercase hex digit lookup, avoiding a `format!` allocation per byte.
 const HEX: &[u8; 16] = b"0123456789abcdef";
 

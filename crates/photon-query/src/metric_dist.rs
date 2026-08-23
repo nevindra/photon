@@ -15,8 +15,9 @@ use photon_core::PhotonError;
 
 use crate::metric_engine::{metric_base_predicate, MetricRequest};
 use crate::metric_query::{
-    bucket_of, bucket_start, MetricSeriesRequest, ProbeMeta, QuerySeriesResult, SeriesPoint,
-    SeriesResult, MAX_COLLECT_ROWS, MAX_SERIES, TEMPORALITY_CUMULATIVE,
+    bucket_of, bucket_start, collect_sorted_prefix, MetricSeriesRequest, ProbeMeta,
+    QuerySeriesResult, SeriesPoint, SeriesResult, MAX_COLLECT_ROWS, MAX_SERIES,
+    TEMPORALITY_CUMULATIVE,
 };
 use crate::{col_ref, MetricsQueryEngine};
 
@@ -153,22 +154,20 @@ impl MetricsQueryEngine {
             .collect();
         sorts.push(col("__ts").sort(true, false));
 
-        let batches = df
-            .filter(metric_base_predicate(base))
-            .map_err(|e| PhotonError::Query(format!("dist filter: {e}")))?
-            .select(selects)
-            .map_err(|e| PhotonError::Query(format!("dist select: {e}")))?
-            .sort(sorts)
-            .map_err(|e| PhotonError::Query(format!("dist sort: {e}")))?
-            // Applied AFTER the sort so a truncation keeps a deterministic prefix (the sort
-            // order's leading rows) rather than whatever DataFusion happened to scan first.
-            // `row_cap + 1`: collecting exactly that many rows is the signal that the true result
-            // was larger than `row_cap` (see the row-walk loop below).
-            .limit(0, Some(row_cap + 1))
-            .map_err(|e| PhotonError::Query(format!("dist limit: {e}")))?
-            .collect()
-            .await
-            .map_err(|e| PhotonError::Query(format!("dist collect: {e}")))?;
+        // The prefix is taken AFTER the sort, so a truncation keeps a deterministic set of rows
+        // (the sort order's leading ones) rather than whatever DataFusion happened to scan first.
+        // `row_cap + 1`: seeing exactly that many rows is the signal that the true result was
+        // larger than `row_cap` (see the row-walk loop below).
+        let batches = collect_sorted_prefix(
+            df.filter(metric_base_predicate(base))
+                .map_err(|e| PhotonError::Query(format!("dist filter: {e}")))?
+                .select(selects)
+                .map_err(|e| PhotonError::Query(format!("dist select: {e}")))?,
+            sorts,
+            row_cap,
+            "dist",
+        )
+        .await?;
 
         let mut out: Vec<(BTreeMap<String, String>, Vec<DistRow>)> = Vec::new();
         let mut cur_key: Option<Vec<Option<String>>> = None;
@@ -317,14 +316,31 @@ impl MetricsQueryEngine {
 /// across consecutive samples (a `count` decrease, an advanced `start_timestamp`, or a changed
 /// bound vector — length or values — is a reset → the new counts are the contribution; the first
 /// sample contributes 0). Canonical bounds are taken from the first parsed row.
-pub(crate) fn histogram_series(
+/// The time-bucketed accumulation behind every explicit-histogram read: canonical bounds plus, per
+/// time bucket, element-wise bucket counts and the payload `sum`/`count`.
+///
+/// Factored out of [`histogram_series`] so the SLO path can ask a different question of the same
+/// numbers — "how many samples landed at or below X" — without re-deriving the cumulative
+/// reset rule, which is the subtle part and must never diverge between two readers of one metric.
+pub(crate) struct HistAccum {
+    pub bounds: Vec<f64>,
+    /// One `bounds.len() + 1` long vector per time bucket.
+    pub counts: Vec<Vec<f64>>,
+    pub sums: Vec<f64>,
+    pub totals: Vec<f64>,
+    /// `false` for a bucket no payload landed in — distinct from a bucket that observed zero.
+    pub has: Vec<bool>,
+}
+
+/// Accumulate `rows` into `buckets` time buckets. `None` when no row carried explicit bounds, which
+/// is the only shape this can fail on.
+pub(crate) fn histogram_accumulate(
     rows: &[DistRow],
     cumulative: bool,
-    agg: Agg,
     start: i64,
     end: i64,
     buckets: usize,
-) -> Vec<SeriesPoint> {
+) -> Option<HistAccum> {
     let parsed: Vec<(i64, Option<i64>, HistPayload)> = rows
         .iter()
         .filter_map(|r| {
@@ -333,26 +349,15 @@ pub(crate) fn histogram_series(
                 .map(|p| (r.ts, r.st, p))
         })
         .collect();
-    let empty = || {
-        (0..buckets)
-            .map(|i| SeriesPoint {
-                t: bucket_start(start, end, buckets, i),
-                v: None,
-            })
-            .collect::<Vec<_>>()
-    };
-    let Some(bounds) = parsed
+    let bounds = parsed
         .iter()
         .find(|(_, _, p)| !p.explicit_bounds.is_empty())
-        .map(|(_, _, p)| p.explicit_bounds.clone())
-    else {
-        return empty();
-    };
+        .map(|(_, _, p)| p.explicit_bounds.clone())?;
     let nb = bounds.len() + 1;
 
     let mut counts = vec![vec![0f64; nb]; buckets];
-    let mut hsum = vec![0f64; buckets];
-    let mut hcount = vec![0f64; buckets];
+    let mut sums = vec![0f64; buckets];
+    let mut totals = vec![0f64; buckets];
     let mut has = vec![false; buckets];
 
     if cumulative {
@@ -391,8 +396,8 @@ pub(crate) fn histogram_series(
                 }
             };
             add_into(&mut counts[b], &inc_counts);
-            hsum[b] += inc_sum;
-            hcount[b] += inc_count;
+            sums[b] += inc_sum;
+            totals[b] += inc_count;
             has[b] = true;
             prev = Some((
                 cur,
@@ -407,23 +412,56 @@ pub(crate) fn histogram_series(
             let b = bucket_of(*ts, start, end, buckets);
             let cur: Vec<f64> = p.bucket_counts.iter().map(|&c| c as f64).collect();
             add_into(&mut counts[b], &cur);
-            hsum[b] += p.sum.unwrap_or(0.0);
-            hcount[b] += p.count as f64;
+            sums[b] += p.sum.unwrap_or(0.0);
+            totals[b] += p.count as f64;
             has[b] = true;
         }
     }
 
+    Some(HistAccum {
+        bounds,
+        counts,
+        sums,
+        totals,
+        has,
+    })
+}
+
+/// One-group histogram roll-up. Accumulates (see [`histogram_accumulate`]) then answers the
+/// aggregation per time bucket.
+pub(crate) fn histogram_series(
+    rows: &[DistRow],
+    cumulative: bool,
+    agg: Agg,
+    start: i64,
+    end: i64,
+    buckets: usize,
+) -> Vec<SeriesPoint> {
+    let empty = || {
+        (0..buckets)
+            .map(|i| SeriesPoint {
+                t: bucket_start(start, end, buckets, i),
+                v: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let Some(acc) = histogram_accumulate(rows, cumulative, start, end, buckets) else {
+        return empty();
+    };
+
     (0..buckets)
         .map(|i| {
-            let v = if !has[i] {
+            let v = if !acc.has[i] {
                 None
             } else {
                 match agg {
-                    Agg::Count => Some(hcount[i]),
-                    Agg::Sum => Some(hsum[i]),
-                    Agg::Avg => (hcount[i] > 0.0).then(|| hsum[i] / hcount[i]),
+                    Agg::Count => Some(acc.totals[i]),
+                    Agg::Sum => Some(acc.sums[i]),
+                    Agg::Avg => (acc.totals[i] > 0.0).then(|| acc.sums[i] / acc.totals[i]),
                     _ => match quantile_of(agg) {
-                        Some(q) => interpolate_quantile(&hist_ranges(&bounds, &counts[i]), q),
+                        Some(q) => {
+                            interpolate_quantile(&hist_ranges(&acc.bounds, &acc.counts[i]), q)
+                        }
                         None => None,
                     },
                 }
@@ -436,6 +474,38 @@ pub(crate) fn histogram_series(
         .collect()
 }
 
+/// Samples at or below `bound`, and the total, per time bucket.
+///
+/// This is the **latency SLI**: "how many requests were fast enough". A histogram cannot answer it
+/// at an arbitrary threshold — it only knows its own bucket edges — so `bound` is snapped DOWN to
+/// the nearest bucket edge and the edge actually measured is returned. Snapping down rather than to
+/// the nearest edge keeps the answer conservative: an SLO reported as met was met, never rounded
+/// into being met. A `bound` below the first edge measures nothing and yields `good = 0`.
+///
+/// Returns `None` when no payload carried explicit bounds (nothing to measure against).
+pub(crate) fn histogram_le_counts(
+    rows: &[DistRow],
+    cumulative: bool,
+    bound: f64,
+    start: i64,
+    end: i64,
+    buckets: usize,
+) -> Option<(Vec<(f64, f64)>, f64)> {
+    let acc = histogram_accumulate(rows, cumulative, start, end, buckets)?;
+    // The number of leading buckets whose upper edge is at or below the requested bound. Bucket
+    // `i` covers `(bounds[i-1], bounds[i]]`, so including bucket `i` means every sample in it was
+    // `<= bounds[i]`.
+    let take = acc.bounds.iter().filter(|&&b| b <= bound).count();
+    let measured = acc.bounds.get(take.wrapping_sub(1)).copied().unwrap_or(0.0);
+    let per_bucket = (0..buckets)
+        .map(|i| {
+            let good: f64 = acc.counts[i].iter().take(take).sum();
+            (good, acc.totals[i])
+        })
+        .collect();
+    Some((per_bucket, measured))
+}
+
 /// Element-wise `acc += add`, tolerating length mismatch (extra `add` entries are ignored).
 fn add_into(acc: &mut [f64], add: &[f64]) {
     for (a, b) in acc.iter_mut().zip(add) {
@@ -443,7 +513,92 @@ fn add_into(acc: &mut [f64], add: &[f64]) {
     }
 }
 
+/// One series' latency SLI over the window: good (fast-enough) and total sample counts per time
+/// bucket, plus the bucket edge the measurement actually used.
+pub struct LatencySli {
+    pub labels: BTreeMap<String, String>,
+    /// `(good, total)` per time bucket, in bucket order.
+    pub buckets: Vec<(f64, f64)>,
+}
+
+/// The result of a [`MetricsQueryEngine::latency_sli`] read.
+pub struct LatencySliResult {
+    pub series: Vec<LatencySli>,
+    /// The histogram edge the counts were actually taken at, in the metric's own unit (ns for
+    /// `photon.*.duration`). Reported because it is almost never exactly what was asked for — a
+    /// histogram only knows its own edges — and an SLO that silently measured 500ms when it was
+    /// configured for 300ms is a number nobody can act on.
+    pub measured_bound: f64,
+    /// `true` when the series cap bit, so the caller can say the answer is partial.
+    pub capped: bool,
+}
+
 impl MetricsQueryEngine {
+    /// "How many samples were at or below `bound`" for an explicit-bucket histogram metric —
+    /// the read behind a latency SLO.
+    ///
+    /// Deliberately NOT a new `Agg` variant: `Agg` is a closed vocabulary shared with the metrics
+    /// explorer and the alert engine, and "count at or below an arbitrary value" carries a
+    /// parameter none of the others do. It stays a dedicated entry point so nothing else has to
+    /// grow a threshold argument it will never use.
+    ///
+    /// Only meaningful for a stored explicit Histogram. A metric that is not one (a gauge, a sum,
+    /// a classic `_bucket` family) yields an empty result rather than an error — the caller reports
+    /// "no data", which is the truth.
+    pub async fn latency_sli(
+        &self,
+        req: MetricSeriesRequest,
+        bound: f64,
+    ) -> Result<LatencySliResult, PhotonError> {
+        let buckets = req.buckets.clamp(1, 3000);
+        let base = MetricRequest {
+            metric: req.metric.clone(),
+            start_ts_nanos: req.start_ts_nanos,
+            end_ts_nanos: req.end_ts_nanos,
+            filter: req.filter.clone(),
+            host: None,
+        };
+        let Some(meta) = self.metric_meta_probe_cached(&base).await? else {
+            return Ok(LatencySliResult {
+                series: vec![],
+                measured_bound: 0.0,
+                capped: false,
+            });
+        };
+        let cumulative = meta.temporality == Some(TEMPORALITY_CUMULATIVE);
+        let (groups, capped) = self
+            .collect_dist_series(&base, &req.group_by, metric_schema::HISTOGRAM)
+            .await?;
+
+        let mut measured_bound = 0.0f64;
+        let mut series = Vec::with_capacity(groups.len());
+        for (labels, rows) in groups {
+            let Some((per_bucket, measured)) = histogram_le_counts(
+                &rows,
+                cumulative,
+                bound,
+                req.start_ts_nanos,
+                req.end_ts_nanos,
+                buckets,
+            ) else {
+                continue;
+            };
+            // Every series of one metric shares the ladder, so the last one speaks for all — but
+            // take the largest seen rather than assuming, so a series stored under an older ladder
+            // cannot silently shrink the reported edge.
+            measured_bound = measured_bound.max(measured);
+            series.push(LatencySli {
+                labels,
+                buckets: per_bucket,
+            });
+        }
+        Ok(LatencySliResult {
+            series,
+            measured_bound,
+            capped,
+        })
+    }
+
     /// Exp-histogram series query: p50/p90/p99 (merge + interpolate) + count/sum/avg. Mirrors
     /// `query_series_histogram`, re-scanning by the `exp_histogram` JSON column.
     #[allow(clippy::too_many_arguments)]
@@ -886,6 +1041,117 @@ mod hist_tests {
             b.append(p);
         }
         MetricsQueryEngine::from_batch(schema, b.finish().unwrap())
+    }
+
+    // --- the latency SLI (`histogram_le_counts`) ---
+    // Bounds [10,50,100,500], counts [2,5,10,3,0] → 20 samples, of which 7 are <= 50.
+
+    fn le_rows() -> Vec<DistRow> {
+        vec![DistRow {
+            ts: 10,
+            st: Some(0),
+            json: r#"{"count":20,"sum":0,"bucket_counts":[2,5,10,3,0],"explicit_bounds":[10,50,100,500]}"#
+                .into(),
+        }]
+    }
+
+    #[test]
+    fn le_counts_split_at_a_bucket_edge() {
+        let (per, measured) = histogram_le_counts(&le_rows(), false, 50.0, 0, 100, 1).unwrap();
+        assert_eq!(per, vec![(7.0, 20.0)]);
+        assert_eq!(measured, 50.0);
+    }
+
+    #[test]
+    fn a_threshold_between_edges_snaps_down_and_says_so() {
+        // Asked for 80; a histogram only knows 50 and 100. Snapping DOWN is conservative: it can
+        // only under-report "fast enough", never round an SLO into being met.
+        let (per, measured) = histogram_le_counts(&le_rows(), false, 80.0, 0, 100, 1).unwrap();
+        assert_eq!(per, vec![(7.0, 20.0)]);
+        assert_eq!(
+            measured, 50.0,
+            "the caller must be told 50 was measured, not 80"
+        );
+    }
+
+    #[test]
+    fn a_threshold_under_the_first_edge_measures_nothing() {
+        let (per, measured) = histogram_le_counts(&le_rows(), false, 5.0, 0, 100, 1).unwrap();
+        assert_eq!(per, vec![(0.0, 20.0)]);
+        assert_eq!(measured, 0.0);
+    }
+
+    #[test]
+    fn a_threshold_above_every_edge_still_excludes_the_overflow_bucket() {
+        // The +Inf bucket has no upper edge to be "at or below", so a sample in it is never fast
+        // enough — which is right: it is the slowest requests there are.
+        let rows = vec![DistRow {
+            ts: 10,
+            st: Some(0),
+            json: r#"{"count":25,"sum":0,"bucket_counts":[2,5,10,3,5],"explicit_bounds":[10,50,100,500]}"#
+                .into(),
+        }];
+        let (per, measured) = histogram_le_counts(&rows, false, 10_000.0, 0, 100, 1).unwrap();
+        assert_eq!(per, vec![(20.0, 25.0)]);
+        assert_eq!(measured, 500.0);
+    }
+
+    #[test]
+    fn le_counts_follow_the_cumulative_reset_rule() {
+        // Same rule as `histogram_series`: the first CUMULATIVE sample contributes nothing, so the
+        // window's good/total come from the delta alone. This is why the accumulation is shared
+        // rather than reimplemented — two readers of one metric must never disagree.
+        let s0 =
+            r#"{"count":0,"sum":0,"bucket_counts":[0,0,0,0,0],"explicit_bounds":[10,50,100,500]}"#;
+        let s1 = r#"{"count":20,"sum":0,"bucket_counts":[2,5,10,3,0],"explicit_bounds":[10,50,100,500]}"#;
+        let rows = vec![
+            DistRow {
+                ts: 10,
+                st: Some(0),
+                json: s0.into(),
+            },
+            DistRow {
+                ts: 20,
+                st: Some(0),
+                json: s1.into(),
+            },
+        ];
+        let (per, _) = histogram_le_counts(&rows, true, 50.0, 0, 100, 1).unwrap();
+        assert_eq!(per, vec![(7.0, 20.0)]);
+    }
+
+    #[test]
+    fn le_counts_split_across_time_buckets() {
+        // Two windows, each its own (good, total) — this is what makes a burn rate over 5m and
+        // over 1h come off one read.
+        let json =
+            r#"{"count":10,"sum":0,"bucket_counts":[1,3,4,2,0],"explicit_bounds":[10,50,100,500]}"#;
+        let rows = vec![
+            DistRow {
+                ts: 10,
+                st: Some(0),
+                json: json.into(),
+            },
+            DistRow {
+                ts: 70,
+                st: Some(0),
+                json: json.into(),
+            },
+        ];
+        let (per, _) = histogram_le_counts(&rows, false, 50.0, 0, 100, 2).unwrap();
+        assert_eq!(per, vec![(4.0, 10.0), (4.0, 10.0)]);
+    }
+
+    #[test]
+    fn a_payload_without_bounds_measures_nothing_rather_than_zero() {
+        // No bounds means there is no ladder to measure against. `None` lets the caller say "no
+        // data"; a `(0, 0)` would read as "nothing was fast enough", which is a different claim.
+        let rows = vec![DistRow {
+            ts: 10,
+            st: Some(0),
+            json: r#"{"count":5,"sum":0,"bucket_counts":[],"explicit_bounds":[]}"#.into(),
+        }];
+        assert!(histogram_le_counts(&rows, false, 50.0, 0, 100, 1).is_none());
     }
 
     // Pure roll-up: two DELTA points in one bucket, element-wise summed → known p50.

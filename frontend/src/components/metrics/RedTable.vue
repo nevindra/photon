@@ -101,7 +101,7 @@ const COLUMNS = computed(() =>
 <template>
   <div class="flex flex-col">
     <Table container-class="overflow-visible" class="border-collapse font-mono text-xs">
-      <TableHeader class="sticky top-0 z-10 bg-background">
+      <TableHeader class="sticky top-0 z-10 bg-card">
         <TableRow class="text-[10px] font-medium uppercase tracking-wider text-muted-foreground hover:bg-transparent">
           <TableHead class="w-6" aria-label="Health" />
           <TableHead
@@ -141,7 +141,7 @@ const COLUMNS = computed(() =>
           <TableCell class="py-1.5 text-foreground">
             <span class="inline-flex items-center gap-1.5">
               {{ row.service }}
-              <Badge v-if="row.tenant" data-testid="red-tenant-badge" class="rounded-full border-brand/35 bg-brand-soft px-1.5 py-0 text-[10px] text-brand">
+              <Badge v-if="row.tenant" variant="brand" data-testid="red-tenant-badge" class="px-1.5 py-0 text-[10px]">
                 {{ row.tenant }}
               </Badge>
             </span>

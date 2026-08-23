@@ -100,9 +100,11 @@ const COLUMNS = computed(() => [
 </script>
 
 <template>
-  <div class="flex flex-col">
+  <!-- The table owns its panel (white card + hairline) so it reads as a block on the grey app
+       canvas rather than a bare grid — same chrome as ServicesTable. -->
+  <div class="flex flex-col overflow-hidden rounded-xl border border-border bg-card shadow-1">
     <Table container-class="overflow-visible" class="border-collapse font-mono text-xs">
-      <TableHeader class="sticky top-0 z-10 bg-background">
+      <TableHeader class="sticky top-0 z-10 bg-card">
         <TableRow class="text-[10px] font-medium uppercase tracking-wider text-muted-foreground hover:bg-transparent">
           <TableHead
             v-for="col in COLUMNS"

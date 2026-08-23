@@ -1,5 +1,5 @@
 <script setup>
-// SearchBar — model A′ (spec §2/§3 of docs/superpowers/specs/2026-07-02-search-ux-revamp-design.md).
+// SearchBar — the query-grammar input. Grammar: docs/subsystems/logs.md; UI: docs/frontend.md.
 //
 // Technique: a colored, pointer-events-none overlay <div> sits BEHIND a transparent real
 // <input>. The input owns the text/caret/selection (100% normal text editing); the overlay
@@ -460,7 +460,7 @@ function onKeydown(e) {
 <template>
   <div class="relative w-full">
     <div
-      class="relative w-full rounded-md border border-input bg-background shadow-sink transition-shadow focus-within:ring-2 focus-within:ring-ring"
+      class="relative w-full rounded-md border border-input bg-surface-1 transition-[border-color,box-shadow] duration-150 ease-out hover:border-foreground/15 focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/20"
     >
       <!-- Overlay (behind): tokenized, styled, character-aligned, non-interactive. -->
       <div

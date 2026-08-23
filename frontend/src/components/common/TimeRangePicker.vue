@@ -1,7 +1,6 @@
 <script setup>
 // Header time-range control — compact, preset-first popover with a custom
-// absolute-range escape hatch. See docs/superpowers/specs/
-// 2026-07-02-search-ux-revamp-design.md §5 "Time-range picker (model A)".
+// absolute-range escape hatch. See docs/frontend.md.
 //
 // Presets and custom range are mutually exclusive: picking a preset clears
 // the parent's customRange, applying a custom range clears the parent's
@@ -147,7 +146,7 @@ function applySelection() {
           <input
             v-model="fromInput"
             type="datetime-local"
-            class="rounded-md border border-input bg-background px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            class="rounded-md border border-input bg-surface-1 px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
             @input="clearPendingPreset"
           />
         </label>
@@ -156,7 +155,7 @@ function applySelection() {
           <input
             v-model="toInput"
             type="datetime-local"
-            class="rounded-md border border-input bg-background px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            class="rounded-md border border-input bg-surface-1 px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
             @input="clearPendingPreset"
           />
         </label>

@@ -12,7 +12,7 @@ const props = defineProps({
     :aria-label="ariaLabel"
     :class="
       cn(
-        'inline-flex h-9 items-center justify-center gap-1 rounded-lg bg-muted p-1 text-muted-foreground',
+        'inline-flex h-9 items-center justify-center gap-0.5 rounded-lg bg-muted p-1 text-muted-foreground',
         props.class,
       )
     "

@@ -1,7 +1,8 @@
-// One source of truth for cross-signal links. correlate() ALWAYS merges the active time window +
-// tenant from context.ts, so no navigation hop can drop context. relatedFor() returns the typed
-// destination list per entity kind, dropping any destination whose required field is absent.
-import { timeRange, customRange, tenant } from '@/lib/core/context'
+// One source of truth for cross-signal links. correlate() ALWAYS merges the active time window,
+// tenant, and environment from context.ts, so no navigation hop can drop context. relatedFor()
+// returns the typed destination list per entity kind, dropping any destination whose required
+// field is absent.
+import { timeRange, customRange, tenant, environment } from '@/lib/core/context'
 
 export interface Destination {
   path: string
@@ -21,11 +22,21 @@ export function correlate(dest: Destination): string {
     p.set('range', timeRange.value)
   }
   if (tenant.value) p.set('tenant', tenant.value)
+  if (environment.value) p.set('env', environment.value)
   const qs = p.toString()
   return path + (qs ? `?${qs}` : '')
 }
 
-export type EntityKind = 'log' | 'span' | 'service' | 'rumError' | 'rumPage' | 'monitor' | 'metric' | 'host'
+export type EntityKind =
+  | 'log'
+  | 'span'
+  | 'service'
+  | 'backendIssue'
+  | 'rumError'
+  | 'rumPage'
+  | 'monitor'
+  | 'metric'
+  | 'host'
 
 export interface Entity {
   kind: EntityKind | string
@@ -79,6 +90,16 @@ function candidates(kind: string, f: Fields): Candidate[] {
         { id: 'rum-app', label: 'RUM app', dest: { path: '/rum', query: { app: f.service } } },
         { id: 'uptime', label: 'Uptime', dest: { path: '/uptime', query: { q: f.service } } },
       ]
+    // A Backend Issue's jumps mirror the RUM Issue's, one runtime over: the failing trace, the
+    // logs around it, and the owning service. `service` is always present here (it is half the
+    // Issue's identity), so none of the three is conditional on it the way rumError's is.
+    case 'backendIssue':
+      return [
+        Boolean(f.traceId) && { id: 'trace', label: 'Trace waterfall', dest: { path: `/traces/${f.traceId}` } },
+        { id: 'logs', label: 'Logs', dest: { path: '/logs', query: { q: f.traceId ? term('trace_id', f.traceId) : term('service.name', f.service) } } },
+        { id: 'traces', label: 'Failing traces', dest: { path: '/traces', query: { q: andTerms(term('service.name', f.service), 'status:error'), sort: 'errors' } } },
+        { id: 'service', label: 'Backend health', dest: { path: `/services/${encodeURIComponent(f.service ?? '')}` } },
+      ]
     case 'rumError':
       return [
         Boolean(f.traceId) && { id: 'trace', label: 'Trace waterfall', dest: { path: `/traces/${f.traceId}` } },
@@ -114,7 +135,7 @@ function candidates(kind: string, f: Fields): Candidate[] {
 export function relatedFor(entity: Entity): RelatedDestination[] {
   const list = candidates(entity.kind, entity.fields ?? {}).filter((c): c is RelatedDestination => Boolean(c))
   // Phase-2 flagship destination, present on the correlated kinds.
-  if (['span', 'log', 'service', 'rumError'].includes(entity.kind)) {
+  if (['span', 'log', 'service', 'rumError', 'backendIssue'].includes(entity.kind)) {
     list.push({ id: 'correlated-view', label: 'Open correlated view', dest: { path: '/traces' }, phase: 2 })
   }
   return list

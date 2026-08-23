@@ -6,7 +6,7 @@ defineEmits(['select'])
 </script>
 
 <template>
-  <div class="overflow-x-auto rounded-lg border border-border bg-card shadow-1">
+  <div class="overflow-x-auto rounded-xl border border-border bg-card shadow-1">
     <Table>
       <TableHeader>
         <TableRow>

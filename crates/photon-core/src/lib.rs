@@ -46,6 +46,7 @@ pub mod retention;
 pub mod rum;
 pub mod schema;
 pub mod segment;
+pub mod span_error;
 pub mod span_record;
 pub mod span_schema;
 

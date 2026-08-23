@@ -242,7 +242,12 @@ cd sdk/rum   && bun run test  # SDK tests + bun run size (bundle-size gate)
 ## Status & license
 
 Photon began as an internal SigNoz replacement and is under active development. It is a single-node,
-single-role (all authenticated users share one role) platform today — RBAC, multi-tenancy, and
-clustering are explicitly out of scope until there's demand.
+single-role (all authenticated users share one role) platform today — RBAC and multi-tenancy are
+explicitly out of scope until there's demand.
+
+It does federate: a **central** Photon can register your own Photon installs in other regions,
+clusters or environments (**sites**) and aggregate what they push, so one team can watch the whole
+fleet while each site team watches their own. That is fleet aggregation, not clustering — there is
+no shared cluster state and no node serves another's data.
 
 _License: TBD._

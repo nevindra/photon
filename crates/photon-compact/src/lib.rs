@@ -1,9 +1,9 @@
 //! photon-compact: drains closed WAL segments into sorted Parquet + skip index, updates
 //! the manifest, and enqueues replication.
 //!
-//! Implemented per the `photon-compact` section of
-//! `docs/superpowers/plans/2026-07-01-photon-interface-contracts.md`.
+//! Its place in the crate graph is described in `docs/architecture.md`.
 
+mod align;
 mod compactor;
 mod metrics_compactor;
 mod span_compactor;

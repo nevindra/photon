@@ -9,6 +9,14 @@ import TracesExplorer from "@/views/TracesExplorer.vue";
 import TraceDetailView from "@/views/TraceDetailView.vue";
 import ServicesListView from "@/views/ServicesListView.vue";
 import ServiceDetailView from "@/views/ServiceDetailView.vue";
+import ServiceOperationsView from "@/views/ServiceOperationsView.vue";
+import ServiceOperationView from "@/views/ServiceOperationView.vue";
+import ServiceDependenciesView from "@/views/ServiceDependenciesView.vue";
+import ServiceIssuesView from "@/views/ServiceIssuesView.vue";
+import ServiceDeploymentsView from "@/views/ServiceDeploymentsView.vue";
+import ServiceIssueDetailView from "@/views/ServiceIssueDetailView.vue";
+import BackendIssuesView from "@/views/BackendIssuesView.vue";
+import ServiceMapView from "@/views/ServiceMapView.vue";
 import MetricsExplorer from "@/views/MetricsExplorer.vue";
 import RumAppsView from "@/views/RumAppsView.vue";
 import RumVitalsView from "@/views/RumVitalsView.vue";
@@ -37,12 +45,52 @@ const routes = [
     name: "trace-detail",
     component: TraceDetailView,
   },
-  // Services (APM): per-service health list + per-service detail dashboard.
+  // Services (APM): the fleet board, then per-service detail SUB-ROUTES.
+  //
+  // Each tab owns its own queries, so Overview stays fast when Operations is expensive — one view
+  // fetching everything up front means the slowest panel sets the whole page's speed. Mirrors the
+  // `/rum` app-scoped pattern, including its ordering rule: any static sub-path must be declared
+  // BEFORE the dynamic `:service` catch-all, or `/services/map` resolves as a service named "map".
   { path: "/services", name: "services", component: ServicesListView },
+  // Fleet-wide Backend Issues. Static, so it must precede `/services/:service` or it resolves as
+  // a service literally named "errors".
+  { path: "/services/errors", name: "backend-issues", component: BackendIssuesView },
+  // Same rule as `/services/errors`: static before the `:service` catch-all.
+  { path: "/services/map", name: "service-map", component: ServiceMapView },
   {
     path: "/services/:service",
     name: "service-detail",
     component: ServiceDetailView,
+  },
+  {
+    path: "/services/:service/operations",
+    name: "service-operations",
+    component: ServiceOperationsView,
+  },
+  {
+    path: "/services/:service/operations/:operation",
+    name: "service-operation",
+    component: ServiceOperationView,
+  },
+  {
+    path: "/services/:service/deployments",
+    name: "service-deployments",
+    component: ServiceDeploymentsView,
+  },
+  {
+    path: "/services/:service/errors",
+    name: "service-issues",
+    component: ServiceIssuesView,
+  },
+  {
+    path: "/services/:service/errors/:fingerprint",
+    name: "service-issue",
+    component: ServiceIssueDetailView,
+  },
+  {
+    path: "/services/:service/dependencies",
+    name: "service-dependencies",
+    component: ServiceDependenciesView,
   },
   // Top-level OTLP Metrics Explorer (Milestone 3). Distinct from the Services section above.
   { path: "/metrics", name: "metrics", component: MetricsExplorer },

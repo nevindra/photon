@@ -57,7 +57,7 @@ const isError = computed(() => rulesQuery.isError.value)
         <Button size="sm" variant="secondary" @click="$emit('open-create')">New alert</Button>
       </div>
     </EmptyState>
-    <div v-else class="overflow-x-auto rounded-lg border border-border bg-card shadow-1">
+    <div v-else class="overflow-x-auto rounded-xl border border-border bg-card shadow-1">
       <Table>
         <TableHeader>
           <TableRow>

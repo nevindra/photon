@@ -1,6 +1,10 @@
 # Federation
 
-One central Photon monitors many customer Photon installs (tenants) that push telemetry to it, egress-only via OTLP. **No new storage engine** — federated data flows through the existing logs/traces/metrics WAL and storage pipeline; this doc covers what's specific to federation: the config, token flow, server-side tenant stamping, the summary/full modes, and the curated management UI.
+One central Photon monitors many Photon installs **of your own** (tenants) that push telemetry to it, egress-only via OTLP. **No new storage engine** — federated data flows through the existing logs/traces/metrics WAL and storage pipeline; this doc covers what's specific to federation: the config, token flow, server-side tenant stamping, the summary/full modes, and the curated management UI.
+
+> **Vocabulary.** Code and config say **tenant** (the `tenants` table, `?tenant=`, the `tenant` resource attribute, `[federation]`), and that name is not going to change. In prose we say **Site**, because "tenant" reads as *customer* — and these are not customers. A Site is another deployment of ours, in another region / cluster / environment; when one goes quiet, that is our outage, which is why `/home` ranks Sites in the same attention list as a service or a host. The install they push to is **Central**. Central is not a different product: same binary, same UI, same landing page — the difference is only in the data. See [`../../CONTEXT.md`](../../CONTEXT.md).
+>
+> This is **not clustering**. Nothing is shared: no cluster state, no consensus, no node serving another's data. A Site is a whole Photon that runs standalone and happens to also egress to Central.
 
 > Shared plumbing and invariants: [`../architecture.md`](../architecture.md).
 
@@ -10,6 +14,36 @@ One central Photon monitors many customer Photon installs (tenants) that push te
 - **Full mode** (opt-in): the tenant-side Photon **also** forwards raw OTLP batches (logs/traces/metrics) to central in real time. This is a best-effort tee (non-blocking; a full queue drops the incoming batch — drop-newest) that rides alongside local ingest. Central stamps each forwarded batch with the same `tenant` attribute.
 
 Both modes use per-tenant bearer tokens and server-side stamping — client-supplied `tenant` attributes are always overwritten. Summary mode is the default and runs alone; full mode enables the tee and ALSO runs the summary pusher (so central sees both the high-volume raw mirror and the low-volume summary).
+
+## The service rollup rides along
+
+A Site ships its `photon.service.*` / `photon.operation.*` rollup to central, in **both** modes,
+controlled by `[federation].push_service_rollup` (default `true`, env
+`PHOTON_FEDERATION_PUSH_SERVICE_ROLLUP`).
+
+It needs its own wiring because neither mode covers it:
+
+- `summary` mode pushes synthetic health metrics and says nothing per-service. Without this, the
+  cross-Site Services index would only work for Sites that can afford `full` mode.
+- `full` mode mirrors **accepted OTLP batches**, and the rollup writes straight to the local metrics
+  WAL — it never becomes an accepted OTLP batch.
+
+So the rollup pass offers each published bucket to the same tee the forwarder drains: sharing the
+existing tee in `full` mode, and creating a metrics-only tee (plus its forwarder) in `summary` mode.
+Sharing rather than creating a second one in full mode is load-bearing — two tees means two
+forwarders means every bucket delivered twice, and central sums the points in a bucket rather than
+de-duplicating them. `rollup::tee_plan` is that decision, in one testable place.
+
+The offer happens only **after** the local WAL append succeeds, and it is `try_send`: an unreachable
+central or a full queue costs a `dropped` tick on `/api/federation/status`, never the Site's own
+data. Central stamps `tenant` on arrival exactly as it does for every other metric, so no
+central-side change was needed.
+
+Central does **not** re-roll mirrored spans (`red_rollup` filters to local spans only) — otherwise
+every federated service would be counted twice, once from its Site's shipped rollup and once from
+central's own pass over the mirrored spans.
+
+See [`docs/subsystems/rollup.md`](rollup.md).
 
 ## Tenant-side configuration
 

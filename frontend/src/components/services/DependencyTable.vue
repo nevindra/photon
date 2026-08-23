@@ -32,7 +32,7 @@ function fmtErrorRate(r) {
 </script>
 
 <template>
-  <div class="flex flex-col overflow-hidden rounded-lg border border-border bg-card shadow-1">
+  <div class="flex flex-col overflow-hidden rounded-xl border border-border bg-card shadow-1">
     <header class="px-4 pb-2 pt-3.5">
       <h3 class="text-xs font-medium uppercase tracking-wider text-muted-foreground">{{ title }}</h3>
     </header>

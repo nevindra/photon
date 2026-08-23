@@ -136,7 +136,7 @@ function onShortcut(e) {
           type="button"
           data-testid="copy-message"
           :title="copiedMessage ? 'Copied' : 'Copy message (c)'"
-          class="absolute right-2 top-2 inline-flex h-7 w-7 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-background hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+          class="absolute right-2 top-2 inline-flex h-7 w-7 items-center justify-center rounded-sm text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
           @click="copyMessage"
         >
           <Check v-if="copiedMessage" class="h-4 w-4 text-foreground" />

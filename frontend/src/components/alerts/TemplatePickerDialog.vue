@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Quick-setup template picker: pick a target (Service/App/Host/Global) → list of templates for it →
 // Apply (POST straight from templateToRuleInput) or Customize (emit a seed → AlertsView opens
-// AlertRuleDialog pre-seeded). Frontend-only; see docs/superpowers/specs/2026-07-18-alert-rule-templates-design.md.
+// AlertRuleDialog pre-seeded). Frontend-only; see docs/subsystems/alerts.md.
 import { computed, ref, watch } from 'vue'
 import {
   Dialog,

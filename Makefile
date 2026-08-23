@@ -15,6 +15,11 @@ DEV_DATA   := .photon-dev
 DEV_USER   := admin
 DEV_PASS   := admin
 
+# A copy of a real deployment's hot tier, for working on the read path against real telemetry
+# rather than loadgen output. Gitignored; see photon.prod-replica.toml for how it is used.
+REPLICA_CONFIG := photon.prod-replica.toml
+REPLICA_DATA   := .photon-prod
+
 # process-compose runs its own control API. By default that's TCP :8080 — the SAME port
 # Photon's API binds, so pc would claim it first and the `server` process fails with
 # "address already in use". Run pc over a unix socket instead (never touches :8080); the
@@ -54,6 +59,14 @@ down: ## Stop a detached dev stack
 .PHONY: logs
 logs: ## Tail the per-process dev logs
 	tail -n +1 -f $(DEV_DATA)/logs/server.log $(DEV_DATA)/logs/web.log
+
+.PHONY: replica
+replica: ## Run the backend against the production data replica in .photon-prod
+	@test -d $(REPLICA_DATA)/hot || { \
+		echo "$(REPLICA_DATA)/hot is missing — pull a copy of the production hot tier first."; \
+		exit 1; }
+	@echo "Serving $(REPLICA_DATA) (this directory IS mutated: merge, rollup, retention)."
+	cargo run -p photon-server -- $(REPLICA_CONFIG)
 
 ## ---- Build & test ---------------------------------------------------------
 
@@ -165,7 +178,7 @@ $(DEV_CONFIG):
 		'days = 7' \
 		'' \
 		'[schema]' \
-		'promoted_attributes = ["service.name", "host.name"]' \
+		'promoted_attributes = ["service.name", "host.name", "deployment.environment"]' \
 		'' \
 		'[wal]' \
 		'segment_max_bytes = 134217728' \

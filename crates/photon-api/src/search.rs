@@ -40,6 +40,33 @@ pub(crate) fn engine_failure(what: &str, e: &PhotonError) -> Response {
         .into_response()
 }
 
+/// DataFusion's wording for "this server ran out of the shared query memory pool". It arrives
+/// buried in a `PhotonError::Query` string because `PhotonError` carries one variant per crate,
+/// not one per failure mode — see `photon_core::PhotonError`.
+const RESOURCES_EXHAUSTED: &str = "Resources exhausted";
+
+/// An engine error that may be either side's fault: 400 when the engine rejected the request
+/// (an unsupported aggregation, `rate` on a gauge, an unknown group-by column), 500 when it failed
+/// to execute a request that was fine.
+///
+/// `/api/red` and `/api/metrics/query` used to answer both with 400. That is not a cosmetic
+/// mislabel. A 400 says "your query is malformed", so a server that has exhausted its query memory
+/// pool under a wide window looks exactly like a user typo: the UI shows the raw message instead of
+/// retrying or degrading, and nothing in an access log or an uptime check distinguishes the two.
+/// A 7-day histogram query returned `400 Resources exhausted` for precisely this reason.
+pub(crate) fn engine_query_failure(what: &str, e: &PhotonError) -> Response {
+    let ours = matches!(e, PhotonError::Io(_) | PhotonError::Storage(_))
+        || e.to_string().contains(RESOURCES_EXHAUSTED);
+    if ours {
+        return engine_failure(what, e);
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": e.to_string() })),
+    )
+        .into_response()
+}
+
 /// The search request sent by the UI. Timestamps arrive as decimal-nanosecond strings (they
 /// exceed JS's safe integer range), everything else is plain.
 #[derive(Debug, Deserialize)]

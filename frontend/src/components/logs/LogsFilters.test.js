@@ -35,7 +35,7 @@ afterEach(() => {
 
 // --- Pinned Services/Severity (ported from FilterRail.test.js) --------------------------------
 // Checked state derives purely from `facetChecked(query, field, value)` (single-state model, see
-// .superpowers/sdd/facet-single-state-model.md); the parent (LogsView) supplies
+// docs/frontend.md); the parent (LogsView) supplies
 // `services`/`serviceCounts`/`severityCounts` plus the search `query`.
 describe('LogsFilters — pinned Services/Severity', () => {
   it('renders service and severity sections with counts', () => {

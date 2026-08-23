@@ -116,6 +116,7 @@ fn req() -> SpanQueryRequest {
         limit: 0,
         offset: 0,
         projected_attributes: Vec::new(),
+        required_attributes: Vec::new(),
     }
 }
 
@@ -256,6 +257,10 @@ async fn red_metrics_by_service_rolls_operations_up() {
     assert_eq!(checkout.operation, None);
     assert_eq!(checkout.count, 5); // 3 charge + 2 lookup
     assert_eq!(checkout.error_count, 1);
+    // ADR-0003 over the real Parquet round trip: this corpus sets neither `kind` nor
+    // `parent_span_id`, so cascade rule 1 finds nothing and rule 2 (trace roots) takes every span.
+    assert_eq!(checkout.span_count, 5);
+    assert_eq!(checkout.basis, photon_query::RedBasis::TraceRoot);
 
     let payments = rows.iter().find(|r| r.service == "payments").unwrap();
     assert_eq!(payments.count, 2);

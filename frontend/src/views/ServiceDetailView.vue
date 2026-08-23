@@ -1,258 +1,264 @@
-<!-- frontend/src/views/ServiceDetailView.vue -->
-<script setup>
-// Per-service APM dashboard (`/services/:service`): KPI row, four time-series charts, a Key
-// operations table (RED grouped by operation, scoped to this service), and Database/External
-// dependency tables. Time is global (lib/context.js, driven by the ContextBar in AppShell — Task
-// 8) — this view derives its current/previous windows from there, so "last 30m" and the KPI trend
-// chips mean the same thing everywhere. Mounting here also sets the app-wide entity SCOPE to this
-// service (surfaced as a chip in the ContextBar, cleared by the user via its ✕).
+<script setup lang="ts">
+// `/services/:service` — the service Overview tab.
+//
+// It answers one question, in this order: is this service healthy, what changed, and where is the
+// problem. Everything that answers a DIFFERENT question moved to its own sub-route (Operations,
+// Dependencies), so this page paints without waiting on a dependency scan.
+//
+// The **Logs panel** is the piece that was missing. A service can be on fire in its logs while its
+// spans look normal — a failing background job, a config parse error, a connection-pool warning
+// every 200ms produce no errored SERVER span and move no number on the RED charts. Four latency
+// charts and no log volume is a health page that can be green during an outage.
 import { computed } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import AppShell from '@/components/common/AppShell.vue'
+import { useRouter } from 'vue-router'
+import ServiceScaffold from '@/components/services/ServiceScaffold.vue'
 import ChartPanel from '@/components/charts/ChartPanel.vue'
 import MetricChart from '@/components/metrics/MetricChart.vue'
 import HealthBanner from '@/components/services/HealthBanner.vue'
 import ServiceVolumeChart from '@/components/services/ServiceVolumeChart.vue'
 import ApdexBandChart from '@/components/services/ApdexBandChart.vue'
-import { serviceStatus } from '@/lib/services/serviceHealth'
+import ServiceLogPanel from '@/components/services/ServiceLogPanel.vue'
+import SloPanel from '@/components/services/SloPanel.vue'
+import OperationsTable from '@/components/services/OperationsTable.vue'
 import MetricTiles from '@/components/metrics/MetricTiles.vue'
-import RedTable from '@/components/metrics/RedTable.vue'
-import ApdexThresholdControl from '@/components/services/ApdexThresholdControl.vue'
-import DependencyTable from '@/components/services/DependencyTable.vue'
-import RelatedMenu from '@/components/common/RelatedMenu.vue'
-import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
 import { Spinner } from '@/components/ui/spinner'
-import { ArrowLeft } from 'lucide-vue-next'
-import { api } from '@/lib/core/api'
-import { formatDuration, formatNumber } from '@/lib/core/format'
-import { useRed } from '@/lib/traces/tracesQueries'
-import { backTo } from '@/lib/core/useBackTo'
-import { useServiceTimeseries, useServiceDependencies } from '@/lib/services/servicesQueries'
+import { serviceHealth } from '@/lib/services/serviceHealth'
+import { useDeployments, useServiceTimeseries, useServiceOperations } from '@/lib/services/servicesQueries'
+import { useServiceParam } from '@/lib/services/useServiceParam'
+import { deployMarkers } from '@/lib/services/deployMarkers'
+import { grammarTerm } from '@/lib/core/queryLang'
+import { formatCompact, formatDuration } from '@/lib/core/format'
 import {
-  timeRange,
-  customRange,
-  startNs,
-  endNs,
-  startMs,
-  endMs,
-  prevStartNs,
-  prevEndNs,
+  timeRange, customRange, startNs, endNs, startMs, endMs, prevStartNs, prevEndNs, windowMs,
 } from '@/lib/core/context'
 import { correlate } from '@/lib/core/useCorrelate'
+import type { RedRow } from '@/lib/core/api'
 
-const route = useRoute()
 const router = useRouter()
+const service = useServiceParam()
 
-const service = computed(() => {
-  const s = route.params.service
-  return ((Array.isArray(s) ? s[0] : s) ?? '').trim()
-})
-
-
-// Same round-trip preservation as the trace detail's back button (see lib/core/useBackTo.ts):
-// return to the list's own history entry so its sort/search state survives.
-function backToServices() {
-  backTo(router, '/services')
-}
-
-// --- data ---
-// ONE `useServiceTimeseries` call (48 buckets) feeds all four charts. `buckets=1` on the
-// current/previous windows collapses to a single whole-window aggregate for the KPI tiles — the
-// same trick REDMetricsView plays via `useTracesLatency(..., 1)` for its p99 tile.
+// ONE 48-bucket read feeds all four charts; `buckets=1` collapses to whole-window KPIs.
 const timeseries = useServiceTimeseries(service, startNs, endNs, 48)
 const kpiNow = useServiceTimeseries(service, startNs, endNs, 1)
 const kpiPrev = useServiceTimeseries(service, prevStartNs, prevEndNs, 1)
-const dependencies = useServiceDependencies(service, startNs, endNs)
+const opsQuery = useServiceOperations(service, startNs, endNs)
+// Releases, drawn on every chart below. A step in a line and a release at the same x is the
+// cheapest cause-and-effect this page can offer, and it costs one small control-plane read.
+const deploysQuery = useDeployments(service, startNs, endNs)
+const markers = computed(() => deployMarkers(deploysQuery.data.value?.deployments ?? []))
 
-// Key operations: RED grouped by operation, scoped to this service via the grammar's raw
-// `service.name:<svc>` attribute term (`service.name`/`name` and the friendlier `service`/
-// `operation` aliases resolve identically — see photon-core's SpanFieldResolver::resolve_field).
-const keyOpsQuery = useRed(() => `service.name:${service.value}`, startNs, endNs, 'operation')
-const keyOps = computed(() => keyOpsQuery.data.value ?? [])
-const keyOpsLoading = computed(() => keyOpsQuery.isFetching.value)
+const now = computed(() => kpiNow.data.value?.[0])
+const prev = computed(() => kpiPrev.data.value?.[0])
+const buckets = computed(() => timeseries.data.value ?? [])
+const chartsLoading = computed(() => timeseries.isFetching.value)
+const windowSecs = computed(() => windowMs.value / 1000)
 
-const databaseRows = computed(() => dependencies.data.value?.database ?? [])
-const externalRows = computed(() => dependencies.data.value?.external ?? [])
+// Key operations: the busiest ENTRY points. The full list — including the work this service does
+// rather than serves — is one click away on the Operations tab, which is where that distinction
+// gets the explanation it needs.
+const keyOps = computed<RedRow[]>(() =>
+  [...(opsQuery.data.value ?? [])]
+    .filter((r) => (r.basis ?? 'entry') === 'entry')
+    .sort((a, b) => (b.count ?? 0) - (a.count ?? 0))
+    .slice(0, 8),
+)
+const opsLoading = computed(() => opsQuery.isFetching.value)
 
-// Signed fraction (cur - prev)/prev, or null when there is no comparable previous value.
-function delta(cur, prev) {
-  if (prev == null || prev === 0 || !Number.isFinite(prev)) return null
-  return (cur - prev) / prev
+function delta(cur: number, before: number): number | null {
+  if (!before || !Number.isFinite(before)) return null
+  return (cur - before) / before
 }
-
 const comparisonLabel = computed(() => `vs prev ${customRange.value ? 'window' : timeRange.value}`)
 
 const tiles = computed(() => {
-  const now = kpiNow.data.value?.[0]
-  const prev = kpiPrev.data.value?.[0]
-  const rateNow = now?.rate ?? 0
-  const ratePrev = prev?.rate ?? 0
-  const errNow = now?.error_rate ?? 0
-  const errPrev = prev?.error_rate ?? 0
-  const p99Now = Number(now?.p99 ?? 0)
-  const p99Prev = Number(prev?.p99 ?? 0)
-  const apdexNow = now?.apdex ?? null
-  const apdexPrev = prev?.apdex ?? null
+  const n = now.value
+  const p = prev.value
+  const rate = (n?.count ?? 0) / windowSecs.value
+  const prevRate = (p?.count ?? 0) / windowSecs.value
   return [
     {
-      label: 'Request rate',
-      value: (rateNow >= 100 ? formatNumber(Math.round(rateNow)) : rateNow.toFixed(1)) + '/s',
-      delta: delta(rateNow, ratePrev),
+      label: 'Requests',
+      value: formatCompact(n?.count ?? 0),
+      sub: `${formatCompact(rate)}/s · ${formatCompact(n?.span_count ?? 0)} spans`,
+      delta: delta(rate, prevRate),
       tone: 'neutral',
     },
     {
       label: 'Error rate',
-      value: (errNow * 100).toFixed(2) + '%',
-      delta: delta(errNow, errPrev),
+      value: ((n?.error_rate ?? 0) * 100).toFixed(2) + '%',
+      sub: n?.http_5xx || n?.http_4xx ? `${formatCompact(n?.http_5xx ?? 0)} 5xx · ${formatCompact(n?.http_4xx ?? 0)} 4xx` : undefined,
+      delta: delta(n?.error_rate ?? 0, p?.error_rate ?? 0),
       tone: 'up-bad',
     },
     {
       label: 'p99 latency',
-      value: formatDuration(p99Now),
-      delta: delta(p99Now, p99Prev),
+      value: formatDuration(Number(n?.p99 ?? 0)),
+      sub: `p50 ${formatDuration(Number(n?.p50 ?? 0))} · p90 ${formatDuration(Number(n?.p90 ?? 0))}`,
+      delta: delta(Number(n?.p99 ?? 0), Number(p?.p99 ?? 0)),
       tone: 'up-bad',
     },
     {
       label: 'Apdex',
-      value: apdexNow != null ? apdexNow.toFixed(2) : '—',
-      // Higher Apdex is better → up-good (up=green / down=red), enabled in MetricTiles.
-      delta: apdexNow != null && apdexPrev != null ? delta(apdexNow, apdexPrev) : null,
+      value: n?.apdex == null ? '—' : n.apdex.toFixed(2),
+      sub: bandSub.value,
+      delta: n?.apdex != null && p?.apdex != null ? delta(n.apdex, p.apdex) : null,
       tone: 'up-good',
     },
   ]
 })
 
-// Banner: whole-window status + a plain-language "why" line (reasons + trend hints + frustrated %).
-const bannerStatus = computed(() => serviceStatus(kpiNow.data.value?.[0] ?? {}))
+const bandSub = computed(() => {
+  const n = now.value
+  if (!n) return undefined
+  const banded = (n.satisfied ?? 0) + (n.tolerating ?? 0) + (n.frustrated ?? 0)
+  if (!banded) return undefined
+  return `${Math.round(((n.frustrated ?? 0) / banded) * 100)}% frustrated`
+})
 
-function trendHint(cur, prev) {
-  const d = delta(cur, prev)
+// Banner: whole-window Attention Level plus a plain-language "why". The previous window rides
+// along so a service that reported and then stopped reads Down here too, rather than a calm banner
+// over an empty chart.
+const banner = computed(() =>
+  serviceHealth(
+    { count: now.value?.count, rate: now.value?.rate, error_rate: now.value?.error_rate, apdex: now.value?.apdex ?? null },
+    { prev: prev.value ? { count: prev.value.count, rate: prev.value.rate } : undefined },
+  ),
+)
+
+function trendHint(cur: number, before: number): string {
+  const d = delta(cur, before)
   if (d == null) return ''
   return ` ${d > 0 ? '▲' : '▼'}${Math.abs(d * 100).toFixed(0)}%`
 }
-const bannerReasons = computed(() => {
-  const now = kpiNow.data.value?.[0]
-  const prev = kpiPrev.data.value?.[0]
-  // No traffic in the window → no "why" line; the banner falls back to its calm state (rather than
-  // emitting a noisy "p99 0ms" for an idle service).
-  if (!now || !(now.count > 0)) return []
-  const out = []
-  const er = now.error_rate ?? 0
-  if (er > 0) out.push(`Error rate ${(er * 100).toFixed(1)}%${trendHint(er, prev?.error_rate)}`)
-  const p99 = Number(now.p99 ?? 0)
-  out.push(`p99 ${formatDuration(p99)}${trendHint(p99, Number(prev?.p99 ?? 0))}`)
-  if (now.apdex != null) {
-    const banded = (now.satisfied ?? 0) + (now.tolerating ?? 0) + (now.frustrated ?? 0)
-    const frustPct = banded > 0 ? Math.round(((now.frustrated ?? 0) / banded) * 100) : null
-    out.push(`Apdex ${now.apdex.toFixed(2)}${frustPct != null ? ` (${frustPct}% frustrated)` : ''}`)
-  }
+const bannerReasons = computed<string[]>(() => {
+  const n = now.value
+  const p = prev.value
+  // No traffic → the model's own line ("No spans 340/s" or "No traffic"), not a noisy "p99 0ms".
+  if (!n || !(n.count > 0)) return banner.value.text
+  const out: string[] = []
+  const er = n.error_rate ?? 0
+  if (er > 0) out.push(`Error rate ${(er * 100).toFixed(1)}%${trendHint(er, p?.error_rate ?? 0)}`)
+  const p99 = Number(n.p99 ?? 0)
+  out.push(`p99 ${formatDuration(p99)}${trendHint(p99, Number(p?.p99 ?? 0))}`)
+  if (n.apdex != null) out.push(`Apdex ${n.apdex.toFixed(2)}${bandSub.value ? ` (${bandSub.value})` : ''}`)
   return out
 })
 
-// --- chart series, all derived from the one `timeseries` fetch ---
-const buckets = computed(() => timeseries.data.value ?? [])
-const chartsLoading = computed(() => timeseries.isFetching.value)
+// --- chart series, all off the one `timeseries` fetch ---
+// Errors BY CLASS, not one error line: a 5xx is this service's own fault and a 4xx is the caller's
+// bad request, and one line for both is why "our error rate doubled" turns into an hour of work to
+// discover somebody else shipped a broken client.
+// `MetricChart` speaks NANOSECONDS on `t` (it is shared with the metrics explorer, whose
+// points are ns); these buckets are epoch ms. Without the conversion every point lands in 1970
+// and the chart draws an empty window.
+const MS_TO_NS = 1e6
 
-const errorRateSeries = computed(() => {
-  if (!buckets.value.length) return []
-  // 0-1 fraction, NOT pre-scaled — MetricChart's `percent` prop multiplies by 100 itself;
-  // pre-scaling here would double-scale the chart. No yRange here → axis auto-ranges so a
-  // low error line stays readable (unlike the utilization panels, which pin [0,100]).
-  return [{ labels: {}, points: buckets.value.map((b) => ({ t: b.ts, v: b.error_rate ?? 0 })), exemplars: [] }]
-})
+const errorSeries = computed(() =>
+  !buckets.value.length
+    ? []
+    : [
+        { labels: { class: '5xx' }, points: buckets.value.map((b) => ({ t: b.ts * MS_TO_NS, v: b.http_5xx ?? 0 })), exemplars: [] },
+        { labels: { class: '4xx' }, points: buckets.value.map((b) => ({ t: b.ts * MS_TO_NS, v: b.http_4xx ?? 0 })), exemplars: [] },
+        { labels: { class: 'span status' }, points: buckets.value.map((b) => ({ t: b.ts * MS_TO_NS, v: b.error_count ?? 0 })), exemplars: [] },
+      ],
+)
 
-const latencySeries = computed(() => {
-  if (!buckets.value.length) return []
-  return ['p50', 'p90', 'p99'].map((k) => ({
-    labels: { percentile: k },
-    points: buckets.value.map((b) => ({ t: b.ts, v: b[k] != null ? Number(b[k]) / 1e6 : null })),
-    exemplars: [],
-  }))
-})
+const latencySeries = computed(() =>
+  !buckets.value.length
+    ? []
+    : (['p50', 'p90', 'p99'] as const).map((k) => ({
+        labels: { percentile: k },
+        points: buckets.value.map((b) => ({ t: b.ts * MS_TO_NS, v: b[k] != null ? Number(b[k]) / 1e6 : null })),
+        exemplars: [],
+      })),
+)
 
-// Exemplar pivot from a Key-operations row into the Traces explorer, slowest first. Operation
-// names containing whitespace/comma can't be expressed as a `name:` term (the grammar splits OR
-// lists on `,` and terms on whitespace) — REDMetricsView's onOpenExemplars uses the same guard.
-function onOpenExemplars({ operation }) {
-  let q = `service.name:${service.value}`
-  if (operation && !/[\s,]/.test(operation)) q += ` name:${operation}`
-  router.push(correlate({ path: '/traces', query: { q, sort: 'slowest' } }))
+// The entry-set basis is the same on every bucket of one series, so the first bucket speaks for
+// all of them.
+const basis = computed(() => buckets.value[0]?.basis ?? now.value?.basis ?? 'entry')
+
+function openOperation(row: RedRow): void {
+  if (!row.operation) return
+  router.push({
+    path: `/services/${encodeURIComponent(service.value)}/operations/${encodeURIComponent(row.operation)}`,
+    query: router.currentRoute.value.query,
+  })
 }
-
-// Dependency row → the service's slowest traces in the Traces explorer. (Service-scoped; a
-// dependency-scoped filter can follow once a peer/db-system grammar field is confirmed.)
-function onOpenDependencyTraces() {
-  router.push(correlate({ path: '/traces', query: { q: `service.name:${service.value}`, sort: 'slowest' } }))
+function openAllOperations(): void {
+  router.push({
+    path: `/services/${encodeURIComponent(service.value)}/operations`,
+    query: router.currentRoute.value.query,
+  })
+}
+function openExemplars(row: RedRow): void {
+  const q = [grammarTerm('service.name', service.value), grammarTerm('name', row.operation)]
+    .filter(Boolean)
+    .join(' ')
+  router.push(correlate({ path: '/traces', query: { q, sort: 'slowest' } }))
 }
 </script>
 
 <template>
-  <AppShell :mock="api.mock" :crumb="`Backend › ${service}`">
-    <!-- Back button folds into the ContextBar's lead slot; the crumb already reads "Backend › {service}". -->
-    <template #lead>
-      <Button
-        data-testid="back-to-services"
-        size="icon"
-        variant="ghost"
-        class="size-7 shrink-0"
-        aria-label="Back to services"
-        @click="backToServices"
-      >
-        <ArrowLeft class="size-4" />
-      </Button>
-    </template>
-    <!-- View-specific actions fold into the ContextBar's actions slot (before the time picker). -->
-    <template #actions>
-      <div v-if="service" class="flex items-center gap-2">
-        <RelatedMenu :entity="{ kind: 'service', fields: { service } }" />
-        <ApdexThresholdControl :service="service" />
-      </div>
-    </template>
+  <ServiceScaffold :service="service">
+    <main class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+      <HealthBanner :level="banner.level" :reasons="bannerReasons" />
 
-    <main class="flex min-h-0 flex-1 flex-col overflow-y-auto">
-      <!-- health banner -->
-      <div class="px-5 pt-5">
-        <HealthBanner :status="bannerStatus" :reasons="bannerReasons" />
-      </div>
+      <MetricTiles :tiles="tiles" :comparison-label="comparisonLabel" />
 
-      <!-- KPI row -->
-      <div class="px-5 pt-4">
-        <MetricTiles :tiles="tiles" :comparison-label="comparisonLabel" />
-      </div>
+      <!-- Objectives sit directly under the KPIs and above the charts: a budget is the only thing
+           on this page that is already a decision, and everything below it is the evidence. -->
+      <SloPanel :service="service" />
 
-      <!-- What changed: volume (absolute) · error % · latency · apdex bands -->
-      <div class="grid grid-cols-1 gap-4 px-5 pt-4 lg:grid-cols-2">
+      <!-- What changed. -->
+      <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <ChartPanel title="Request volume" subtitle="Requests + errors · absolute count">
-          <ServiceVolumeChart :buckets="buckets" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
+          <ServiceVolumeChart :markers="markers" :buckets="buckets" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
         </ChartPanel>
-        <ChartPanel title="Error %" subtitle="Share of requests that errored">
-          <MetricChart :series="errorRateSeries" percent :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
+        <ChartPanel
+          title="Errors by class"
+          subtitle="5xx is ours · 4xx is the caller's · span status is neither"
+        >
+          <MetricChart :markers="markers" :series="errorSeries" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
         </ChartPanel>
         <ChartPanel title="Latency" subtitle="p50 / p90 / p99 · ms">
-          <MetricChart :series="latencySeries" unit="ms" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
+          <MetricChart :markers="markers" :series="latencySeries" unit="ms" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
         </ChartPanel>
         <ChartPanel title="Apdex bands" subtitle="Satisfied / tolerating / frustrated">
-          <ApdexBandChart :buckets="buckets" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
+          <ApdexBandChart :markers="markers" :buckets="buckets" :start-ms="startMs" :end-ms="endMs" :loading="chartsLoading" />
         </ChartPanel>
       </div>
 
-      <!-- Where is the problem? -->
-      <div class="flex items-center gap-2.5 px-5 pb-2 pt-6 text-xs font-medium uppercase tracking-wider text-muted-foreground">
-        Where is the problem?
-      </div>
-      <div class="flex items-center gap-2.5 px-5 pb-2 text-xs text-muted-foreground">
-        <span class="font-mono tabular-nums text-foreground/80">{{ formatNumber(keyOps.length) }} operations</span>
-        <span class="text-border">·</span>
-        <span class="font-mono">{{ customRange ? 'custom range' : `last ${timeRange}` }}</span>
-        <Spinner v-if="keyOpsLoading" size="sm">loading…</Spinner>
-      </div>
-      <RedTable :rows="keyOps" group="operation" :loading="keyOpsLoading" @open-exemplars="onOpenExemplars" />
+      <!-- Where is the problem: the busiest entry points, and what the logs say. -->
+      <div class="grid grid-cols-1 gap-4 xl:grid-cols-2">
+        <div class="flex flex-col gap-2">
+          <div class="flex flex-wrap items-center gap-2.5 text-xs text-muted-foreground">
+            <span class="font-medium uppercase tracking-wider">Key operations</span>
+            <Badge
+              v-if="basis !== 'entry'"
+              variant="secondary"
+              data-testid="basis-badge"
+              class="px-1.5 py-0 text-[10px]"
+              title="This service emits no server or consumer spans, so its request count is every span it recorded"
+            >
+              span-based
+            </Badge>
+            <Spinner v-if="opsLoading" size="sm">loading…</Spinner>
+            <button type="button" class="ml-auto text-[11px] text-primary hover:underline" @click="openAllOperations">
+              All operations ↗
+            </button>
+          </div>
+          <OperationsTable
+            :rows="keyOps"
+            :loading="opsLoading"
+            :window-secs="windowSecs"
+            @open="openOperation"
+            @open-exemplars="openExemplars"
+          />
+        </div>
 
-      <!-- Dependencies (clickable → traces) -->
-      <div class="grid grid-cols-1 gap-4 px-5 py-5 lg:grid-cols-2">
-        <DependencyTable title="Database calls" :rows="databaseRows" @open-traces="onOpenDependencyTraces" />
-        <DependencyTable title="External calls" :rows="externalRows" @open-traces="onOpenDependencyTraces" />
+        <ServiceLogPanel :service="service" />
       </div>
     </main>
-  </AppShell>
+  </ServiceScaffold>
 </template>

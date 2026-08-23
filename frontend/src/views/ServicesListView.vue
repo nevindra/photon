@@ -1,57 +1,68 @@
-<script setup>
-import { ref, computed, watch } from 'vue'
-import { useRouter } from 'vue-router'
+<script setup lang="ts">
+// The Services index: a FLEET BOARD, not a table with a Site column
+// (docs/adr/0004-the-services-index-is-a-fleet-board.md).
+//
+// Three reading layers, in the order a person actually needs them:
+//
+//   1. The Site band — which Sites are even reporting. A stale Site is tinted and badged, because
+//      its rows below are Unknown, not OK. It is also the page's Site filter; there is no separate
+//      picker, since a picker that showed no health would make you choose blind.
+//   2. KPIs and the attention strip — what is wrong right now, worst first, capped and honest
+//      about what the cap hides.
+//   3. The table — everything, in one dense row per `(service, environment)`.
+//
+// One request feeds all three (`GET /api/services/overview`). The previous window is a second copy
+// of the same request: without it, a service that was serving 5,000/s and stopped renders as a calm
+// grey zero instead of Down.
+import { ref, computed, watch, useTemplateRef } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useQuery } from '@tanstack/vue-query'
 import AppShell from '@/components/common/AppShell.vue'
+import { NavTabs, NavTabItem } from '@/components/ui/nav-tabs'
 import SearchBar from '@/components/common/SearchBar.vue'
 import MetricTiles from '@/components/metrics/MetricTiles.vue'
 import ServicesTable from '@/components/services/ServicesTable.vue'
-import ServiceHealthCounts from '@/components/services/ServiceHealthCounts.vue'
+import SiteBand from '@/components/services/SiteBand.vue'
 import AttentionStrip from '@/components/services/AttentionStrip.vue'
-import ChartPanel from '@/components/charts/ChartPanel.vue'
-import SpanVolumeHistogram from '@/components/traces/SpanVolumeHistogram.vue'
-import LatencyHistogram from '@/components/traces/LatencyHistogram.vue'
 import { Spinner } from '@/components/ui/spinner'
-import { api } from '@/lib/core/api'
-import { formatDuration, formatNumber } from '@/lib/core/format'
+import { Badge } from '@/components/ui/badge'
+import { api, type OverviewRow } from '@/lib/core/api'
+import { formatCompact, formatDuration, formatNumber } from '@/lib/core/format'
 import { useUrlState } from '@/lib/core/useUrlState'
-import { useServicesList } from '@/lib/services/servicesQueries'
-import { useTracesLatency } from '@/lib/traces/tracesQueries'
-import { setDurationRange } from '@/lib/core/queryLang'
+import {
+  useServicesOverview,
+  useIncidentsByService,
+  mergeFleet,
+  siteStats,
+  levelCounts,
+  fleetTotals,
+  type FleetRow,
+  type SiteSlice,
+} from '@/lib/services/servicesOverview'
+import { correlate } from '@/lib/core/useCorrelate'
+import { grammarTerm } from '@/lib/core/queryLang'
 import { SPAN_FIELDS, SPAN_EXAMPLE_QUERIES } from '@/lib/traces/spanFields'
 import {
   timeRange,
   customRange,
   startNs,
   endNs,
-  startMs,
-  endMs,
-  windowMs,
   prevStartNs,
   prevEndNs,
-  setCustomRange,
-  tenantQueryTerm,
+  windowMs,
+  tenant,
+  setTenant,
+  clearTenant,
 } from '@/lib/core/context'
 
-// Services (APM) list — Task 11. Adapted from `REDMetricsView.vue`'s "by service" RED table, but
-// as its own top-level page: no operation/service toggle (this table is always service-level) and
-// no sub-view tab bar (Services lives outside the Traces section). `useServicesList` returns the
-// same RED-shaped rows as `useRed(..., 'service')` plus a per-row `apdex` score consumed by
-// `ServicesTable`'s Apdex column.
 const router = useRouter()
+const route = useRoute()
 
 // --- state ---
-// Time is now global (lib/context.js, driven by the ContextBar in AppShell — Task 8) — only the
-// search text is owned locally.
+// Time, Site and Environment are global (ContextBar in AppShell); only the search text is local.
 const text = ref('')
-// Tenant-scoped variant for the two shared span-chart children (mirrors TracesExplorer.scopedText);
-// `text` itself stays the literal SearchBar value.
-const scopedText = computed(() => [text.value.trim(), tenantQueryTerm()].filter(Boolean).join(' '))
-
-// --- URL persistence: text only now (timeRange/customRange are synced by context.js itself). ---
 useUrlState({ text })
 
-// --- services (search-bar autocomplete) ---
 const servicesQuery = useQuery({
   queryKey: ['services'],
   queryFn: ({ signal }) => api.services({ signal }),
@@ -59,23 +70,32 @@ const servicesQuery = useQuery({
 })
 const servicesList = computed(() => servicesQuery.data.value ?? [])
 
-// --- data: services RED current/previous + latency current/previous (p99 KPI reuses /api/traces/latency) ---
-const svcNow = useServicesList(() => text.value.trim(), startNs, endNs)
-const svcPrev = useServicesList(() => text.value.trim(), prevStartNs, prevEndNs)
-const latencyNow = useTracesLatency(() => text.value.trim(), startNs, endNs, 1)
-const latencyPrev = useTracesLatency(() => text.value.trim(), prevStartNs, prevEndNs, 1)
+// --- data ---
+// 30 buckets is the sparkline resolution; the table renders one per row.
+const now = useServicesOverview(() => text.value.trim(), startNs, endNs, 30)
+// The previous window is fetched WITHOUT sparklines (1 bucket): it exists only so `serviceLevel`
+// can tell Silence ("it reported, then stopped") from never-reported, and 30 unused series per
+// service is a real cost on a fleet.
+const prev = useServicesOverview(() => text.value.trim(), prevStartNs, prevEndNs, 1)
+const incidentsByService = useIncidentsByService()
 
-const rows = computed(() => svcNow.data.value ?? [])
-const prevRows = computed(() => svcPrev.data.value ?? [])
-const loading = computed(() => svcNow.isFetching.value)
+const loading = computed(() => now.isFetching.value)
+const prevRows = computed<OverviewRow[]>(() => prev.data.value?.rows ?? [])
+const rows = computed<FleetRow[]>(() =>
+  mergeFleet(now.data.value, { prev: prevRows.value, incidentsByService: incidentsByService.value }),
+)
+const sites = computed(() => siteStats(now.data.value, rows.value))
+// `rollup` means the numbers came from pre-aggregated `photon.service.*` metrics rather than a raw
+// span scan. Surfaced because a rollup bug should show up as an attributable number.
+const source = computed(() => now.data.value?.source ?? 'raw')
 
-// 400 surfacing: map the services-list query error to a fresh { message, offset } for the
-// SearchBar underline (same pattern as REDMetricsView).
-const queryError = ref(null)
+// 400 surfacing: map the overview query error to a fresh { message, offset } for the SearchBar
+// underline (same pattern as the other explorer views).
+const queryError = ref<{ message: string; offset: number | null } | null>(null)
 watch(
-  () => [svcNow.error.value, svcNow.errorUpdatedAt.value, svcNow.dataUpdatedAt.value],
+  () => [now.error.value, now.errorUpdatedAt.value, now.dataUpdatedAt.value],
   () => {
-    const e = svcNow.error.value
+    const e = now.error.value as { status?: number; body?: { error?: string; offset?: number } } | null
     queryError.value =
       e && e.status === 400
         ? { message: e.body?.error ?? 'invalid query', offset: e.body?.offset ?? null }
@@ -83,130 +103,186 @@ watch(
   },
 )
 
-// --- KPI derivation ---
-function totals(list) {
-  const arr = list ?? []
-  const count = arr.reduce((s, r) => s + (r.count ?? 0), 0)
-  const errors = arr.reduce((s, r) => s + (r.error_count ?? 0), 0)
-  return { count, errors }
-}
-// Signed fraction (cur - prev)/prev, or null when there is no comparable previous value.
-function delta(cur, prev) {
-  if (prev == null || prev === 0 || !Number.isFinite(prev)) return null
-  return (cur - prev) / prev
+// --- KPIs ---
+const windowSecs = computed(() => windowMs.value / 1000)
+const comparisonLabel = computed(() => `vs prev ${customRange.value ? 'window' : timeRange.value}`)
+
+/** Signed fraction (cur - prev)/prev, or null when there is nothing comparable to divide by. */
+function delta(cur: number, before: number): number | null {
+  if (!before || !Number.isFinite(before)) return null
+  return (cur - before) / before
 }
 
-const windowSecs = computed(() => windowMs.value / 1000)
-// Label under each KPI value naming the comparison window ("vs prev 30m" / "vs prev window").
-const comparisonLabel = computed(() => `vs prev ${customRange.value ? 'window' : timeRange.value}`)
-// The previous window is, by construction (context.js), the same length as the current one — so
-// the previous-window rate denominator reuses `windowSecs` (no separate prevWindowSecs needed).
+const counts = computed(() => levelCounts(rows.value))
+const totals = computed(() => fleetTotals(rows.value))
+// The previous window is not merged (no Spread, no levels needed) — only its raw sums are.
+const prevTotals = computed(() => {
+  const requests = prevRows.value.reduce((a, r) => a + (r.count ?? 0), 0)
+  const errors = prevRows.value.reduce((a, r) => a + (r.error_count ?? 0), 0)
+  return {
+    requests,
+    errorRate: requests > 0 ? errors / requests : 0,
+    p99: prevRows.value.reduce((a, r) => Math.max(a, Number(r.p99 ?? 0)), 0),
+  }
+})
+
+const openIncidents = computed(() =>
+  Object.values(incidentsByService.value).reduce((a, list) => a + list.length, 0),
+)
+const spans = computed(() => rows.value.reduce((a, r) => a + r.span_count, 0))
+// Fleet Apdex is recomputed from the bands, never averaged: the mean of per-service scores weights
+// a service serving 4 requests the same as one serving 4 million.
+const fleetApdex = computed(() => {
+  const s = rows.value.reduce((a, r) => a + r.satisfied, 0)
+  const t = rows.value.reduce((a, r) => a + r.tolerating, 0)
+  const f = rows.value.reduce((a, r) => a + r.frustrated, 0)
+  const banded = s + t + f
+  return banded > 0 ? (s + t / 2) / banded : null
+})
 
 const tiles = computed(() => {
-  const now = totals(svcNow.data.value)
-  const prev = totals(svcPrev.data.value)
-  const rateNow = now.count / windowSecs.value
-  const ratePrev = prev.count / windowSecs.value
-  const errNow = now.count ? now.errors / now.count : 0
-  const errPrev = prev.count ? prev.errors / prev.count : 0
-  const p99Now = Number(latencyNow.data.value?.p99 ?? 0)
-  const p99Prev = Number(latencyPrev.data.value?.p99 ?? 0)
+  const rate = totals.value.requests / windowSecs.value
   return [
     {
-      label: 'Request rate',
-      value: (rateNow >= 100 ? formatNumber(Math.round(rateNow)) : rateNow.toFixed(1)) + '/s',
-      delta: delta(rateNow, ratePrev),
+      label: 'Requests',
+      value: formatCompact(totals.value.requests),
+      sub: `${formatCompact(rate)}/s · ${formatCompact(spans.value)} spans`,
+      delta: delta(totals.value.requests, prevTotals.value.requests),
       tone: 'neutral',
     },
     {
       label: 'Error rate',
-      value: (errNow * 100).toFixed(2) + '%',
-      delta: delta(errNow, errPrev),
+      value: (totals.value.errorRate * 100).toFixed(2) + '%',
+      sub: `${formatCompact(rows.value.reduce((a, r) => a + r.error_count, 0))} errors`,
+      delta: delta(totals.value.errorRate, prevTotals.value.errorRate),
       tone: 'up-bad',
     },
     {
       label: 'p99 latency',
-      value: formatDuration(p99Now),
-      delta: delta(p99Now, p99Prev),
+      value: formatDuration(totals.value.p99),
+      sub: 'worst service',
+      delta: delta(totals.value.p99, prevTotals.value.p99),
       tone: 'up-bad',
     },
     {
-      label: 'Requests',
-      value: formatNumber(now.count),
-      delta: delta(now.count, prev.count),
-      tone: 'neutral',
+      label: 'Apdex',
+      value: fleetApdex.value == null ? '—' : fleetApdex.value.toFixed(2),
+      sub: 'weighted by requests',
+      delta: null,
+      tone: 'up-good',
+    },
+    {
+      label: 'Open incidents',
+      value: formatNumber(openIncidents.value),
+      sub: openIncidents.value ? 'firing now' : 'none firing',
+      delta: null,
+      tone: 'up-bad',
     },
   ]
 })
 
 // --- handlers ---
-// Dragging a duration band on the latency chart rewrites the search text to a removable
-// `duration>=A duration<=B` pill — the text feeds every query, so the services table, the charts,
-// and the KPIs all refetch against the new filter (same as typing it by hand).
-function onLatencyBrush({ minNs, maxNs }) {
-  text.value = setDurationRange(text.value, minNs, maxNs)
+const tableEl = useTemplateRef<HTMLElement>('tableEl')
+
+function onSelectSite(key: string | null): void {
+  if (key) setTenant(key)
+  else clearTenant()
 }
-// Row click → service detail page.
-function onOpenService(service) {
-  router.push('/services/' + encodeURIComponent(service))
+function openService(service: string, environment?: string | null): void {
+  const query = environment ? { env: environment } : undefined
+  router.push({ path: '/services/' + encodeURIComponent(service), query })
+}
+function onOverflow(): void {
+  tableEl.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+// Opening one Site's slice narrows the whole board to that Site first, so the detail page you land
+// on describes the same thing the child row did.
+function onOpenSite(slice: SiteSlice): void {
+  if (slice.tenant) setTenant(slice.tenant)
+  openService(slice.service, slice.environment)
+}
+// Operations have no route of their own until the detail sub-routes land; until then the honest
+// destination is the traces explorer, filtered to that operation and sorted slowest-first.
+function onOpenOperation({ service, operation }: { service: string; operation: string }): void {
+  router.push(
+    correlate({
+      path: '/traces',
+      query: {
+        q: [grammarTerm('service.name', service), grammarTerm('name', operation)].filter(Boolean).join(' '),
+        sort: 'slowest',
+      },
+    }),
+  )
 }
 </script>
 
 <template>
   <AppShell :mock="api.mock" crumb="Backend › Services">
+    <!-- Services · Issues: two readings of the same fleet, so they share one bar. The Issues
+         list is not a filter of this table (it groups errored spans, not services), which is why
+         it is a sibling tab rather than a mode toggle. -->
     <template #toolbar>
-      <SearchBar
-        :model-value="text"
-        :services="servicesList"
-        :error="queryError"
-        :catalog="SPAN_FIELDS"
-        :example-queries="SPAN_EXAMPLE_QUERIES"
-        @update:model-value="text = $event"
-      />
+      <div class="flex w-full items-center gap-3">
+        <NavTabs class="shrink-0 text-xs" aria-label="Backend sections">
+          <NavTabItem :to="{ path: '/services', query: route.query }" :active="true">Services</NavTabItem>
+          <NavTabItem :to="{ path: '/services/errors', query: route.query }" :active="false">Issues</NavTabItem>
+          <NavTabItem :to="{ path: '/services/map', query: route.query }" :active="false">Map</NavTabItem>
+        </NavTabs>
+        <div class="min-w-0 flex-1">
+          <SearchBar
+            :model-value="text"
+            :services="servicesList"
+            :error="queryError ?? undefined"
+            :catalog="SPAN_FIELDS"
+            :example-queries="SPAN_EXAMPLE_QUERIES"
+            @update:model-value="text = $event"
+          />
+        </div>
+      </div>
     </template>
 
-    <main class="flex min-h-0 flex-1 flex-col overflow-y-auto">
-      <!-- fleet health counts -->
-      <div class="px-5 pt-5">
-        <ServiceHealthCounts :rows="rows" />
-      </div>
+    <main class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+      <!-- 1. Which Sites are reporting (central only — a Site install has no registry). -->
+      <SiteBand :sites="sites" :active="tenant" @select="onSelectSite" />
 
-      <!-- KPI row -->
-      <div class="px-5 pt-3">
-        <MetricTiles :tiles="tiles" :comparison-label="comparisonLabel" />
-      </div>
+      <!-- 2. What is wrong. -->
+      <MetricTiles :tiles="tiles" :comparison-label="comparisonLabel" :cols="5" />
 
-      <!-- needs attention (auto-hides when the fleet is all-healthy) -->
-      <div class="px-5 pt-4 empty:hidden">
-        <AttentionStrip
+      <AttentionStrip :rows="rows" :max="8" @open="openService($event.service, $event.environment)" @overflow="onOverflow" />
+
+      <!-- 3. Everything. -->
+      <div ref="tableEl" class="flex flex-col gap-2">
+        <div class="flex flex-wrap items-center gap-2.5 text-xs text-muted-foreground">
+          <span class="font-mono tabular-nums text-foreground/80">{{ formatNumber(rows.length) }} services</span>
+          <span class="text-border">·</span>
+          <span class="font-mono">{{ customRange ? 'custom range' : `last ${timeRange}` }}</span>
+          <template v-for="k in (['down', 'critical', 'warning', 'unknown'] as const)" :key="k">
+            <Badge v-if="counts[k]" :data-level="k" variant="outline" class="px-1.5 py-0 text-[10px] capitalize">
+              {{ counts[k] }} {{ k }}
+            </Badge>
+          </template>
+          <Badge
+            v-if="source === 'rollup'"
+            variant="secondary"
+            data-testid="source-badge"
+            class="px-1.5 py-0 text-[10px]"
+            title="Answered from pre-aggregated photon.service.* metrics rather than a raw span scan"
+          >
+            rollup
+          </Badge>
+          <Spinner v-if="loading" size="sm">loading…</Spinner>
+        </div>
+
+        <ServicesTable
           :rows="rows"
-          :prev-rows="prevRows"
+          :loading="loading"
+          :window-secs="windowSecs"
           :start-ns="startNs"
           :end-ns="endNs"
-          @open-service="onOpenService"
+          @open-service="openService($event.service, $event.environment)"
+          @open-site="onOpenSite"
+          @open-operation="onOpenOperation"
         />
-      </div>
-
-      <!-- meta row: service count + range -->
-      <div class="flex items-center gap-2.5 px-5 pb-2 pt-5 text-xs text-muted-foreground">
-        <span class="font-mono tabular-nums text-foreground/80">{{ formatNumber(rows.length) }} services</span>
-        <span class="text-border">·</span>
-        <span class="font-mono">{{ customRange ? 'custom range' : `last ${timeRange}` }}</span>
-        <Spinner v-if="loading" size="sm">loading…</Spinner>
-      </div>
-
-      <div class="px-5">
-        <ServicesTable :rows="rows" :prev-rows="prevRows" :loading="loading" @open-service="onOpenService" />
-      </div>
-
-      <!-- exploratory charts, now secondary (below the table) -->
-      <div class="grid grid-cols-1 gap-4 px-5 pb-5 pt-6 lg:grid-cols-2">
-        <ChartPanel title="Request volume &amp; errors" subtitle="Stacked by status · drag to zoom the time range">
-          <SpanVolumeHistogram :query="scopedText" :start-ms="startMs" :end-ms="endMs" @zoom="setCustomRange" />
-        </ChartPanel>
-        <ChartPanel title="Latency distribution" subtitle="Span durations · drag to filter by duration">
-          <LatencyHistogram :query="scopedText" :start-ms="startMs" :end-ms="endMs" @brush="onLatencyBrush" />
-        </ChartPanel>
       </div>
     </main>
   </AppShell>

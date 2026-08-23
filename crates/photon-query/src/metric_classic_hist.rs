@@ -19,8 +19,8 @@ use crate::metric_dist::{hist_ranges, interpolate_quantile, quantile_of};
 use crate::metric_engine::{metric_base_predicate, MetricRequest};
 use crate::metric_predicate::metric_field_col;
 use crate::metric_query::{
-    bucket_start, reset_aware_series, MetricSeriesRequest, PointRow, QuerySeriesResult,
-    SeriesPoint, SeriesResult, MAX_SERIES,
+    bucket_start, collect_sorted_prefix, reset_aware_series, MetricSeriesRequest, PointRow,
+    QuerySeriesResult, SeriesPoint, SeriesResult, MAX_COLLECT_ROWS, MAX_SERIES,
 };
 use crate::{col_ref, MetricsQueryEngine};
 
@@ -225,23 +225,31 @@ impl MetricsQueryEngine {
             .collect();
         sorts.push(col("__ts").sort(true, false));
 
-        let batches = df
-            .filter(metric_base_predicate(base))
-            .map_err(|e| PhotonError::Query(format!("classic-hist counter filter: {e}")))?
-            .select(selects)
-            .map_err(|e| PhotonError::Query(format!("classic-hist counter select: {e}")))?
-            .sort(sorts)
-            .map_err(|e| PhotonError::Query(format!("classic-hist counter sort: {e}")))?
-            .collect()
-            .await
-            .map_err(|e| PhotonError::Query(format!("classic-hist counter collect: {e}")))?;
+        // This scan had no bound at all: it sorted and collected every matching row in the window
+        // into a `Vec<RecordBatch>`. Same `MAX_COLLECT_ROWS` budget as the pointwise and
+        // distribution scans, taken the same way, and `capped` already rides the response for the
+        // `MAX_SERIES` truncation.
+        let batches = collect_sorted_prefix(
+            df.filter(metric_base_predicate(base))
+                .map_err(|e| PhotonError::Query(format!("classic-hist counter filter: {e}")))?
+                .select(selects)
+                .map_err(|e| PhotonError::Query(format!("classic-hist counter select: {e}")))?,
+            sorts,
+            MAX_COLLECT_ROWS,
+            "classic-hist counter",
+        )
+        .await?;
 
         let mut out: Vec<(Vec<Option<String>>, Vec<PointRow>)> = Vec::new();
         let mut cur_key: Option<Vec<Option<String>>> = None;
         let mut cur_rows: Vec<PointRow> = Vec::new();
         let mut capped = false;
 
-        for b in &batches {
+        // `rows_seen` enforces `MAX_COLLECT_ROWS` across the whole collected set: once exhausted,
+        // `'rows` breaks out of both loops, dropping the trailing row the `+ 1` fetched as the
+        // overflow trip wire and flagging `capped`. Mirrors `collect_dist_series_with_cap`.
+        let mut rows_seen: usize = 0;
+        'rows: for b in &batches {
             let ts = b
                 .column(n_group)
                 .as_any()
@@ -267,6 +275,11 @@ impl MetricsQueryEngine {
                 })?;
 
             for i in 0..b.num_rows() {
+                if rows_seen >= MAX_COLLECT_ROWS {
+                    capped = true;
+                    break 'rows;
+                }
+                rows_seen += 1;
                 let key: Vec<Option<String>> = gcols
                     .iter()
                     .map(|a| {
@@ -420,16 +433,18 @@ impl MetricsQueryEngine {
         sorts.push(col("__le").sort(true, true));
         sorts.push(col("__ts").sort(true, false));
 
-        let batches = df
-            .filter(metric_base_predicate(&base))
-            .map_err(|e| PhotonError::Query(format!("classic-hist bucket filter: {e}")))?
-            .select(selects)
-            .map_err(|e| PhotonError::Query(format!("classic-hist bucket select: {e}")))?
-            .sort(sorts)
-            .map_err(|e| PhotonError::Query(format!("classic-hist bucket sort: {e}")))?
-            .collect()
-            .await
-            .map_err(|e| PhotonError::Query(format!("classic-hist bucket collect: {e}")))?;
+        // Same `MAX_COLLECT_ROWS` budget, and for the same reason, as the counter scan above:
+        // this one also sorted and collected every `le`-bucket row in the window.
+        let batches = collect_sorted_prefix(
+            df.filter(metric_base_predicate(&base))
+                .map_err(|e| PhotonError::Query(format!("classic-hist bucket filter: {e}")))?
+                .select(selects)
+                .map_err(|e| PhotonError::Query(format!("classic-hist bucket select: {e}")))?,
+            sorts,
+            MAX_COLLECT_ROWS,
+            "classic-hist bucket",
+        )
+        .await?;
 
         // group key -> Vec<(le, per-bucket cumulative increase)>. Sorted by (group key, le, ts) so
         // every (group key, le) run is contiguous.
@@ -438,6 +453,9 @@ impl MetricsQueryEngine {
         let mut capped = false;
         let mut cur: Option<(Vec<Option<String>>, Option<String>)> = None;
         let mut cur_rows: Vec<PointRow> = Vec::new();
+        // See `collect_value_series` — `rows_seen` is what actually enforces `MAX_COLLECT_ROWS`
+        // over the (possibly multi-batch) collected set.
+        let mut rows_seen: usize = 0;
 
         let flush = |acc: &mut Acc,
                      capped: &mut bool,
@@ -456,7 +474,7 @@ impl MetricsQueryEngine {
             acc.entry(gkey).or_default().push((le_f64, pts));
         };
 
-        for b in &batches {
+        'rows: for b in &batches {
             let le = b
                 .column(n_group)
                 .as_any()
@@ -485,6 +503,11 @@ impl MetricsQueryEngine {
                 })?;
 
             for i in 0..b.num_rows() {
+                if rows_seen >= MAX_COLLECT_ROWS {
+                    capped = true;
+                    break 'rows;
+                }
+                rows_seen += 1;
                 let key: Vec<Option<String>> = gcols
                     .iter()
                     .map(|a| {

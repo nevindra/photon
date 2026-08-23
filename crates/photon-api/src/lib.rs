@@ -1,7 +1,6 @@
 //! photon-api: REST API (session auth + log search) that also serves the embedded Vue UI.
 //!
-//! Implemented per the `photon-api` section of
-//! `docs/superpowers/plans/2026-07-01-photon-interface-contracts.md`.
+//! Its place in the crate graph and its `/api/*` surface are described in `docs/architecture.md`.
 //!
 //! An axum [`Router`] over shared [`AppState`] (the query engine, the user table, and the
 //! cookie signing key). JSON endpoints live under `/api`; every other GET is served from the
@@ -11,6 +10,7 @@ pub mod alerts;
 mod assets;
 mod auth;
 mod data;
+pub mod deployments;
 mod facet;
 mod federation;
 mod fields;
@@ -22,8 +22,17 @@ mod red;
 mod rum;
 pub mod rum_apps;
 mod search;
+mod service_errors;
+mod service_map;
+mod service_operations;
 mod services;
+mod services_overview;
+/// The rollup read seam. `pub` only for [`services_rollup::RollupStatus`] and
+/// [`services_rollup::RollupCoverage`] — `photon-server` implements the trait over the rollup's
+/// SQLite watermark, exactly as it does for `UsageStore`/`ReplicationStatus`.
+pub mod services_rollup;
 pub mod settings;
+pub mod slo;
 mod stream;
 pub mod tenants;
 mod traces;
@@ -31,6 +40,7 @@ mod traces_agg;
 mod traces_search;
 pub mod uptime;
 mod usage;
+mod usage_services;
 pub mod users;
 
 use std::net::SocketAddr;
@@ -94,6 +104,14 @@ pub struct ApiServer {
     /// `/api/federation/status` report `enabled: false` — set via
     /// [`ApiServer::with_federation_status`].
     federation: Option<Arc<dyn federation::FederationStatus>>,
+    /// A view of what the `photon.service.*` rollup has published, built by `photon-server` over
+    /// its watermark. `None` means "no rollup", and every Backend read then scans raw spans —
+    /// correct, just slower over a wide window. Set via [`ApiServer::with_rollup_status`].
+    rollup: Option<Arc<dyn services_rollup::RollupStatus>>,
+    /// The deployments table (auto-detected releases + CI-posted ones). `None` keeps
+    /// `/api/deployments` returning 404 — set via [`ApiServer::with_deployments`].
+    deployments: Option<Arc<dyn deployments::DeploymentStore>>,
+    slos: Option<Arc<dyn slo::SloStore>>,
 }
 
 /// Shared, immutable application state: a cheap-to-clone handle over an `Arc`. Handlers pull
@@ -126,6 +144,13 @@ pub(crate) struct AppStateInner {
     pub(crate) tenants: Option<tenants::TenantApi>,
     /// This node's own federation pusher/tee status; read by `federation.rs`.
     pub(crate) federation: Option<Arc<dyn federation::FederationStatus>>,
+    /// Rollup coverage; read by `red.rs` / `services.rs` to decide whether a window can be
+    /// answered off `photon.service.*` instead of raw spans.
+    pub(crate) rollup: Option<Arc<dyn services_rollup::RollupStatus>>,
+    /// The deployments table; read by `deployments.rs`. `None` disables `/api/deployments`.
+    pub(crate) deployments: Option<Arc<dyn deployments::DeploymentStore>>,
+    /// The SLO table; read by `slo.rs`. `None` disables `/api/services/:service/slos*`.
+    pub(crate) slos: Option<Arc<dyn slo::SloStore>>,
 }
 
 impl std::ops::Deref for AppState {
@@ -167,6 +192,9 @@ impl ApiServer {
             alerts: None,
             tenants: None,
             federation: None,
+            rollup: None,
+            deployments: None,
+            slos: None,
         }
     }
 
@@ -238,6 +266,32 @@ impl ApiServer {
         self
     }
 
+    /// Attach a view of the `photon.service.*` rollup's published range, built by `photon-server`
+    /// over the rollup watermark. Leaving it unset makes every Backend read scan raw spans.
+    pub fn with_rollup_status(
+        mut self,
+        rollup: Option<Arc<dyn services_rollup::RollupStatus>>,
+    ) -> Self {
+        self.rollup = rollup;
+        self
+    }
+
+    /// Attach the deployments table. Leaving it unset keeps `/api/deployments` returning 404 —
+    /// the subsystem is optional, and a node with no control-plane DB simply has no releases.
+    pub fn with_deployments(
+        mut self,
+        deployments: Option<Arc<dyn deployments::DeploymentStore>>,
+    ) -> Self {
+        self.deployments = deployments;
+        self
+    }
+
+    /// Attach the SLO table. Leaving it unset keeps `/api/services/:service/slos*` returning 404.
+    pub fn with_slos(mut self, slos: Option<Arc<dyn slo::SloStore>>) -> Self {
+        self.slos = slos;
+        self
+    }
+
     /// Bind `addr` and serve until the process is terminated.
     pub async fn serve(self, addr: SocketAddr) -> Result<(), PhotonError> {
         let app = self.into_router();
@@ -267,6 +321,9 @@ impl ApiServer {
             alerts: self.alerts,
             tenants: self.tenants,
             federation: self.federation,
+            rollup: self.rollup,
+            deployments: self.deployments,
+            slos: self.slos,
         }));
 
         // Everything except `/api/login` requires a valid signed `photon_session` cookie.
@@ -280,6 +337,7 @@ impl ApiServer {
             .route("/histogram", get(histogram::histogram))
             .route("/storage", get(data::storage))
             .route("/usage/series", get(usage::usage_series))
+            .route("/usage/services", get(usage_services::usage_services))
             .route(
                 "/retention",
                 get(data::get_retention).put(data::put_retention),
@@ -303,6 +361,38 @@ impl ApiServer {
                 get(services::get_settings)
                     .put(services::put_settings)
                     .delete(services::delete_settings),
+            )
+            .route("/services/overview", get(services_overview::overview))
+            .route(
+                "/deployments",
+                get(deployments::list).post(deployments::record),
+            )
+            .route("/services/map", get(service_map::service_map))
+            // SLO routes sit BEFORE nothing in particular — axum matches by path shape, not order
+            // — but they are grouped here so the whole objective surface reads in one place.
+            .route("/services/:service/slos", get(slo::list).post(slo::create))
+            .route(
+                "/services/:service/slos/:id",
+                axum::routing::patch(slo::update).delete(slo::delete),
+            )
+            .route("/services/:service/slos/:id/budget", get(slo::budget))
+            .route("/services/errors", get(service_errors::fleet_errors))
+            .route("/services/:service/errors", get(service_errors::errors))
+            .route(
+                "/services/:service/errors/facets",
+                get(service_errors::error_facets),
+            )
+            .route(
+                "/services/:service/errors/:fingerprint",
+                get(service_errors::error_detail),
+            )
+            .route(
+                "/services/:service/operations",
+                get(service_operations::operations),
+            )
+            .route(
+                "/services/:service/operations/:operation/heatmap",
+                get(service_operations::heatmap),
             )
             .route("/metrics/query", post(metrics::query))
             .route("/metrics/catalog", get(metrics::catalog))
@@ -474,7 +564,17 @@ pub(crate) fn test_server_with_users(users: Arc<dyn UserStore>) -> ApiServer {
 pub(crate) fn test_server() -> ApiServer {
     let store = crate::users::SqliteUserStore::open_in_memory().unwrap();
     store.seed("admin", &hash_password("hunter2"));
+    // An in-memory deployments table, so `/api/deployments` is exercised for real. The
+    // not-configured (404) path is driven from `test_server_with_users`, which has none.
     test_server_with_users(Arc::new(store))
+        .with_deployments(Some(Arc::new(
+            crate::deployments::SqliteDeploymentStore::open_in_memory().unwrap(),
+        )))
+        // Likewise an in-memory SLO table, so the CRUD routes are exercised for real; the
+        // not-configured (404) path is driven from `test_server_with_users`, which has neither.
+        .with_slos(Some(Arc::new(
+            crate::slo::SqliteSloStore::open_in_memory().unwrap(),
+        )))
 }
 
 /// The seeded test server as a routed axum [`Router`], ready for `oneshot` requests.
@@ -504,6 +604,9 @@ pub(crate) fn test_state_with_rum(rum: Option<rum::RumApi>) -> AppState {
         alerts: s.alerts,
         tenants: s.tenants,
         federation: s.federation,
+        rollup: s.rollup.clone(),
+        deployments: s.deployments.clone(),
+        slos: s.slos.clone(),
     }))
 }
 
@@ -531,6 +634,68 @@ pub(crate) fn test_state_with_tenants_and_metrics(
         alerts: s.alerts,
         tenants,
         federation: s.federation,
+        rollup: s.rollup.clone(),
+        deployments: s.deployments.clone(),
+        slos: s.slos.clone(),
+    }))
+}
+
+/// An [`AppState`] carrying a metrics engine, a rollup status AND an SLO store at once — the three
+/// things a budget read needs. The narrower helpers below each vary one of them.
+#[cfg(test)]
+pub(crate) fn test_state_for_slo(
+    metrics_query: MetricsQueryEngine,
+    rollup: Option<Arc<dyn services_rollup::RollupStatus>>,
+    slos: Option<Arc<dyn slo::SloStore>>,
+) -> AppState {
+    let s = test_server();
+    AppState(Arc::new(AppStateInner {
+        query: s.query,
+        span_query: s.span_query,
+        metrics_query,
+        users: s.users,
+        key: s.key,
+        uptime: s.uptime,
+        data: s.data,
+        live: s.live,
+        usage: s.usage,
+        replication: s.replication,
+        rum: s.rum,
+        alerts: s.alerts,
+        tenants: s.tenants,
+        federation: s.federation,
+        rollup,
+        deployments: s.deployments.clone(),
+        slos,
+    }))
+}
+
+/// An [`AppState`] over the seeded test server carrying a given rollup status, so
+/// `services_rollup.rs` can drive the source decision end to end (the default test server has no
+/// rollup, which only ever exercises the raw path).
+#[cfg(test)]
+pub(crate) fn test_state_with_rollup(
+    rollup: Option<Arc<dyn services_rollup::RollupStatus>>,
+) -> AppState {
+    let s = test_server();
+    AppState(Arc::new(AppStateInner {
+        query: s.query,
+        span_query: s.span_query,
+        metrics_query: s.metrics_query,
+        users: s.users,
+        key: s.key,
+        uptime: s.uptime,
+        data: s.data,
+        live: s.live,
+        usage: s.usage,
+        replication: s.replication,
+        rum: s.rum,
+        alerts: s.alerts,
+        tenants: s.tenants,
+        federation: s.federation,
+        rollup,
+        deployments: s.deployments.clone(),
+        slos: s.slos.clone(),
     }))
 }
 
@@ -555,6 +720,9 @@ pub(crate) fn test_state_with_tenants(tenants: Option<tenants::TenantApi>) -> Ap
         alerts: s.alerts,
         tenants,
         federation: s.federation,
+        rollup: s.rollup.clone(),
+        deployments: s.deployments.clone(),
+        slos: s.slos.clone(),
     }))
 }
 

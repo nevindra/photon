@@ -24,6 +24,14 @@ function mountChart(props) {
 }
 
 describe('MetricChart', () => {
+  it('forwards deploy markers verbatim to the line chart', () => {
+    // Markers are moments in WALL CLOCK ms, not points on a series, so they pass through untouched
+    // — the ns→ms conversion above must not be applied to them.
+    const markers = [{ xMs: 1_700_000_000_000, label: '1.4.2', color: 'hsl(var(--brand))' }]
+    const w = mountChart({ series: ONE_SERIES, startMs: 0, endMs: 3, markers })
+    expect(w.findComponent(LineChart).props('markers')).toEqual(markers)
+  })
+
   it('maps series: ns-string timestamps → ms Numbers, labels → key/label', () => {
     const w = mountChart({ series: ONE_SERIES, unit: 'ms', startMs: 0, endMs: 3 })
     const series = w.findComponent(LineChart).props('series')

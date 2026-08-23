@@ -24,7 +24,7 @@ const props = defineProps({
   startMs: { type: Number, required: true },
   endMs: { type: Number, required: true },
 })
-// Single-state model (see docs/superpowers/.../facet-single-state-model.md): each value has
+// Single-state model (see docs/frontend.md): each value has
 // exactly ONE state, checked or unchecked — there is no separate "exclude" toggle. A row
 // click/Enter/Space toggles that state (`toggle-value`); unchecking a value writes a `-field:v`
 // exclusion under the hood (see `toggleFacetValue`), it isn't a distinct user action. `clear-field`

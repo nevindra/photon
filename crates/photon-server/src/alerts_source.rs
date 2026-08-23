@@ -256,6 +256,13 @@ impl EngineConditionSource {
     /// (t-digest) all at once, so a single call feeds every `TraceKind`. Picks the row for
     /// `c.service` and derives the scalar; error_rate/request_rate mirror `photon-api`'s
     /// `red.rs`. No matching row ⇒ `Ok(vec![])` (resolve). `key` = `[("service.name", svc)]`.
+    ///
+    /// NOTE: since the entry-span change (`docs/adr/0003-a-services-request-rate-is-its-entry-spans.md`)
+    /// `count` and `error_count` are over the service's ENTRY spans, not every span it emits, so a
+    /// trace rule now measures requests served rather than spans recorded. That is the number these
+    /// rules always meant, but it rescales thresholds written against the old inflated count — hence
+    /// the upgrade note in the changelog. An operation pinned to a CLIENT or INTERNAL span name still
+    /// resolves: `red_metrics` decides the basis per group, so such a group falls back to all spans.
     async fn sample_traces(
         &self,
         c: &TraceCondition,
@@ -270,6 +277,7 @@ impl EngineConditionSource {
             limit: 0,
             offset: 0,
             projected_attributes: Vec::new(),
+            required_attributes: Vec::new(),
         };
         // Grouping per operation when one is pinned lets us select the exact (service, operation)
         // row; otherwise a per-service rollup. Apdex thresholds only affect the satisfied/

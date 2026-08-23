@@ -12,6 +12,9 @@ describe('servicesQueries', () => {
       'useServiceSettings',
       'useSetServiceSettings',
       'useResetServiceSettings',
+      'useBackendIssues',
+      'useBackendIssueFacets',
+      'useBackendIssueDetail',
     ]) {
       expect(typeof q[n]).toBe('function')
     }

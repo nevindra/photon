@@ -137,11 +137,20 @@ pub(crate) async fn traces_search(
         Err(e) => return engine_failure("traces search", &e),
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    let cursor = next_cursor(result.traces.len(), limit, offset, result.matched_count);
+    // Page against what the engine actually rolled up, not against `matched_count`. Beyond the
+    // engine's rollup cap there is nothing left to hand out, and past that point `matched_count`
+    // is an estimate anyway — pointing a cursor at it would offer pages that come back empty.
+    let pageable = result
+        .matched_count
+        .min(photon_query::MAX_ROLLED_UP_TRACES as u64);
+    let cursor = next_cursor(result.traces.len(), limit, offset, pageable);
 
     Json(json!({
         "traces": result.traces.iter().map(trace_summary_to_json).collect::<Vec<_>>(),
         "matched_count": result.matched_count,
+        // `true` ⇒ `matched_count` is a HyperLogLog estimate (the match set is past the rollup
+        // cap), so render it as an approximation rather than a tally.
+        "matched_count_estimated": result.matched_count_estimated,
         "elapsed_ms": elapsed_ms,
         "next_cursor": cursor,
     }))

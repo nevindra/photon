@@ -1,7 +1,6 @@
 //! photon-wal: durable write-ahead log with group commit.
 //!
-//! Implemented per the `photon-wal` section of
-//! `docs/superpowers/plans/2026-07-01-photon-interface-contracts.md`.
+//! Its place in the crate graph is described in `docs/architecture.md`.
 //!
 //! A [`DiskWal`] persists [`RecordBatch`](arrow::record_batch::RecordBatch)es as a sequence
 //! of self-describing, crc32-checked frames in rotating segment files. Concurrent
