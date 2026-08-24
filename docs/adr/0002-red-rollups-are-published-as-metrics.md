@@ -1,7 +1,6 @@
 # RED rollups are published as metrics, not stored in a table of their own
 
-Status: accepted — decided, not yet implemented.
-Implementation: [`docs/plans/2026-08-21-backend-services-revamp.md`](../plans/2026-08-21-backend-services-revamp.md)
+Status: accepted
 
 `red.rs` has always said it: *"v1 is breadth-first / correctness-over-speed... no precomputed rollups — the
 flagged optimization target."* Four things came due at once and made it payable. The Services index became a

@@ -1,7 +1,6 @@
 # A service's request rate is its entry spans, not every span it emits
 
-Status: accepted — decided, not yet implemented.
-Implementation: [`docs/plans/2026-08-21-backend-services-revamp.md`](../plans/2026-08-21-backend-services-revamp.md)
+Status: accepted
 
 `red_over` aggregated over every span kind. A service that instruments generously — nested INTERNAL spans
 around each stage of its own work — reported several times the throughput of a service doing identical work

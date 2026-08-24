@@ -1,7 +1,6 @@
 # The Services index is a fleet board, and the Site picker is only a filter
 
-Status: accepted — decided, not yet implemented.
-Implementation: [`docs/plans/2026-08-21-backend-services-revamp.md`](../plans/2026-08-21-backend-services-revamp.md)
+Status: accepted
 
 `tenant` is a global context dimension: pick a Site in the ContextBar and every view narrows to it. That is
 the right default for the explorers, where you are reading one Site's data. It is the wrong default for the

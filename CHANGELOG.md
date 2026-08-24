@@ -5,15 +5,114 @@ All notable changes to Photon are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.7.0] - 2026-08-24
 
-The **Backend (Services / APM) revamp** — in progress. See
-[`docs/plans/2026-08-21-backend-services-revamp.md`](docs/plans/2026-08-21-backend-services-revamp.md)
-and ADRs [0002](docs/adr/0002-red-rollups-are-published-as-metrics.md),
-[0003](docs/adr/0003-a-services-request-rate-is-its-entry-spans.md),
+A **Backend release**: the Services / APM vertical, the landing page, and the read path underneath
+them are rebuilt around **judgment rather than readings**. `/home` becomes an **Attention Board**
+where every watched thing is a Subject at one ranked Attention Level; `/services` becomes a fleet
+board with per-service Overview / Operations / Issues / Map / Deployments / SLO tabs, each owning its
+own queries; a background **rollup** publishes RED as ordinary `photon.service.*` metrics so a wide
+window is a metrics read rather than a span scan; and the whole UI moves onto a **flat token
+system** where separation comes from a grey canvas instead of shadow. A read-path pass measured
+against a copy of a real deployment (9 days, 86.6M spans) puts every Backend query inside a
+**2 s / 24 h, 5 s / 7 d** budget — thirteen endpoints were over it and four failed outright, the
+worst at 33.3 s. The decisions are recorded as ADRs
+[0001](docs/adr/0001-landing-page-is-an-attention-board.md),
+[0002](docs/adr/0002-red-rollups-are-published-as-metrics.md),
+[0003](docs/adr/0003-a-services-request-rate-is-its-entry-spans.md) and
 [0004](docs/adr/0004-the-services-index-is-a-fleet-board.md).
 
+**Upgrading.** No config change is required, no data migration exists, and every existing Parquet
+file stays readable. Two things do change under you, both deliberate and both detailed below: every
+rate and error rate on the Backend pages is **recomputed over entry spans** and in most cases drops,
+which rescales trace alert thresholds written against the old numbers; and the rollup's latency
+histogram is renamed `photon.service.duration` → **`photon.service.latency`** (its bucket ladder is
+a wire contract), which orphans histograms already on disk until `repair_latency` republishes them.
+
 ### Added
+
+- **The Attention Board replaces the landing dashboard.** `/home` showed readings and left the
+  judging to the reader — a KPI strip, two charts picked from whichever service happened to be
+  busiest, three per-world panels, and no alert incidents at all despite `photon-alerts` being fully
+  wired. It now answers one question: **is anything wrong, and where?** Every watched thing becomes
+  a **Subject** at one ranked **Attention Level** — Down / Critical / Warning / OK, plus **Unknown**
+  for the absence of a judgment. The judging is pure and table-tested (`lib/home/attention.ts`) and
+  adds no fourth opinion about what "bad" means: it maps `serviceHealth.ts`, `hostStats.ts`, the
+  API's own Web-Vital rating and the tenants API's own up/stale/down onto the shared axis, keeping
+  each kind's native word verbatim in the reason line.
+  - The **World** roll-up cards double as the page's filter (`?world=`, no tabs), so every world's
+    tally stays on screen — that is what makes an empty attention list believable.
+  - The board judges over its own bounded **Watch Range** (5m / 15m / 1h / 6h, `?watch=`) rather
+    than the app-wide Window, so `AppShell`/`ContextBar` gain a `timePicker` prop and `/home`
+    renders its own picker. Drilling out writes the Watch Range into the global range first, so the
+    destination shows the same slice of time.
+  - A tenant filter is a **lens**, and the board narrows honestly. Services, RUM apps and hosts
+    carry the tenant dimension; uptime and the alert engine do not — so under a lens the Ops world
+    is dropped rather than mislabelled as the Site's, incidents resolving to another Site's Subject
+    stay out of the Unattributed banner, and per-row Site labelling switches off.
+  - `TenantCard` moves to `/tenants` as a fleet-health board rather than being orphaned by the
+    rewrite; `StatusPill` gains `solid` (spent on **Down** alone); `useUrlState` gains
+    `useUrlParam(key, ref)`, the one-key merge-preserving counterpart for views owning a single
+    param. See [`docs/adr/0001`](docs/adr/0001-landing-page-is-an-attention-board.md).
+
+- **The Backend (Services / APM) vertical, rebuilt around judgment rather than readings.** The index
+  was a RED table sorted by throughput and the detail page was four charts plus an operations list;
+  neither answered "is this service healthy", "what is broken in it", "what does it talk to", or
+  "did we do this to ourselves". `/services` is now a **fleet board** ranked by Attention Level
+  ([ADR-0004](docs/adr/0004-the-services-index-is-a-fleet-board.md)), served by
+  `GET /api/services/overview` in one request, and each service gets **sub-routes that own their own
+  queries**, so an expensive tab never slows a cheap one:
+  - **Overview** (`/services/:service`) — health banner, KPIs, error budgets, four charts, and key
+    operations beside a **Logs panel**, which closes a real hole: a service can be on fire in its
+    logs while its spans look normal.
+  - **Operations** (`/services/:service/operations`) — entry points by default with all operations
+    behind a stated toggle, per-row sparklines, and a per-operation **latency heatmap**
+    (`GET /api/services/:service/operations/:operation/heatmap`) — the one shape three percentile
+    lines cannot draw.
+  - **Issues** (`/services/:service/errors`, `…/:fingerprint`, plus the fleet-wide
+    `/services/errors`) — errored spans grouped by `error.fingerprint`, fingerprinted at ingest.
+    Identity is the **pair** `(service, fingerprint)`, never the fingerprint alone: one bug across
+    three services is three Issues. Backed by `GET /api/services/errors`,
+    `GET /api/services/:service/errors[/facets|/:fingerprint]`.
+  - **Map** (`/services/map`) — the topology from a single scan, self-joining child
+    `(trace_id, parent_span_id)` to parent `(trace_id, span_id)`. `service` narrows **after** the
+    edges exist, never as a scan filter, because scoping the scan would delete the parent spans the
+    join needs; the `MAX_MAP_SPANS` cap is reported as `capped`.
+  - **Deployments** (`/services/:service/deployments`, `GET/POST /api/deployments`) — releases
+    **detected at ingest** from a resource `service.version` nobody has seen before, each with a
+    before/after RED diff, so a 5,000-span batch costs four string lookups. CI may POST commit /
+    author / message to enrich a row, but `detected_at_ms` and `source` are **write-once**, so a
+    late pipeline post cannot move a deploy marker off the moment the graph changed.
+  - **SLOs & error budgets** (`GET/POST /api/services/:service/slos`,
+    `PATCH/DELETE …/slos/:id`, `GET …/slos/:id/budget`) — error budget and multi-window burn rate
+    computed from the **rollup only**. A window the rollup does not cover comes back `partial`,
+    never a part-window number dressed as a full one, and a latency objective's threshold snaps
+    **down** to a `LATENCY_BOUNDS_NS` edge with the response saying which.
+  - **Per-service footprint** on `/data` (a new Services tab), stated as the estimate it is:
+    Parquet sorts by `service.name` and compresses a service's rows together, so there is no
+    measured per-service byte figure to read.
+  See [`docs/subsystems/services-apm.md`](docs/subsystems/services-apm.md).
+
+- **The service rollup.** A background pass turns spans into per-service `photon.service.*` and
+  per-operation `photon.operation.*` metrics, so the Backend pages can read a wide window without
+  re-scanning raw spans. It adds no storage engine: the points go through the existing metrics WAL
+  and are metrics like any other. 60-second buckets, each published exactly once; latency ships as a
+  real explicit-bucket histogram so any window can be re-quantized honestly. A **first run backfills
+  `[rollup].backfill_days` (default 30)**, walking one hour-wide slice per pass, so the rollup
+  describes the spans already on disk and not only the ones that arrive next — measured on 300M
+  spans, `/api/services/overview` took 23.1 s over 7 days scanning raw spans against 63 ms off the
+  rollup. Checked against a full raw scan over the same window, request counts agree to **0.00 %**
+  on every service at 1h, 6h and 24h, and the rollup answers 24h in 38 ms against the raw scan's
+  2,196 ms. Tunable via `[rollup]` (`interval_secs` / `lag_secs` / `top_operations` /
+  `backfill_days`) or `PHOTON_ROLLUP_*`. Three things worth knowing before you rely on it: a span
+  arriving more than `lag_secs` after its bucket closed never reaches the rollup; per-service
+  operation series are capped at `top_operations` with the tail summed into a single `__other__`
+  series; and **coverage cannot be extended backwards** — the backfill runs only when no watermark
+  exists, so once any bucket is published the floor is fixed, and a window starting before coverage
+  falls back to a raw scan (a 53 ms → 24.7 s cliff). Republishing a range without double-counting
+  its counters is a design decision rather than a repair, so this one is reported, not fixed. See
+  [`docs/subsystems/rollup.md`](docs/subsystems/rollup.md) and
+  [ADR-0002](docs/adr/0002-red-rollups-are-published-as-metrics.md).
 
 - **HTTP status classes beside span status.** RED rows and buckets now carry `http_4xx` and
   `http_5xx` alongside `error_count`. They sit *beside* it, never instead of it: `error_count` keeps
@@ -25,16 +124,15 @@ and ADRs [0002](docs/adr/0002-red-rollups-are-published-as-metrics.md),
   metrics / RUM / services / infra query through one `withContext()` helper. Existing Parquet needs
   no migration — an unpromoted older file simply reads the key from its attributes map.
 
-- **The service rollup.** A background pass turns spans into per-service `photon.service.*` and
-  per-operation `photon.operation.*` metrics, so the Backend pages can read a wide window without
-  re-scanning raw spans. It adds no storage engine: the points go through the existing metrics WAL
-  and are metrics like any other. 60-second buckets, each published exactly once; latency ships as a
-  real explicit-bucket histogram so any window can be re-quantized honestly. Tunable via `[rollup]`
-  (`interval_secs` / `lag_secs` / `top_operations`) or `PHOTON_ROLLUP_*`. Two things worth knowing
-  before you rely on it: a span arriving more than `lag_secs` after its bucket closed never reaches
-  the rollup, and per-service operation series are capped at `top_operations` with the tail summed
-  into a single `__other__` series. See
-  [`docs/subsystems/rollup.md`](docs/subsystems/rollup.md).
+- **`make replica` runs the backend against a copy of a real deployment** (`photon.prod-replica.toml`
+  over a hot tier copied into a gitignored `.photon-prod/`), so the read path can be worked on
+  against real telemetry instead of loadgen output. Two things that copy needs, both explained in
+  the config file: the replica must use a **fresh** control-plane DB rather than the source's — the
+  alert engine and the uptime prober are always on and read their work out of that database, so a
+  replica pointed at a production copy would deliver to production's real notification channels and
+  probe production's endpoints from a laptop — and a hot tier copied out of a *running* Photon is
+  not a clean snapshot, since `merge_once` unlinks files mid-copy, so
+  `scripts/prune-replica-manifest.py` drops manifest entries whose Parquet did not survive.
 
 ### Changed
 
@@ -52,11 +150,124 @@ and ADRs [0002](docs/adr/0002-red-rollups-are-published-as-metrics.md),
   written against the old inflated counts need revisiting. There is no automatic migration for this.
 
 - **One severity vocabulary across the whole UI.** The Backend world's `critical` / `degraded` /
-  `healthy` / `idle` scale is retired in favour of the Attention Level the landing page already used:
+  `healthy` / `idle` scale is retired in favour of the Attention Level the landing page already uses:
   **Down / Critical / Warning / OK**, plus **Unknown** for the absence of a judgment. `idle` was the
   load-bearing bug — a service falling from thousands of requests per second to nothing rendered as
   calm neutral grey. It now splits correctly: reported-then-silent is **Down**, never-reported is
   **Unknown**.
+
+- **A flat token system: separation now comes from the canvas, not from shadow.** `--background`
+  drops to a visibly grey sheet with white `--surface-1` paper on top, so a card reads as a card
+  with nothing but a hairline border and a 1 px ambient shadow.
+  - **Elevation** is cut to three steps — `shadow-1` (hairline ambient, was a 20 px drop plus an
+    inset highlight), `shadow-2` (the one real float), `sink` — dropping the `--hi` top-highlight
+    token and the unused `shadow-hi` utility. Popover / dropdown / dialog / toast / tooltip move
+    onto that ramp instead of stock Tailwind `shadow-md`/`lg`.
+  - **One radius family** off `--radius` 0.75rem (was 0.5rem): sm 6 / md 10 / lg 12 / xl 14 /
+    2xl 18; pills use `rounded-full` and sit outside the scale.
+  - **Primitives**: `badge` becomes real pills with soft tonal `success`/`warning`/`error`/`brand`
+    variants (`outline` is now the neutral entity chip); `stat-tile` gains `#icon`, `#action` and a
+    hairline-separated `#footer`, and stops lifting on hover; `segmented` / `tabs` / `nav-tabs` /
+    `toggle-group` share one switcher look (white pill on a muted track, no cyan underline);
+    `switch` swaps its keycap thumb for a plain circle; `input` / `select` / `SearchBar` drop the
+    inset shadow for a soft `ring-2` focus; `.pk` loses its hard bottom lip and hover lift and sinks
+    1 px on `:active` (`.pk-brand` removed).
+  - **`AppShell` gains a `surface` prop.** Dashboards stay on the grey canvas; the dense explorers
+    (`/logs`, `/traces`, `/traces/:id`, `/metrics`) pass `surface="sheet"` for one edge-to-edge
+    white working surface. A table on a canvas view must own a panel, so `RumBreakdownTable` gets
+    one and `RedTable` is wrapped in the service detail view.
+  See [`docs/frontend.md`](docs/frontend.md).
+
+- **Trace-search ranking probes the newest slice first, and `matched_count` says when it is an
+  estimate.** Ranking grouped every distinct `trace_id` in the window to find the newest 2,000 — one
+  hash-table entry per trace id, fine at an hour and ruinous at a week. A 3-day window holds 11.4M
+  ids and a 7-day one over 20M (times `target_partitions` partial aggregates), and the 7-day case
+  died outright under the shared query pool: `HTTP 500` after 1.9 s, having grouped six days at full
+  cost only to throw them away. The scan now starts on the newest 15 minutes and widens ×8 until the
+  page fills or it covers the window (15m → 2h → 16h → 5d 8h → all of it); a busy week fills on the
+  first probe, a quiet one walks to the full window at ~1.14× a single pass and lands on exactly the
+  un-probed answer. Each probe reaches `STEP3_WINDOW_PAD_NANOS` further back than its own start, so
+  a trace straddling a boundary cannot rank as newer than it is. `matched_count` stays **exact**
+  whenever the page is short of the cap (that page *is* every matching trace — the case for every
+  query a human has narrowed down); once it fills, the true total is already past anything the view
+  can show, so it becomes a magnitude from a fixed-size HyperLogLog (`approx_distinct`, ~1 % relative
+  error — measured 2,007 against an exact 2,001). The response carries **`matched_count_estimated`**
+  so the UI renders `~11.3M` instead of passing an approximation off as a count.
+
+- **The query memory pool is sized from the host instead of a hard-coded 512 MiB.** It is now a
+  quarter of total RAM clamped to 256 MiB..=4 GiB, overridable with `[query].memory_pool_bytes` /
+  `PHOTON_QUERY_MEMORY_POOL_BYTES`. It remains one *process-wide* `FairSpillPool` shared by every
+  engine — a ceiling on the sum of all concurrent queries, not a per-query allowance.
+
+### Fixed
+
+- **Parquet filter pushdown silently emptied every fetch plan, and it is now off.** In DataFusion 43,
+  `pushdown_filters` over files whose physical schemas differ — the state every
+  `[schema].promoted_attributes` change puts a node in, for one whole retention period — makes any
+  plan carrying a `LIMIT` return **zero rows**. Not an error, not a partial answer. Measured over
+  four surviving metrics files, `count()` reported 29,819 rows while `LIMIT 1` reported none. An
+  aggregate or a sort between the filter and the limit hides it, which is why only three call sites
+  ever showed the symptom and why it read as "this metric does not exist" rather than as a bug —
+  and why `/api/services/:service/dependencies` used to answer in 29 ms: it was returning an empty
+  list. `pushdown_filters` and `reorder_filters` are now off with a regression test
+  (`a_fetch_plan_over_mixed_schema_files_still_returns_rows`) pinning them there until the upstream
+  bug is fixed.
+- **Rollup latency percentiles were pinned at exactly 10.000 s.** The bucket ladder topped out
+  there, so every slower request fell into the `+Inf` overflow bucket and the quantile read
+  interpolated at the top bound — a service whose real p50 was two minutes reported ten seconds,
+  with nothing marking the number as a floor rather than a measurement. The ladder now reaches
+  **30 minutes across 19 buckets**. Because `explicit_bounds` are a wire contract, renumbering them
+  renames the metric (`photon.service.duration` → **`photon.service.latency`**, likewise
+  `photon.operation.*`), which orphans every histogram already on disk; `repair_latency` republishes
+  the histogram over the covered range — and **only** the histogram, since quantiles are
+  scale-invariant and counters are not.
+- **That repair could not run on a federation central.** A rollup pass skips any tenant already
+  publishing its own rollup, which is what protects counters from being summed twice, but the repair
+  publishes no counter and so found nothing to publish. `Publish::skips_covered_tenants` limits the
+  exclusion to counter publishes, so central heals its own history instead of waiting on every Site.
+- **`merge_once` failed once a minute forever after a `promoted_attributes` change.** Batches
+  decoded from files written under different schemas were concatenated as-is. `photon-compact` now
+  aligns each decoded batch to the writing schema first (`align.rs`): a column the batch lacks
+  becomes a typed null, so consolidation survives the mixed-schema state instead of erroring on
+  every pass.
+- **Engine failures came back as HTTP 400.** `/api/red` and `/api/metrics/query` answered every
+  engine error with a 400, so a server that had exhausted its shared query memory pool under a wide
+  window looked exactly like a user typo — a 7-day histogram query returned
+  `400 Resources exhausted`, the UI showed the raw message instead of degrading, and nothing in an
+  access log distinguished the two. Failures that are **ours** (I/O, storage, pool exhaustion) now
+  return **500**; a request the engine legitimately rejected (an unsupported aggregation, `rate` on
+  a gauge, an unknown group-by column) keeps its 400.
+- **Four charts on the service pages had been drawing nothing.**
+  `GET /api/services/:service/timeseries` changed `ts` from nanosecond strings to epoch-ms numbers
+  and its consumers were never updated, so two of them multiplied and two divided — every point
+  landed near epoch 1970, outside the chart window. Pre-existing on `main`, not introduced by the
+  revamp.
+
+### Performance
+
+- **Every Backend read path is inside a 2 s / 24 h, 5 s / 7 d budget.** Stress-tested against a copy
+  of a real deployment — 9 days, 86.6M spans, 6.01 GB hot tier — thirteen endpoints were over budget
+  and four returned errors outright, the worst at 33.3 s. All of them clear it now; the slowest is
+  1,271 ms at 24h and 1,294 ms at 7d, and everything else is under 460 ms.
+
+  | endpoint | 24h | 7d |
+  | --- | --- | --- |
+  | `/services/:service/operations` | 6,246 ms → **54 ms** | 33,295 ms → **193 ms** |
+  | `/services/overview` | 5,069 ms → **42 ms** | 30,301 ms → **147 ms** |
+  | `/red?group=service` | 2,133 ms → **36 ms** | 13,371 ms → **131 ms** |
+  | `/traces/search` (recent) | 791 ms → **91 ms** | HTTP 500 → **337 ms** |
+
+- **Row sparklines come from one scan instead of one per row.** The Services index and the
+  Operations tab each drew two mini-charts per row through their own `red_timeseries` call, capped
+  at 40 — so a page load was 1 + N full scans of the same spans. `red_spark` groups by series and
+  time bucket at once and returns them all from a single scan.
+- **A span query no longer touches the `attributes` map unless a surviving file might hold the key.**
+  A span Parquet's `attributes` map is 63 % of its bytes and **96 % of its decoded bytes**, so
+  referencing it at all costs about the same however many keys are probed. The manifest already
+  records each file's long-tail keys, so `attr_lookup` resolves a key that no surviving file declares
+  to a typed NULL literal and the map column never enters the plan (`AttrKeys::Unknown` — at least
+  one file did not declare its keys — keeps the probe, conservatively). Measured on 300M spans,
+  `/api/red` over 7 days: **12.3 s touching the map against 2.2 s without.**
 
 ## [1.6.0] - 2026-08-12
 
@@ -600,6 +811,7 @@ operator-facing knobs. Fully backward compatible — no config or API breaking c
 - **Cached metric probe metadata** per engine (manifest-pointer invalidated), dropping a
   redundant prune + Parquet open per chart panel.
 
+[1.7.0]: https://github.com/nevindra/photon/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/nevindra/photon/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/nevindra/photon/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/nevindra/photon/compare/v1.3.0...v1.4.0

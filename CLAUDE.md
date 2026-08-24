@@ -24,7 +24,6 @@ node that can serve another's data.
 - [`docs/frontend.md`](docs/frontend.md) — the Vue app: routes/views, the `ui/` primitives, `lib/`.
 - [`docs/conventions.md`](docs/conventions.md) — conventions & gotchas.
 - [`docs/adr/`](docs/adr/) — decisions that would otherwise get "fixed" by the next reader.
-- [`docs/plans/`](docs/plans/) — accepted implementation plans, task-by-task, for work in flight.
 - [`CONTEXT.md`](CONTEXT.md) — the ubiquitous language (glossary only, no implementation detail).
 - [`README.md`](README.md) — the public-facing overview and positioning.
 
