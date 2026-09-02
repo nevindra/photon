@@ -51,6 +51,21 @@ pub struct IngestConfig {
     /// Default ~16 MiB. `PHOTON_INGEST_MAX_BODY_BYTES` overrides.
     #[serde(default = "IngestConfig::default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Cap on the byte length of ONE long-tail attribute value, applied while OTLP is mapped
+    /// into Arrow (see [`crate::attr_limit`]). `0` disables it.
+    ///
+    /// It is enforced at the front door on purpose: an oversized value cut here never reaches
+    /// the WAL, so it costs nothing to `fsync`, compact, replicate, or decode later. Measured on
+    /// a production span corpus, capping every value cost the file 0.2% at 8 KiB, 2.9% at 4 KiB,
+    /// **10.8% at the 2 KiB default**, 20.6% at 1 KiB and 30.8% at 512 B — nearly all of it one
+    /// key, `db.query.text`, averaging 1,618 bytes on 16% of spans.
+    ///
+    /// **Truncation is not reversible.** Raise it if whole SQL statements matter more than the
+    /// bytes; set `0` to keep the old unlimited behavior. Promoted attributes are never
+    /// truncated — the read path groups on them.
+    /// `PHOTON_INGEST_MAX_ATTRIBUTE_VALUE_BYTES` overrides.
+    #[serde(default = "IngestConfig::default_max_attribute_value_bytes")]
+    pub max_attribute_value_bytes: usize,
 }
 
 impl IngestConfig {
@@ -59,6 +74,9 @@ impl IngestConfig {
     }
     fn default_max_body_bytes() -> usize {
         16 * 1024 * 1024
+    }
+    fn default_max_attribute_value_bytes() -> usize {
+        2048
     }
 }
 
@@ -71,11 +89,17 @@ pub struct StorageConfig {
     pub db_path: String,
     #[serde(default)]
     pub durable: Option<DurableConfig>,
-    /// zstd compression level the compactors use when streaming Parquet files to disk. Higher
-    /// levels shrink files further (roughly 10-30% smaller at level 3 vs the default) for more
-    /// CPU per compaction pass. Range `1..=19` (validated below). Default 1 is byte-identical to
-    /// the previously hardcoded `Compression::ZSTD(Default::default())` — `ZstdLevel::try_new(1)`
-    /// equals `ZstdLevel::default()` in parquet 53.
+    /// zstd compression level the compactors use when streaming Parquet files to disk. Range
+    /// `1..=19` (validated below).
+    ///
+    /// **Default 6, and the level costs the read path nothing.** Decoding every column of the
+    /// same production corpus took 88 ms at level 1, 88 ms at level 6 and 86 ms at level 12:
+    /// zstd's decompression speed barely moves with the level, so what a higher level buys in
+    /// size it charges to compaction CPU, not to queries. Measured against level 1 on merged
+    /// files: logs −1.6%, spans −5.5%, metrics −12.5%.
+    ///
+    /// Level 3 is the one to skip — on this corpus it lands within 0.2% of level 1 while costing
+    /// more, which is why the ladder here jumps straight to 6.
     #[serde(default = "StorageConfig::default_zstd_level")]
     pub zstd_level: i32,
 }
@@ -86,7 +110,7 @@ impl StorageConfig {
     }
 
     fn default_zstd_level() -> i32 {
-        1
+        6
     }
 }
 
@@ -539,6 +563,10 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+        if let Some(v) = get("PHOTON_INGEST_MAX_ATTRIBUTE_VALUE_BYTES") {
+            self.ingest.max_attribute_value_bytes =
+                parse_var("PHOTON_INGEST_MAX_ATTRIBUTE_VALUE_BYTES", &v)?;
+        }
         if let Some(v) = get("PHOTON_SESSION_SECRET") {
             self.auth.session_secret = v;
         }
@@ -978,9 +1006,9 @@ session_secret = "a-long-random-session-signing-secret"
     }
 
     #[test]
-    fn storage_zstd_level_defaults_to_1_when_omitted() {
+    fn storage_zstd_level_defaults_to_6_when_omitted() {
         let c = Config::from_toml_str(VALID).unwrap();
-        assert_eq!(c.storage.zstd_level, 1);
+        assert_eq!(c.storage.zstd_level, 6);
     }
 
     #[test]

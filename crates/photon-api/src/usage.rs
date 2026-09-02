@@ -5,6 +5,7 @@
 //! (`replicated`). The `/api/usage/series` handler differences the cumulative ingest counters into
 //! per-bucket rates via the pure `bucket_series` helper.
 
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -54,6 +55,32 @@ pub trait UsageStore: Send + Sync {
 pub trait ReplicationStatus: Send + Sync {
     fn configured(&self) -> bool;
     fn pending(&self) -> usize;
+}
+
+/// One signal's small-file merge health, as `GET /api/data/storage` reports it.
+///
+/// This exists because the merge failed silently on a real deployment for **twelve days**. The
+/// compactor loop logs a failure to stderr and carries on, so nothing surfaced: files kept being
+/// written once a minute and never consolidated, the manifest grew to 22.6 MiB, and a 7-day span
+/// query ended up opening 10,080 files. A number that only ever appears in stderr is a number
+/// nobody reads.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionHealth {
+    /// `"logs"` | `"traces"` | `"metrics"`.
+    pub signal: &'static str,
+    /// Epoch-ms of the last pass that either merged files or found nothing to merge. `None` =
+    /// no pass has succeeded since start-up.
+    pub last_ok_ms: Option<i64>,
+    /// Passes that have failed in a row. Non-zero means merging is stalled *right now*: a merge
+    /// always re-selects the OLDEST small files, so one bad input fails every pass forever.
+    pub consecutive_failures: u64,
+    /// The most recent failure's message, kept so the UI does not send anyone to the logs.
+    pub last_error: Option<String>,
+}
+
+/// A live view of the three compactors' merge passes.
+pub trait CompactionStatus: Send + Sync {
+    fn snapshot(&self) -> Vec<CompactionHealth>;
 }
 
 /// Attribute a replicated object path to its signal. `None` = not a parquet file we track.

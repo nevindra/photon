@@ -17,13 +17,17 @@ use parquet::schema::types::ColumnPath;
 use photon_core::PhotonError;
 use photon_storage::Storage;
 
-/// Default zstd compression level: matches the level `Compression::ZSTD(Default::default())`
-/// hardcoded before the level became configurable — `parquet::basic::ZstdLevel::try_new(1)` equals
-/// `ZstdLevel::default()` in parquet 53. Note this no longer implies byte-identical output to that
-/// era: the per-column encodings in [`writer_properties`] changed independently of the level. Do
-/// not raise it blindly — measured on a production corpus, **level 3 is ~3% LARGER than level 1**
-/// here; the next level that actually pays is 6.
-pub(crate) const DEFAULT_ZSTD_LEVEL: i32 = 1;
+/// Fallback zstd level for a compactor built without [`with_zstd_level`]; `photon-server` always
+/// sets it from `[storage].zstd_level`, whose default this mirrors.
+///
+/// 6, not 1, and not 3. Measured on a production corpus: level 3 lands within 0.2% of level 1
+/// while costing more CPU, and level 6 is the first that pays (logs −1.6%, spans −5.5%, metrics
+/// −12.5% against level 1 on merged files). Decode is unaffected — 88 ms at level 1, 88 ms at 6,
+/// 86 ms at 12 for every column of the same file — so the level is charged to compaction, never
+/// to queries.
+///
+/// [`with_zstd_level`]: crate::Compactor::with_zstd_level
+pub(crate) const DEFAULT_ZSTD_LEVEL: i32 = 6;
 
 /// Cap on rows per Parquet row group, overriding parquet-rs's default of 1,048,576. Without this,
 /// `ArrowWriter` buffers an entire row group's column data in memory before flushing it, so a large
@@ -122,6 +126,36 @@ fn writer_properties(
 
     Ok(builder.build())
 }
+
+/// The leading sort column every signal puts in front of its own key when the segment carries a
+/// promoted `tenant` column — i.e. on a federation **central**, where every row is stamped with
+/// the Site it came from.
+///
+/// Ordering by Site first is what makes a per-Site query cheap, and nothing else does. Measured on
+/// a simulated 10-Site central over 1,050,786 real spans, the bytes one `tenant:<name>` query has
+/// to decode: 100% with `tenant` in the attributes map, 100% with it promoted but still sorted
+/// `(service, time)`, and 12.2% once it leads. Promotion alone buys nothing here; the sort does.
+/// The file costs 1.6% more to store for it.
+///
+/// Returns `None` when there is no `tenant` column, which is every single-install deployment — and
+/// there the sort is unchanged. It is also a no-op for a central with one Site: a constant column
+/// sorts stably, so the rest of the key still decides the order.
+///
+/// The trade it makes is inside one file: row groups now span the file's whole time range rather
+/// than a slice of it, so Parquet's row-group statistics prune less well on time. That is
+/// affordable because files are already narrow in time — the manifest prunes the window before any
+/// file is opened — and it buys pruning on the dimension a central actually queries by.
+pub(crate) fn tenant_sort_key(batch: &RecordBatch) -> Option<arrow::compute::SortColumn> {
+    batch
+        .column_by_name(TENANT_COLUMN)
+        .map(|values| arrow::compute::SortColumn {
+            values: values.clone(),
+            options: None,
+        })
+}
+
+/// The promoted column federation stamps on every row a central accepts.
+pub(crate) const TENANT_COLUMN: &str = "tenant";
 
 /// Resolve an object path to its real on-disk location under the hot store's local root, so a
 /// blocking task can stream a Parquet encode straight to a `File`. The object path maps 1:1 onto

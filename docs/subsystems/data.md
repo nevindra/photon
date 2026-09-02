@@ -21,7 +21,7 @@ Handlers: `crates/photon-api/src/{data,usage,usage_services}.rs`.
 
 | Route | Purpose |
 |---|---|
-| `GET /api/storage` | storage stats |
+| `GET /api/storage` | storage stats: per-signal footprint, the `durable` replication block, and a `compaction` array (`{signal, last_ok_ms, consecutive_failures, last_error}` per signal, only when a compactor is attached) |
 | `GET /api/usage/series` | usage over time |
 | `GET /api/usage/services` | per-service footprint over a window: `rows` (biggest first), the per-signal accounting behind the estimate, and the metrics note. `start`/`end` are epoch-ns strings; `limit` defaults to 50 |
 | `GET/PUT /api/retention` | read / set retention |
@@ -42,10 +42,25 @@ cards, and the charts).
   (footprint, ingestion rate). No page-local window selector — the usage charts follow the ONE
   global time control (the `ContextBar`) via `usageWindow`, a computed in `dataQueries.js` derived
   from `context.windowMs` and mapped onto the API's `1h|24h|7d|30d` buckets.
-- **Storage** (`DataStorage.vue`): a durable-replication status band, then one card per signal —
-  signal icon+hue, size, rows/files, a 24h on-disk footprint trend chart (`charts/MiniAreaChart.vue`,
-  same `usageWindow`/series as Overview), a signal-hued "share of disk" bar, and a "durable
-  replication" `Meter`. Uptime keeps its own shape (monitors/heartbeats/incidents, no bytes/trend).
+- **Storage** (`DataStorage.vue`): a merge-stall banner (when there is one), a durable-replication
+  status band, then one card per signal — signal icon+hue, size, rows/files, a 24h on-disk footprint
+  trend chart (`charts/MiniAreaChart.vue`, same `usageWindow`/series as Overview), a signal-hued
+  "share of disk" bar, and a "durable replication" `Meter`. Uptime keeps its own shape
+  (monitors/heartbeats/incidents, no bytes/trend).
+
+  **Merge health is the one thing on this page that reports a fault rather than a measurement.**
+  When `merge_once` stops, nothing looks broken: ingest still acks, search still answers, the file
+  count just climbs by ~1,440 per signal per day and every query over those files gets slower. A
+  production node ran 12 days that way with only a line on stderr to show for it. So each Parquet
+  card carries a `StatusPill` (Merging / Failing / Stalled / Unknown) and a stalled signal is
+  pulled up into an `Alert` at the top of the tab, above the durable band — replication lagging is
+  a copy that has not landed yet, a stalled merge is a tier quietly degrading.
+
+  The judgment is pure and lives in `lib/data/compaction.ts` (`judge` / `judgeAll` / `isDegraded`),
+  not in the SFC. One failed pass already warns, because a merge re-selects the same oldest files
+  every time and therefore cannot self-heal; `STALLED_FAILURES` (30 passes, ~5 minutes) escalates to
+  error. A node with no compactor attached sends no `compaction` array at all and the UI shows
+  nothing — "Unknown", never a healthy-looking green.
 - **Services** (`DataServices.vue`): who is filling the disk, one row per service, **sorted by
   estimated footprint and never by row count** — a chatty service writing 40,000 tiny log lines can
   cost less disk than a quieter one writing 9,000 spans, and ordering by rows would put the cheap

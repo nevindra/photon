@@ -17,6 +17,9 @@ use std::collections::HashSet;
 /// the metrics compactor's sort key `(metric_name, service.name, host.name, timestamp)`.
 const SERVICE_NAME_COLUMN: &str = "service.name";
 const HOST_NAME_COLUMN: &str = "host.name";
+/// The promoted column federation stamps on every row a central accepts. Ranged over by ALL three
+/// signals (unlike `host.name`, which only metrics carry), because a central mirrors all three.
+const TENANT_COLUMN: &str = "tenant";
 
 // `Serialize` is kept only so `from_bytes`'s legacy-format fallback (and its test) can
 // round-trip through `serde_json` exactly like the pre-binary-format encoder did; new
@@ -30,6 +33,19 @@ pub struct SkipIndex {
     /// so legacy serde_json `.idx` sidecars — and v1 binary sidecars — decode to `None`.
     #[serde(default)]
     host_range: Option<(String, String)>,
+    /// Inclusive min/max of the promoted `tenant` column — the federation Site a row came from.
+    ///
+    /// This is the one range that decides whether a **central** can prune at all. Central stamps
+    /// `tenant` on every row it accepts, so with `tenant` leading the compactors' sort key each
+    /// file holds a contiguous slice of Sites and `tenant:<name>` can drop whole files. Without
+    /// it a per-Site query scans every file in the window: measured on a simulated 10-Site
+    /// central, 100% of the bytes with `tenant` in the attributes map, 100% with it promoted but
+    /// sorted `(service, time)`, and 12.2% once it leads the sort.
+    ///
+    /// `#[serde(default)]` so pre-v3 sidecars — binary or the older serde_json ones — decode to
+    /// `None`, which per the conservative-pruning rule means "keep the file".
+    #[serde(default)]
+    tenant_range: Option<(String, String)>,
 }
 
 impl SkipIndex {
@@ -52,6 +68,7 @@ impl SkipIndex {
             service_range,
             // Logs do not range over host.name.
             host_range: None,
+            tenant_range: column_string_min_max(batch, TENANT_COLUMN)?,
         })
     }
 
@@ -106,6 +123,7 @@ impl SkipIndex {
             service_range,
             // Spans do not range over host.name.
             host_range: None,
+            tenant_range: column_string_min_max(batch, TENANT_COLUMN)?,
         })
     }
 
@@ -147,6 +165,7 @@ impl SkipIndex {
             timestamp_range,
             service_range,
             host_range,
+            tenant_range: column_string_min_max(batch, TENANT_COLUMN)?,
         })
     }
 
@@ -174,6 +193,13 @@ impl SkipIndex {
     /// v1 sidecars written before the host block existed).
     pub fn host_range(&self) -> Option<(String, String)> {
         self.host_range.clone()
+    }
+
+    /// Inclusive min/max for the promoted `tenant` column, if known. `None` when `tenant` is not
+    /// promoted, when the segment carries no tenant at all (a plain single-install deployment),
+    /// or for pre-v3 sidecars — all three of which mean "keep the file".
+    pub fn tenant_range(&self) -> Option<(String, String)> {
+        self.tenant_range.clone()
     }
 
     /// Hand-rolled binary encoding (see the module doc and the `idx_binary` helpers below
@@ -224,7 +250,8 @@ fn body_distinct_tokens(batch: &RecordBatch) -> Result<HashSet<String>, PhotonEr
 ///
 /// ```text
 /// magic:            4 bytes, b"PXSK"
-/// version:          1 byte,  currently 2 (v1 sidecars still decode; they stop after has_service)
+/// version:          1 byte,  currently 3 (older sidecars still decode; v1 stops after
+///                            has_service, v2 after has_host)
 /// bloom.num_bits:   8 bytes (u64)
 /// bloom.num_hashes: 4 bytes (u32)
 /// bloom.bits_len:   8 bytes (u64)  -- byte length of the packed bit vector
@@ -238,6 +265,9 @@ fn body_distinct_tokens(batch: &RecordBatch) -> Result<HashSet<String>, PhotonEr
 /// has_host:         1 byte  (0 | 1)   -- v2+ only; absent in v1 sidecars → host_range = None
 ///   [host_lo:       4-byte length (u32) + UTF-8 bytes]
 ///   [host_hi:       4-byte length (u32) + UTF-8 bytes]
+/// has_tenant:       1 byte  (0 | 1)   -- v3+ only; absent in v1/v2 → tenant_range = None
+///   [tenant_lo:     4-byte length (u32) + UTF-8 bytes]
+///   [tenant_hi:     4-byte length (u32) + UTF-8 bytes]
 /// ```
 ///
 /// Chosen over serde_json specifically because `Bloom::bits` (the bulk of the payload) was
@@ -247,7 +277,7 @@ mod idx_binary {
     use super::{Bloom, PhotonError, SkipIndex};
 
     const MAGIC: [u8; 4] = *b"PXSK";
-    const VERSION: u8 = 2;
+    const VERSION: u8 = 3;
 
     pub(super) fn has_magic(b: &[u8]) -> bool {
         b.len() >= MAGIC.len() && b[..MAGIC.len()] == MAGIC
@@ -284,6 +314,16 @@ mod idx_binary {
 
         // v2: has_host + optional (host_lo, host_hi), mirroring the service block.
         match &index.host_range {
+            Some((lo, hi)) => {
+                out.push(1);
+                write_string(&mut out, lo);
+                write_string(&mut out, hi);
+            }
+            None => out.push(0),
+        }
+
+        // v3: has_tenant + optional (tenant_lo, tenant_hi), same shape again.
+        match &index.tenant_range {
             Some((lo, hi)) => {
                 out.push(1);
                 write_string(&mut out, lo);
@@ -348,11 +388,24 @@ mod idx_binary {
             None
         };
 
+        // v3+ carries a tenant block after the host block; v1/v2 sidecars end before it → None,
+        // which means "keep the file".
+        let tenant_range = if version >= 3 {
+            if cur.u8()? == 1 {
+                Some((cur.string()?, cur.string()?))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(SkipIndex {
             bloom,
             timestamp_range,
             service_range,
             host_range,
+            tenant_range,
         })
     }
 
@@ -555,6 +608,11 @@ impl SkipIndex {
     /// synthesize a legacy v1 sidecar for the backward-compat decode test).
     pub(crate) fn clear_host_range_for_test(&mut self) {
         self.host_range = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_tenant_range_for_test(&mut self) {
+        self.tenant_range = None;
     }
 }
 
@@ -1000,6 +1058,97 @@ mod tests {
     }
 
     #[test]
+    fn every_signal_ranges_over_tenant_and_roundtrips_binary_v3() {
+        // A central stamps `tenant` on all three signals, so all three must range over it.
+        let promoted = vec!["service.name".to_string(), "tenant".to_string()];
+
+        let logs_schema = photon_core::schema::LogSchema::new(&promoted);
+        let mut lb = photon_core::record::RecordBatchBuilder::new(&logs_schema);
+        for (svc, tenant) in [("api", "sgp"), ("api", "jkt")] {
+            let mut attributes = std::collections::BTreeMap::new();
+            attributes.insert("service.name".to_string(), svc.to_string());
+            attributes.insert("tenant".to_string(), tenant.to_string());
+            lb.append(&photon_core::record::LogRecord {
+                timestamp_nanos: 1,
+                body: Some("hi".into()),
+                attributes,
+                ..Default::default()
+            });
+        }
+        let idx = SkipIndex::build(&lb.finish().unwrap(), &logs_schema).unwrap();
+        let expected = Some(("jkt".to_string(), "sgp".to_string()));
+        assert_eq!(idx.tenant_range(), expected);
+        assert_eq!(
+            SkipIndex::from_bytes(&idx.to_bytes())
+                .unwrap()
+                .tenant_range(),
+            expected
+        );
+
+        let metrics_schema = photon_core::metric_schema::MetricSchema::new(&promoted);
+        let mut mb = photon_core::metric_record::MetricBatchBuilder::new(&metrics_schema);
+        for tenant in ["sgp", "jkt"] {
+            let mut attributes = std::collections::BTreeMap::new();
+            attributes.insert("service.name".to_string(), "api".to_string());
+            attributes.insert("tenant".to_string(), tenant.to_string());
+            mb.append(&photon_core::metric_record::MetricPoint {
+                metric_name: "m".to_string(),
+                timestamp_nanos: 1,
+                attributes,
+                ..Default::default()
+            });
+        }
+        let idx = SkipIndex::build_metrics(&mb.finish().unwrap()).unwrap();
+        assert_eq!(idx.tenant_range(), expected);
+        assert_eq!(
+            SkipIndex::from_bytes(&idx.to_bytes())
+                .unwrap()
+                .tenant_range(),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_segment_with_no_tenant_column_has_no_tenant_range() {
+        // A plain single-install deployment never promotes `tenant`; the range must stay None,
+        // which the prune path reads as "keep the file".
+        let schema = photon_core::metric_schema::MetricSchema::new(&["service.name".to_string()]);
+        let idx =
+            SkipIndex::build_metrics(&metrics_batch(&schema, &["m"], &["svc"], &["h"], &[1i64]))
+                .unwrap();
+        assert_eq!(idx.tenant_range(), None);
+        assert_eq!(
+            SkipIndex::from_bytes(&idx.to_bytes())
+                .unwrap()
+                .tenant_range(),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_v2_index_decodes_with_no_tenant_range() {
+        // A v2 sidecar (host block, no tenant block) must still decode; tenant_range → None.
+        let schema = photon_core::metric_schema::MetricSchema::new(&[
+            "service.name".to_string(),
+            "host.name".to_string(),
+        ]);
+        let mut idx =
+            SkipIndex::build_metrics(&metrics_batch(&schema, &["m"], &["svc"], &["h"], &[1i64]))
+                .unwrap();
+        idx.clear_tenant_range_for_test();
+        let mut v2 = idx.to_bytes();
+        v2[4] = 2; // version byte (after the 4-byte magic)
+        v2.pop(); // strip the has_tenant = 0 byte that only exists in v3
+        let back = SkipIndex::from_bytes(&v2).unwrap();
+        assert_eq!(back.tenant_range(), None);
+        assert_eq!(
+            back.host_range(),
+            Some(("h".to_string(), "h".to_string())),
+            "the v2 host block still decodes"
+        );
+    }
+
+    #[test]
     fn legacy_v1_index_decodes_with_no_host_range() {
         // A v1-format index (service only, no host block) must still decode; host_range → None.
         let mut idx = SkipIndex::build_metrics(&metrics_batch(
@@ -1017,11 +1166,14 @@ mod tests {
         // version byte to 1 and drop the trailing (has_host = 0) host block. `decode` must accept
         // the older version and default host_range to None.
         idx.clear_host_range_for_test();
+        idx.clear_tenant_range_for_test();
         let mut v1 = idx.to_bytes();
         v1[4] = 1; // version byte (after the 4-byte magic)
+        v1.pop(); // strip the has_tenant = 0 byte that only exists in v3
         v1.pop(); // strip the has_host = 0 byte that only exists in v2
         let back = SkipIndex::from_bytes(&v1).unwrap();
         assert_eq!(back.host_range(), None);
+        assert_eq!(back.tenant_range(), None);
     }
 
     proptest! {

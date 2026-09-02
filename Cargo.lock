@@ -2859,6 +2859,7 @@ dependencies = [
  "photon-query",
  "photon-storage",
  "photon-wal",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

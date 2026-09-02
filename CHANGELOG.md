@@ -5,6 +5,113 @@ All notable changes to Photon are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+A **storage and compaction release**, and one operational scare. Compaction was measured against a
+copy of a real deployment (268M rows, 12 GB hot tier) and two things came out of it: the tier can be
+made meaningfully smaller without giving up read speed, and the node had **not merged anything for
+12 days** without saying so anywhere. Long-tail attribute values are now capped at ingest, the
+default zstd level moves to 6, a promoted key finally reaches data already on disk, `tenant` becomes
+a key that actually prunes on a federation central, and a stalled merge is now a number in the
+product rather than a line on stderr.
+
+**Upgrading.** No data migration exists and every existing Parquet file stays readable. Two things
+change under you. `[ingest].max_attribute_value_bytes` defaults to **2048 and is irreversible** —
+from the first restart, long-tail attribute values longer than 2 KiB are truncated at ingest and the
+rest of those bytes are gone; set it to `0` to keep the old behaviour. And `[storage].zstd_level`
+defaults to **6** instead of 1, which costs about 2.7× the compaction CPU; files written at the old
+level stay readable and re-encode as they pass through `merge_once`.
+
+### Added
+
+- **A stalled merge is visible in the product.** `merge_once` consolidates the pile of one-minute
+  Parquet files into bigger ones, and when it stops, nothing looks broken: ingest still acks, search
+  still answers, the file count just climbs and every query over those files gets slower. A
+  production node stopped merging on **2026-08-21 at 10:26** and nobody noticed for **12 days** — the
+  hot tier grew by exactly 1,440 unmerged files per signal per day, reaching **48,979 files** where a
+  healthy tier holds a few hundred, and a 7-day RED query went from 1.8 s to **14.9 s**. The only
+  trace was one stderr line repeating every 10 s.
+
+  `photon-server/src/merge_health.rs` now records each pass per signal behind the new
+  `photon_api::CompactionStatus` seam. `GET /api/storage` reports it as a `compaction` array
+  (`last_ok_ms`, `consecutive_failures`, `last_error`), and the `/data` Storage tab shows a
+  per-signal pill plus a banner when a signal is stalled — above the durable-replication band,
+  because replication lagging is a copy that has not landed yet while a stalled merge is a tier
+  quietly degrading. A merge always re-selects the same oldest files, so a non-zero streak is a
+  stall rather than a blip: the log prints the first three failures then only powers of two, each
+  carrying how long merging has been down. An idle pass that merged nothing counts as success.
+
+  **This makes the failure visible; it does not explain it.** The root cause of the 12-day stall is
+  still open and needs the node's stderr.
+
+- **`[ingest].max_attribute_value_bytes`** (default `2048`, `0` disables) truncates long-tail
+  attribute values at a UTF-8 char boundary as they are mapped into Arrow
+  (`photon-core/src/attr_limit.rs`). **Promoted attributes are deliberately not capped** — those are
+  the operator's chosen identity keys, and truncating one silently corrupts a filter. Measured on a
+  production span corpus: 8 KiB −0.2 %, 4 KiB −2.9 %, **2 KiB −10.8 %**, 1 KiB −20.6 %, 512 B
+  −30.8 %. On that corpus a single key, `db.query.text`, was **41 % of the whole span tier**, so a
+  targeted cap on one key beats a blanket one if you know which key it is.
+
+- **Offline storage probes** under `crates/photon-compact/examples/` — the tools every measurement
+  in this release came from: per-column footprint and zstd/row-group sweeps (`storage_probe`),
+  bytes-per-attribute-key (`attr_probe`), read-cost breakdown (`read_cost`), per-change shrink
+  attribution (`shrink_probe`), an N-tenant central simulation (`central_probe`), a whole-tier
+  offline recompaction (`recompact`), a real-query A/B bench (`query_bench`), and an integrity check
+  (`verify`). Dev-only, not compiled into `photon-server`.
+
+### Changed
+
+- **`[storage].zstd_level` defaults to 6, not 1.** −9 pp on spans, for ~2.7× the compaction CPU on a
+  task that idles most of the time. The trap this replaces is worth keeping in mind: **the level is
+  not monotonic.** Level 3 measured ~3 % *larger* than level 1 on this data, and 19 costs ~20× the
+  CPU for another ~2 pp. Do not guess it.
+
+- **The skip-index sidecar is format v3**, adding an inclusive `tenant` min/max range beside the v2
+  `host.name` one. Older v1/v2 sidecars decode that range as `None`, which per the conservative
+  pruning rule means *keep the file* — no migration, no rebuild.
+
+- **On a federation central, `tenant` now leads every signal's sort key** when the segment carries
+  the column (`stream::tenant_sort_key`; a no-op on a single install, where there is no such column
+  and the sort is byte-for-byte unchanged). This widens each file's `service.name` range on a
+  central, so service-based pruning there gets worse — a deliberate trade, because that pruning was
+  already dead: measured on the same corpus, a mid-alphabet service name kept **99 % of files**
+  anyway. See Performance below for what it buys.
+
+### Performance
+
+- **Promoting a key does not make it prune; leading the sort key does.** A promoted column that
+  nothing is ordered by has a min/max range spanning every value, so it prunes nothing. Measured on
+  a simulated 8-tenant central, `tenant:t3` read **100 % of the bytes** with `tenant` merely
+  promoted. `tenant` is now wired the whole way through — it leads all three sorts, the skip index
+  ranges over it, the manifest carries `FileEntry.tenant_range`, and `photon_query::tenant_excluded`
+  drops a file whose range cannot hold any requested tenant, before any sidecar is opened. Same
+  query after: **12.2 %**. Three shapes deliberately do not prune, because each can still match
+  outside the range — no `tenant` term at all, `-tenant:x`, and `tenant:*`. Same rule as the blooms:
+  keep a file you did not need, never drop one you did.
+
+- **A change to `promoted_attributes` now reaches data already on disk.** `align::hoist_promoted`
+  moves a promoted key's values out of the long-tail `attributes` map into its column whenever the
+  column is missing or all-NULL, on every compaction and merge (hoist first, align second). Before
+  this, a promotion only applied to segments written after the restart, and the read path kept
+  paying the map probe for a full retention period — on spans that map is 63 % of a file's bytes and
+  96 % of its decoded bytes, so the probe is most of the cost.
+
+- **Measured end to end on a 268M-row copy of a real deployment**: 48,979 files → **261**, 11.60 GiB
+  → **7.60 GiB** of Parquet, with identical query results.
+
+  | query | before | after |
+  | --- | --- | --- |
+  | logs search, 7 d | 986 ms | **27 ms** |
+  | logs search, 7 d, `text="error"` | 1,004 ms | **46 ms** |
+  | span search, 7 d, recent | 2,469 ms | **583 ms** |
+  | `/api/red` by service, 7 d | 14,945 ms | **1,826 ms** |
+
+  Two honest caveats. Most of that speed-up is **merging that should have been happening all
+  along**, not the tuning in this release — the 14.9 s number is a measure of how bad the 12-day
+  stall was. And the recompaction used a more aggressive attribute cap (512 B) and rounded log
+  timestamps to 1 ms, neither of which is a shipped default, so 7.60 GiB is an upper bound on what
+  these defaults alone deliver.
+
 ## [1.7.0] - 2026-08-24
 
 A **Backend release**: the Services / APM vertical, the landing page, and the read path underneath
@@ -811,6 +918,7 @@ operator-facing knobs. Fully backward compatible — no config or API breaking c
 - **Cached metric probe metadata** per engine (manifest-pointer invalidated), dropping a
   redundant prune + Parquet open per chart panel.
 
+[Unreleased]: https://github.com/nevindra/photon/compare/v1.7.0...HEAD
 [1.7.0]: https://github.com/nevindra/photon/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/nevindra/photon/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/nevindra/photon/compare/v1.4.0...v1.5.0

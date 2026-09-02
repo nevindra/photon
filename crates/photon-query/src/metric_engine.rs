@@ -72,6 +72,13 @@ pub(crate) struct MetricRequest {
     pub host: Option<String>,
 }
 
+impl MetricRequest {
+    /// The Sites this request pins, if any — see `MetricResolvedQuery::tenant_values`.
+    pub(crate) fn tenants(&self) -> Option<&[String]> {
+        self.filter.as_ref().and_then(|q| q.tenant_values())
+    }
+}
+
 /// The row predicate every metrics read shares: `metric_name = ?` AND `timestamp` in the window AND
 /// the compiled grammar filter. Applied after pruning so DataFusion's pushdown does the per-row
 /// work during Parquet decode. Bound literals only (no SQL string interpolation → no injection
@@ -247,7 +254,7 @@ impl MetricsQueryEngine {
         let manifest = self.load_metrics_manifest()?;
         let mut surviving: Vec<String> = Vec::new();
         for entry in manifest.candidates(req.start_ts_nanos, req.end_ts_nanos) {
-            if !self.keep_candidate(entry, &req.metric, req.host.as_deref())? {
+            if !self.keep_candidate(entry, &req.metric, req.host.as_deref(), req.tenants())? {
                 continue;
             }
             surviving.push(
@@ -292,7 +299,12 @@ impl MetricsQueryEngine {
                 let candidates = manifest.candidates(req.start_ts_nanos, req.end_ts_nanos);
                 let mut kept: Vec<String> = Vec::new();
                 for entry in &candidates[lo..hi] {
-                    if engine.keep_candidate(entry, &req.metric, req.host.as_deref())? {
+                    if engine.keep_candidate(
+                        entry,
+                        &req.metric,
+                        req.host.as_deref(),
+                        req.tenants(),
+                    )? {
                         kept.push(
                             engine
                                 .hot_dir
@@ -318,9 +330,10 @@ impl MetricsQueryEngine {
     }
 
     /// Decide whether a candidate file survives pruning. `manifest.candidates()` already filtered
-    /// on time overlap; the extra pruning power is the `metric_name` bloom — a single-token check,
-    /// like the spans `trace_id` bloom — plus, when a host is requested, the skip-index `host.name`
-    /// range. A missing, unreadable, OR corrupt `.idx` keeps the file (correctness over pruning) —
+    /// on time overlap; the extra pruning power is the manifest `tenant` range (a federation
+    /// central, checked first because it needs no sidecar), the `metric_name` bloom — a
+    /// single-token check, like the spans `trace_id` bloom — plus, when a host is requested, the
+    /// skip-index `host.name` range. A missing, unreadable, OR corrupt `.idx` keeps the file (correctness over pruning) —
     /// a torn sidecar never aborts the query or panics. Host pruning is conservative: an unknown
     /// host range keeps the file, so pruning can only ever drop files that provably cannot match —
     /// never a real result.
@@ -329,7 +342,16 @@ impl MetricsQueryEngine {
         entry: &FileEntry,
         metric: &str,
         host: Option<&str>,
+        tenants: Option<&[String]>,
     ) -> Result<bool, PhotonError> {
+        // On a federation central, the Site the query pinned must fall inside this file's tenant
+        // range. Manifest-only, so it runs BEFORE the sidecar read below and drops the file
+        // without any random I/O at all. It lives here rather than in `prune` because
+        // `prune_fanned` has its own copy of that loop and the two must agree exactly.
+        if crate::tenant_excluded(entry, tenants) {
+            return Ok(false);
+        }
+
         let idx_path = self
             .hot_dir
             .join(Storage::index_path_metrics(entry.segment_id));
@@ -613,6 +635,7 @@ mod tests {
                 durable: false,
                 attribute_keys: vec![],
                 bytes,
+                tenant_range: None,
             });
         }
         std::fs::write(hot.join(METRICS_MANIFEST_OBJECT_PATH), m.to_json().unwrap()).unwrap();

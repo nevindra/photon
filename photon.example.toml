@@ -18,6 +18,15 @@ token = "change-me-ingest-token"
 http_addr = "0.0.0.0:4318"
 # OTLP/gRPC receiver.
 grpc_addr = "0.0.0.0:4317"
+# Longest a single LONG-TAIL attribute value may be, in bytes; 0 disables the cap. Optional;
+# defaults to 2048. Enforced while OTLP is mapped into Arrow, so an oversized value is cut before
+# it reaches the WAL and costs nothing to fsync, compact, replicate or decode later. Measured on a
+# production span corpus, capping every value: -0.2% at 8192, -2.9% at 4096, -10.8% at 2048,
+# -20.6% at 1024, -30.8% at 512 — almost all of it one key, `db.query.text`, averaging 1,618
+# bytes on 16% of spans. TRUNCATION IS NOT REVERSIBLE: raise it if whole SQL statements matter
+# more than the bytes, or set 0 for the old unlimited behavior. Promoted attributes
+# (`[schema].promoted_attributes`) are never truncated — the read path filters and groups on them.
+max_attribute_value_bytes = 2048
 # Max concurrently in-flight LOGS requests (HTTP + gRPC combined) before excess requests wait
 # for a permit — bounds peak decoded-batch memory (roughly max_in_flight * max decoded batch
 # size) so a saturation burst can't pile decoded batches on the heap. Optional; defaults to 256.
@@ -38,14 +47,14 @@ hot_dir = "/var/lib/photon/hot"
 # Shared control-plane SQLite database: UI user accounts and uptime monitors.
 # Always used — required for login and by the always-on uptime subsystem.
 db_path = "/var/lib/photon/photon.db"
-# zstd compression level for compacted Parquet files. Range 1-19. Optional; defaults to 1.
-# Higher is NOT reliably smaller: measured on a production corpus (logs/spans/metrics), level 3
-# came out ~3% LARGER than level 1, because zstd changes strategy in a way that hurts these
-# small, already well-encoded pages. If you raise it, skip straight to 6 or 9 (~-9pp on spans for
-# ~2.7x the compaction CPU) and measure your own data. 19 costs ~20x the CPU and is rarely worth
-# it. Compaction CPU is off the ingest ack path, but on a rotational disk the extra rewrite I/O
-# competes with queries.
-# zstd_level = 1
+# zstd compression level for compacted Parquet files. Range 1-19. Optional; defaults to 6.
+# The level is charged to compaction, NOT to queries: decoding every column of the same file took
+# 88 ms at level 1, 88 ms at 6 and 86 ms at 12, because zstd's decompression speed barely moves
+# with the level. Against level 1 on merged files, level 6 measured logs -1.6%, spans -5.5%,
+# metrics -12.5%. Skip level 3 — on this corpus it lands within 0.2% of level 1 while costing
+# more. 19 costs ~20x the CPU and is rarely worth it. On a rotational disk the extra rewrite I/O
+# competes with queries even though the CPU does not.
+# zstd_level = 6
 
 # `[storage.durable]` is OPTIONAL. Omit the whole section to run hot-tier only (no
 # replication). When present, compacted objects are replicated hot -> durable to an

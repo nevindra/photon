@@ -16,6 +16,7 @@ futures = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = "3"
 photon-query = { path = "../photon-query" }
 tokio = { workspace = true }

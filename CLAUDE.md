@@ -216,10 +216,19 @@ photon-core     domain types only, no I/O: Arrow schemas (logs/spans/metrics), c
                 PhotonError enum. Everything depends on it.
 photon-wal      group-commit write-ahead log. Trait: Wal. DiskWal + BroadcastingWal (live-tail SSE).
 photon-index    skip-index format (bloom + min/max stats). Struct SkipIndex (NOT a trait). Pure.
+                Binary sidecar format v3: + an inclusive `tenant` min/max range beside the v2
+                `host.name` one; v1/v2 sidecars decode those as None = keep the file.
 photon-storage  hot + durable object_store wrappers + background Replicator. Concrete Storage +
                 Replicator (there is NO BlobStore trait).
 photon-compact  three per-signal compactors (Compactor/SpanCompactor/MetricsCompactor):
-                closed WAL segment → sort → Parquet + skip index → replicate → manifest; + merge_once.
+                closed WAL segment → hoist + align → sort → Parquet + skip index → replicate →
+                manifest; + merge_once. `align::hoist_promoted` moves a promoted key's values out
+                of the long-tail attributes map into its column when the column is missing or
+                all-NULL — this is what makes a change to `[schema].promoted_attributes` reach data
+                ALREADY on disk instead of only new segments. Hoist first, align second.
+                Default zstd level is **6** (`[storage].zstd_level`): −9 pp on spans against the old
+                default of 1, for ~2.7x compaction CPU on a task that idles most of the time. Level
+                3 measures ~3% LARGER than 1 — the level is not monotonic, don't guess it.
 photon-query    three engines: QueryEngine (logs), SpanQueryEngine (traces/APM/RED), MetricsQueryEngine
                 (metrics + RUM vitals). Reassembles Prometheus classic histograms (`le`-bucket →
                 quantile) at query time. Manifest + skip-index pruning, then DataFusion over survivors.
@@ -248,7 +257,12 @@ photon-ingest   OTLP gRPC (tonic) + HTTP (axum) receivers for logs/traces/metric
                 the sync `DeploymentWatcher` seam (photon-server implements it over SQLite). + Prometheus remote-write 1.0 (/api/v1/write,
                 snappy+protobuf → metrics WAL; rejects tenant tokens). Both front doors accept gzipped
                 requests (stock OTel Collector gzips by default) and share one `[ingest].max_body_bytes`
-                cap (~16 MiB) enforced on the *decompressed* size.
+                cap (~16 MiB) enforced on the *decompressed* size. Long-tail attribute VALUES are
+                truncated at `[ingest].max_attribute_value_bytes` (default 2048, 0 = off) on a UTF-8
+                char boundary (`photon-core/src/attr_limit.rs`); promoted attributes are deliberately
+                NOT capped, since truncating an operator's chosen identity key corrupts a filter.
+                Measured on a production span corpus: 8 KiB −0.2%, 4 KiB −2.9%, 2 KiB −10.8%,
+                1 KiB −20.6%, 512 B −30.8%. Irreversible — the bytes are gone at ingest.
 photon-uptime   always-on synthetic HTTP/TCP/ICMP monitors → embedded SQLite. Trait: UptimeStore.
 photon-alerts   system-wide webhook alert engine: per-signal rules (metrics/logs/traces/RUM), a pure
                 Ok→Pending→Triggered state machine per (rule, series), SQLite rules/channels/incidents,
@@ -259,10 +273,18 @@ photon-alerts   system-wide webhook alert engine: per-signal rules (metrics/logs
                 config tunes `interval_default` (60s) and `worker_concurrency` (16) — no rule/channel
                 config surface, everything is UI/SQLite-managed.
 photon-api      axum REST + session auth (argon2, signed cookies) + embedded Vue UI. Defines trait
-                seams RumSink/RumAppStore/UserStore/UsageStore/ReplicationStatus/DataAdmin (photon-api
-                can't dep photon-wal).
+                seams RumSink/RumAppStore/UserStore/UsageStore/ReplicationStatus/CompactionStatus/
+                DataAdmin (photon-api can't dep photon-wal).
 photon-server   the binary: config load, wiring, background-task supervision (3 compactor loops, the
-                alert-engine scheduler, the service-rollup pass, etc.). `rollup/` turns spans into
+                alert-engine scheduler, the service-rollup pass, etc.). `merge_health.rs` records
+                each `merge_once` pass per signal behind the `CompactionStatus` seam, so a stalled
+                merge shows up on `GET /api/data/storage` and the /data Storage tab instead of only
+                on stderr — a production node once merged nothing for 12 days and grew to 48,979
+                files (1,440/signal/day) with a 7d RED query at 14.9s against a healthy 1.8s, and
+                the only trace of it was one stderr line repeating every 10s. A merge re-selects the
+                same OLDEST files every pass, so a non-zero streak is a stall, not a blip; the log
+                prints the first 3 failures then only powers of two, each carrying how long merging
+                has been down. An idle pass that merged nothing counts as SUCCESS. `rollup/` turns spans into
                 per-service `photon.service.*` and per-operation `photon.operation.*` metrics —
                 60s buckets, each published EXACTLY ONCE behind a SQLite watermark (the metrics
                 reader sums a bucket, it does not de-duplicate, so re-emitting would multiply every
@@ -333,6 +355,15 @@ token bloom), and only then reads the surviving **local** Parquet with DataFusio
   over `host.name` (binary sidecar format v2; older v1 sidecars decode with `host_range = None`,
   which — per the conservative-pruning rule above — keeps the file). See
   [`docs/subsystems/infra.md`](docs/subsystems/infra.md).
+- **Promoting a key does not make it prune; leading the sort key does.** A promoted column nothing
+  is ordered by has a min/max range spanning every value, so it prunes nothing. `tenant` is the one
+  key wired the whole way through: all three sorts lead with it when the segment carries the column
+  (`stream::tenant_sort_key`, a no-op on a single install), the skip index ranges over it (v3), the
+  manifest carries `FileEntry.tenant_range`, and `photon_query::tenant_excluded` drops a file whose
+  range cannot hold any requested tenant. Measured on a simulated 8-tenant central: 100% of bytes
+  read with `tenant` merely promoted, **12.2%** with it leading the sort. Three shapes deliberately
+  do NOT prune, because each can still match outside the range — no `tenant` term, `-tenant:x`, and
+  `tenant:*`. Same rule as the blooms: keep a file you didn't need, never drop one you did.
 - **`search` is two-pass (late materialization).** Pass 1 applies the predicate but projects *only*
   `timestamp`, sorts DESC, takes `limit`, finds the cutoff; pass 2 re-runs with `timestamp >= cutoff`
   and returns full rows — so the wide `attributes` map is decoded only for surviving rows. Don't

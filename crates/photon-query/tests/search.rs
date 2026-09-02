@@ -84,6 +84,7 @@ fn entry_from(records: &[LogRecord], seg: SegmentId) -> FileEntry {
         durable: false,
         attribute_keys: Vec::new(),
         bytes: 0,
+        tenant_range: None,
     }
 }
 

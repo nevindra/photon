@@ -49,6 +49,9 @@ mod alerts_source;
 /// Tenant-side federation: the summary pusher (always on when `[federation]` is present) and,
 /// in `full` mode, the OTLP tee/forwarder that mirrors raw batches to central.
 mod federation;
+/// Merge visibility: per-signal `merge_once` health, surfaced on `/api/data/storage` and logged
+/// on an escalating ladder so a stalled merge can never go unnoticed for days again.
+mod merge_health;
 /// The `photon.service.*` rollup: spans → per-service RED published as ordinary metrics, so
 /// the Backend pages can read a wide window without re-scanning raw spans (ADR-0002).
 mod rollup;
@@ -135,6 +138,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cloned()
         .or_else(|| std::env::var("PHOTON_CONFIG").ok());
     let cfg = Config::load(explicit)?;
+
+    // Install the attribute-value cap before any receiver is mounted: every batch builder reads
+    // it at construction, so a value that arrives after this line is capped and one that somehow
+    // arrived before it is not. See `photon_core::attr_limit`.
+    photon_core::attr_limit::set_max_attribute_value_bytes(cfg.ingest.max_attribute_value_bytes);
+    if cfg.ingest.max_attribute_value_bytes > 0 {
+        eprintln!(
+            "attribute values capped at {} bytes (long-tail only; promoted keys are never truncated)",
+            cfg.ingest.max_attribute_value_bytes
+        );
+    }
 
     // Size the one shared DataFusion memory pool before any engine is built — `photon-query`
     // builds its `RuntimeEnv` lazily on the first query, so this has to land first. See
@@ -353,6 +367,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx_traces, rx_traces) = tokio::sync::mpsc::channel::<PurgeCommand>(1);
     let (tx_metrics, rx_metrics) = tokio::sync::mpsc::channel::<PurgeCommand>(1);
 
+    // Shared merge health, declared outside the gate below so `/api/data/storage` can report
+    // "no pass has ever succeeded" on a node running with `PHOTON_DISABLE_COMPACTION` too — that
+    // is a true and useful answer, and hiding the field there would just make the page lie.
+    let merge_health = Arc::new(merge_health::MergeHealth::new());
+
     // Background compactors (one per signal): each drains closed WAL segments (incl. those
     // recovered on startup = WAL replay) into Parquet, occasionally merges small files, applies
     // hourly retention, and enqueues compacted objects into the shared `Replicator`. Each also
@@ -368,6 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rx_logs,
             retention.clone(),
             cfg.storage.zstd_level,
+            merge_health.clone(),
         );
         let traces_handle = spawn_span_compactor(
             spans_wal.clone(),
@@ -377,6 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rx_traces,
             retention.clone(),
             cfg.storage.zstd_level,
+            merge_health.clone(),
         );
         let metrics_handle = spawn_metric_compactor(
             metrics_wal.clone(),
@@ -386,6 +407,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rx_metrics,
             retention.clone(),
             cfg.storage.zstd_level,
+            merge_health.clone(),
         );
         // These loops are meant to run forever; if one ever completes it means its body panicked
         // and that signal's compaction has silently stopped (WAL segments then accumulate until
@@ -695,6 +717,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_data_admin(Some(data_admin))
     .with_live_hub(live_hub)
     .with_usage(usage.clone(), repl_status.clone())
+    // Merge health rides on the same page as the footprint it explains: a hot tier that is
+    // growing in file count while merging is down is the exact pair of numbers you need together.
+    .with_compaction_status(merge_health.clone())
     .with_rum(rum_api)
     .with_tenant_store(tenant_api)
     .with_federation_status(Some(federation_status))
@@ -866,6 +891,7 @@ fn spawn_compactor(
     mut purge_rx: tokio::sync::mpsc::Receiver<PurgeCommand>,
     retention: Arc<RetentionAtomics>,
     zstd_level: i32,
+    health: Arc<crate::merge_health::MergeHealth>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let compactor =
@@ -889,9 +915,10 @@ fn spawn_compactor(
 
                     tick = tick.wrapping_add(1);
                     if tick.is_multiple_of(MERGE_EVERY_TICKS) {
-                        if let Err(e) = compactor.merge_once().await {
-                            eprintln!("compactor: merge_once failed: {e}");
-                        }
+                        // Recorded, not just logged: a merge that starts failing fails on every
+                        // pass forever (it re-selects the same oldest files), and the stderr line
+                        // alone once hid a 12-day stall. See `merge_health`.
+                        health.record("logs", "compactor", compactor.merge_once().await.map(|_| ()));
                     }
 
                     // Hourly retention: purge whole Parquet files older than the live cutoff.
@@ -927,6 +954,7 @@ fn spawn_span_compactor(
     mut purge_rx: tokio::sync::mpsc::Receiver<PurgeCommand>,
     retention: Arc<RetentionAtomics>,
     zstd_level: i32,
+    health: Arc<crate::merge_health::MergeHealth>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let compactor = SpanCompactor::new(wal, storage, Arc::new(replicator), schema)
@@ -947,9 +975,10 @@ fn spawn_span_compactor(
                     }
                     tick = tick.wrapping_add(1);
                     if tick.is_multiple_of(MERGE_EVERY_TICKS) {
-                        if let Err(e) = compactor.merge_once().await {
-                            eprintln!("span-compactor: merge_once failed: {e}");
-                        }
+                        // Recorded, not just logged: a merge that starts failing fails on every
+                        // pass forever (it re-selects the same oldest files), and the stderr line
+                        // alone once hid a 12-day stall. See `merge_health`.
+                        health.record("traces", "span-compactor", compactor.merge_once().await.map(|_| ()));
                     }
                     if tick.is_multiple_of(PURGE_EVERY_TICKS) {
                         let days = retention.traces.load(std::sync::atomic::Ordering::Relaxed) as i64;
@@ -980,6 +1009,7 @@ fn spawn_metric_compactor(
     mut purge_rx: tokio::sync::mpsc::Receiver<PurgeCommand>,
     retention: Arc<RetentionAtomics>,
     zstd_level: i32,
+    health: Arc<crate::merge_health::MergeHealth>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let compactor = MetricsCompactor::new(wal, storage, Arc::new(replicator), schema)
@@ -1000,9 +1030,10 @@ fn spawn_metric_compactor(
                     }
                     tick = tick.wrapping_add(1);
                     if tick.is_multiple_of(MERGE_EVERY_TICKS) {
-                        if let Err(e) = compactor.merge_once().await {
-                            eprintln!("metric-compactor: merge_once failed: {e}");
-                        }
+                        // Recorded, not just logged: a merge that starts failing fails on every
+                        // pass forever (it re-selects the same oldest files), and the stderr line
+                        // alone once hid a 12-day stall. See `merge_health`.
+                        health.record("metrics", "metric-compactor", compactor.merge_once().await.map(|_| ()));
                     }
                     if tick.is_multiple_of(PURGE_EVERY_TICKS) {
                         let days = retention.metrics.load(std::sync::atomic::Ordering::Relaxed) as i64;

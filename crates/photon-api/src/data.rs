@@ -107,10 +107,15 @@ pub(crate) async fn storage(
         None => None,
     };
 
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "signals": signals,
         "durable": { "configured": configured, "pending": pending, "last_replicated_ms": last_replicated_ms },
-    })))
+    });
+    // Merge health, so a stalled compactor is visible here instead of only in stderr.
+    if let Some(c) = st.compaction.as_ref() {
+        body["compaction"] = serde_json::to_value(c.snapshot()).unwrap();
+    }
+    Ok(Json(body))
 }
 
 // ---- GET/PUT /retention -------------------------------------------------------------------
@@ -339,6 +344,27 @@ mod tests {
             .into_router()
     }
 
+    /// A compactor whose logs merge has been failing since the node started.
+    struct FakeCompaction;
+    impl crate::usage::CompactionStatus for FakeCompaction {
+        fn snapshot(&self) -> Vec<crate::usage::CompactionHealth> {
+            vec![
+                crate::usage::CompactionHealth {
+                    signal: "logs",
+                    last_ok_ms: None,
+                    consecutive_failures: 97,
+                    last_error: Some("parquet: invalid footer".into()),
+                },
+                crate::usage::CompactionHealth {
+                    signal: "traces",
+                    last_ok_ms: Some(1_751_000_000_000),
+                    consecutive_failures: 0,
+                    last_error: None,
+                },
+            ]
+        }
+    }
+
     /// Build a `DataAdmin` whose three purge channels are each drained by a stub task that
     /// replies `PurgeReport { files_removed: 1, rows_removed: 5 }` — mimicking a compactor loop.
     fn stub_data_admin() -> DataAdmin {
@@ -507,5 +533,59 @@ mod tests {
             v["durable"]["last_replicated_ms"],
             json!(1_751_000_000_000i64)
         );
+    }
+
+    /// Merge health is only present when the seam is attached: a node with no compactor wired in
+    /// (`PHOTON_DISABLE_COMPACTION`, or a test router) must not grow a fake "healthy" field.
+    #[tokio::test]
+    async fn storage_omits_compaction_when_no_compactor_is_attached() {
+        let app = router_with_usage();
+        let cookie = crate::session_cookie(&app).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/storage")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert!(v.get("compaction").is_none());
+    }
+
+    /// The one number the 12-day production stall needed: a per-signal failure streak, on the same
+    /// page as the footprint it explains.
+    #[tokio::test]
+    async fn storage_reports_a_stalled_merge_per_signal() {
+        let app = crate::test_server()
+            .with_usage(Arc::new(FakeUsage), Arc::new(FakeRepl))
+            .with_compaction_status(Arc::new(FakeCompaction))
+            .into_router();
+        let cookie = crate::session_cookie(&app).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/storage")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+
+        assert_eq!(v["compaction"][0]["signal"], json!("logs"));
+        assert_eq!(v["compaction"][0]["consecutive_failures"], json!(97));
+        assert_eq!(v["compaction"][0]["last_ok_ms"], json!(null));
+        assert_eq!(
+            v["compaction"][0]["last_error"],
+            json!("parquet: invalid footer")
+        );
+        assert_eq!(v["compaction"][1]["consecutive_failures"], json!(0));
     }
 }

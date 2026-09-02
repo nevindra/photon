@@ -60,6 +60,14 @@ pub struct SpanBatchBuilder {
     /// `schema.promoted` as a set, so attribute routing is an O(1) lookup
     /// instead of an O(promoted) linear scan per attribute.
     promoted_set: HashSet<String>,
+    /// Cap on the byte length of one **long-tail** attribute value, from
+    /// `[ingest].max_attribute_value_bytes` via [`crate::attr_limit`]; `0` is no cap. Read once
+    /// here rather than per row so a builder's limit cannot change mid-batch.
+    ///
+    /// Promoted attributes are deliberately NOT capped: they are the operator's chosen identity
+    /// keys, and the read path filters and groups on them, so a truncated `service.name` would
+    /// silently split a service in two. The long tail has no such contract.
+    max_attr_bytes: usize,
     trace_id: StringBuilder,
     span_id: StringBuilder,
     parent_span_id: StringBuilder,
@@ -80,10 +88,19 @@ pub struct SpanBatchBuilder {
 }
 
 impl SpanBatchBuilder {
+    /// Override the process-wide attribute-value cap for this builder. Production sets the cap
+    /// once via [`crate::attr_limit::set_max_attribute_value_bytes`]; this exists so a test can
+    /// exercise truncation without touching global state that other tests share.
+    pub fn with_max_attribute_value_bytes(mut self, bytes: usize) -> Self {
+        self.max_attr_bytes = bytes;
+        self
+    }
+
     pub fn new(schema: &SpanSchema) -> SpanBatchBuilder {
         SpanBatchBuilder {
             schema: schema.clone(),
             promoted_set: schema.promoted.iter().cloned().collect(),
+            max_attr_bytes: crate::attr_limit::max_attribute_value_bytes(),
             trace_id: StringBuilder::new(),
             span_id: StringBuilder::new(),
             parent_span_id: StringBuilder::new(),
@@ -117,6 +134,7 @@ impl SpanBatchBuilder {
         SpanBatchBuilder {
             schema: schema.clone(),
             promoted_set: schema.promoted.iter().cloned().collect(),
+            max_attr_bytes: crate::attr_limit::max_attribute_value_bytes(),
             trace_id: StringBuilder::with_capacity(rows, rows * 32),
             span_id: StringBuilder::with_capacity(rows, rows * 16),
             parent_span_id: StringBuilder::with_capacity(rows, rows * 16),
@@ -173,7 +191,9 @@ impl SpanBatchBuilder {
                 continue;
             }
             self.attributes.keys().append_value(k);
-            self.attributes.values().append_value(v);
+            self.attributes
+                .values()
+                .append_value(crate::attr_limit::cap_value(v, self.max_attr_bytes));
         }
         self.attributes.append(true).expect("map row append");
     }
@@ -213,7 +233,9 @@ impl SpanBatchBuilder {
                 continue;
             }
             self.attributes.keys().append_value(k);
-            self.attributes.values().append_value(v);
+            self.attributes
+                .values()
+                .append_value(crate::attr_limit::cap_value(v, self.max_attr_bytes));
         }
         self.attributes.append(true).expect("map row append");
     }
@@ -343,7 +365,7 @@ pub fn span_record_from_batch(batch: &RecordBatch, row: usize) -> SpanRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, StringArray, TimestampNanosecondArray};
+    use arrow::array::{Array, MapArray, StringArray, TimestampNanosecondArray};
 
     fn span(trace: &str, svc: &str, start: i64) -> SpanRecord {
         let mut attributes = BTreeMap::new();
@@ -356,6 +378,52 @@ mod tests {
             attributes,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_long_tail_span_attribute_is_capped_and_a_promoted_one_is_not() {
+        // Spans are where this earns its keep: on a production corpus `db.query.text` averaged
+        // 1,618 bytes on 16% of spans and was 41% of the Parquet file on its own.
+        let schema = SpanSchema::new(&["service.name".to_string()]);
+        let long_service = "a".repeat(40);
+        let long_query = "b".repeat(40);
+        let mut rec = span("abc", &long_service, 1);
+        rec.attributes
+            .insert("db.query.text".to_string(), long_query);
+        let mut b = SpanBatchBuilder::new(&schema).with_max_attribute_value_bytes(8);
+        b.append(&rec);
+        let batch = b.finish().unwrap();
+
+        let map = batch
+            .column_by_name(crate::schema::ATTRIBUTES)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap()
+            .clone();
+        let entries = map.entries();
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let i = (0..keys.len())
+            .find(|i| keys.value(*i) == "db.query.text")
+            .expect("db.query.text is in the map");
+        assert_eq!(values.value(i), "bbbbbbbb");
+
+        let svc = batch
+            .column_by_name("service.name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(svc.value(0), long_service);
     }
 
     #[test]

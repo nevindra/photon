@@ -417,6 +417,9 @@ struct CompactedOut {
     max_service: String,
     row_count: u64,
     attribute_keys: Vec<String>,
+    /// Inclusive min/max of the promoted `tenant` column, straight from the skip index. `None`
+    /// when the segment carries no `tenant` column — see `stream::tenant_sort_key`.
+    tenant_range: Option<(String, String)>,
     /// On-disk size of the streamed Parquet file, `stat`ed right after the write on the blocking
     /// thread. Recorded into `FileEntry.bytes` so `storage_stats` is manifest arithmetic.
     bytes: u64,
@@ -437,6 +440,7 @@ impl CompactedOut {
             durable: false,
             attribute_keys: self.attribute_keys.clone(),
             bytes: self.bytes,
+            tenant_range: self.tenant_range.clone(),
         }
     }
 }
@@ -469,6 +473,7 @@ fn compact_segment(
     let (min_ts, max_ts) = index.timestamp_range().unwrap_or((0, 0));
     let (min_service, max_service) = index.service_range().unwrap_or_default();
     let attribute_keys = attribute_keys(&sorted);
+    let tenant_range = index.tenant_range();
 
     Ok(CompactedOut {
         index: index.to_bytes(),
@@ -478,6 +483,7 @@ fn compact_segment(
         max_service,
         row_count: sorted.num_rows() as u64,
         attribute_keys,
+        tenant_range,
         bytes,
     })
 }
@@ -511,12 +517,22 @@ fn concat(schema: &LogSchema, batches: &[RecordBatch]) -> Result<RecordBatch, Ph
     // batch clones `Arc`s, so the WAL path pays nothing for it.
     let aligned: Vec<RecordBatch> = batches
         .iter()
-        .map(|b| crate::align::align_to(b, &schema.arrow))
+        .map(|b| {
+            // Hoist first, align second. A file written before a key was promoted still carries
+            // it in the map, and `align_to` alone would fill the new column with NULLs and leave
+            // it there; hoisting moves it, which is what lets the manifest stop declaring the key
+            // and the read path finally drop the `attributes` map from its plan
+            // (`span_engine::attr_lookup`). No-op on the WAL path, where the builder already
+            // routed promoted keys out of the map.
+            let hoisted = crate::align::hoist_promoted(b, &schema.promoted)?;
+            crate::align::align_to(&hoisted, &schema.arrow)
+        })
         .collect::<Result<_, _>>()?;
     concat_batches(&schema.arrow, &aligned).map_err(|e| PhotonError::Arrow(e.to_string()))
 }
 
-/// Stable lexicographic sort by `(service.name, timestamp)` via the Arrow sort kernels.
+/// Stable lexicographic sort by `(service.name, timestamp)` via the Arrow sort kernels, prefixed
+/// with `tenant` on a federation central.
 fn sort_by_service_and_timestamp(batch: &RecordBatch) -> Result<RecordBatch, PhotonError> {
     let service = batch.column_by_name(SERVICE_NAME_COLUMN).ok_or_else(|| {
         PhotonError::Arrow(format!("batch is missing the {SERVICE_NAME_COLUMN} column"))
@@ -525,16 +541,18 @@ fn sort_by_service_and_timestamp(batch: &RecordBatch) -> Result<RecordBatch, Pho
         PhotonError::Arrow(format!("batch is missing the {} column", schema::TIMESTAMP))
     })?;
 
-    let sort_columns = vec![
-        SortColumn {
-            values: service.clone(),
-            options: None,
-        },
-        SortColumn {
-            values: timestamp.clone(),
-            options: None,
-        },
-    ];
+    // `tenant` leads when the segment carries it (a federation central); on a single install
+    // there is no such column and the key below is unchanged. See `stream::tenant_sort_key`.
+    let mut sort_columns: Vec<SortColumn> =
+        crate::stream::tenant_sort_key(batch).into_iter().collect();
+    sort_columns.push(SortColumn {
+        values: service.clone(),
+        options: None,
+    });
+    sort_columns.push(SortColumn {
+        values: timestamp.clone(),
+        options: None,
+    });
     let indices =
         lexsort_to_indices(&sort_columns, None).map_err(|e| PhotonError::Arrow(e.to_string()))?;
     take_record_batch(batch, &indices).map_err(|e| PhotonError::Arrow(e.to_string()))

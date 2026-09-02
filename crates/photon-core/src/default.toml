@@ -8,6 +8,11 @@
 token = ""
 http_addr = "0.0.0.0:4318"
 grpc_addr = "0.0.0.0:4317"
+# Longest a single long-tail attribute value may be, in bytes; 0 disables the cap. Enforced while
+# OTLP is mapped into Arrow, so an oversized value never reaches the WAL. On a production span
+# corpus this default cost 10.8% of the Parquet file (512 would have cost 30.8%), almost all of it
+# `db.query.text`. Truncation is NOT reversible. Promoted attributes are never truncated.
+max_attribute_value_bytes = 2048
 
 [storage]
 hot_dir = "/var/lib/photon/hot"

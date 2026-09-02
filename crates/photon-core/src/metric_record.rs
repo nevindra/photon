@@ -63,6 +63,14 @@ pub struct MetricBatchBuilder {
     /// `schema.promoted` as a set, so attribute routing is an O(1) lookup
     /// instead of an O(promoted) linear scan per attribute.
     promoted_set: HashSet<String>,
+    /// Cap on the byte length of one **long-tail** attribute value, from
+    /// `[ingest].max_attribute_value_bytes` via [`crate::attr_limit`]; `0` is no cap. Read once
+    /// here rather than per row so a builder's limit cannot change mid-batch.
+    ///
+    /// Promoted attributes are deliberately NOT capped: they are the operator's chosen identity
+    /// keys, and the read path filters and groups on them, so a truncated `service.name` would
+    /// silently split a service in two. The long tail has no such contract.
+    max_attr_bytes: usize,
     metric_name: StringBuilder,
     metric_type: Int32Builder,
     type_text: StringBuilder,
@@ -82,6 +90,14 @@ pub struct MetricBatchBuilder {
 }
 
 impl MetricBatchBuilder {
+    /// Override the process-wide attribute-value cap for this builder. Production sets the cap
+    /// once via [`crate::attr_limit::set_max_attribute_value_bytes`]; this exists so a test can
+    /// exercise truncation without touching global state that other tests share.
+    pub fn with_max_attribute_value_bytes(mut self, bytes: usize) -> Self {
+        self.max_attr_bytes = bytes;
+        self
+    }
+
     pub fn new(schema: &MetricSchema) -> MetricBatchBuilder {
         MetricBatchBuilder::with_capacity(schema, 0)
     }
@@ -93,6 +109,7 @@ impl MetricBatchBuilder {
             schema: schema.arrow.clone(),
             promoted_names: schema.promoted.clone(),
             promoted_set: schema.promoted.iter().cloned().collect(),
+            max_attr_bytes: crate::attr_limit::max_attribute_value_bytes(),
             metric_name: StringBuilder::with_capacity(rows, rows * 16),
             metric_type: Int32Builder::with_capacity(rows),
             type_text: StringBuilder::new(),
@@ -143,7 +160,9 @@ impl MetricBatchBuilder {
                 continue;
             }
             self.attributes.keys().append_value(k);
-            self.attributes.values().append_value(v);
+            self.attributes
+                .values()
+                .append_value(crate::attr_limit::cap_value(v, self.max_attr_bytes));
         }
         self.attributes.append(true).expect("map row append");
     }
@@ -184,7 +203,9 @@ impl MetricBatchBuilder {
                 continue;
             }
             self.attributes.keys().append_value(k);
-            self.attributes.values().append_value(v);
+            self.attributes
+                .values()
+                .append_value(crate::attr_limit::cap_value(v, self.max_attr_bytes));
         }
         self.attributes.append(true).expect("map row append");
     }

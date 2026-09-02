@@ -61,7 +61,8 @@ pub use rum::{RumApi, RumSink};
 pub use stream::LiveHub;
 pub use tenants::TenantApi;
 pub use usage::{
-    signal_from_path, ReplicationStatus, SqliteUsageStore, UsageSampleRow, UsageStore,
+    signal_from_path, CompactionHealth, CompactionStatus, ReplicationStatus, SqliteUsageStore,
+    UsageSampleRow, UsageStore,
 };
 
 /// The Photon HTTP server: a query engine, the human user table, and a cookie signing key.
@@ -90,6 +91,9 @@ pub struct ApiServer {
     /// A live view of the durable replicator (configured + pending queue depth). `None` reports
     /// `durable.configured=false` — set via [`ApiServer::with_usage`].
     replication: Option<Arc<dyn usage::ReplicationStatus>>,
+    /// A live view of the three compactors' merge passes. `None` omits `compaction` from
+    /// `/api/data/storage` — set via [`ApiServer::with_compaction_status`].
+    compaction: Option<Arc<dyn usage::CompactionStatus>>,
     /// The RUM subsystem (the SQLite-backed app registry + the metrics/logs write sink). `None`
     /// keeps `POST /api/rum` returning 404 — set via [`ApiServer::with_rum`].
     rum: Option<rum::RumApi>,
@@ -136,6 +140,8 @@ pub(crate) struct AppStateInner {
     // Read by the reshaped `GET /api/storage` handler (Task 6, in `data.rs`); only written here.
     #[allow(dead_code)]
     pub(crate) replication: Option<Arc<dyn usage::ReplicationStatus>>,
+    /// The compactors' merge health; read by the `GET /api/data/storage` handler (`data.rs`).
+    pub(crate) compaction: Option<Arc<dyn usage::CompactionStatus>>,
     /// The RUM subsystem; read by the public `beacon` handler (`rum.rs`). `None` disables `/rum`.
     pub(crate) rum: Option<rum::RumApi>,
     /// The alerts vertical; read by `alerts.rs`. `None` disables `/api/alerts/*`.
@@ -195,7 +201,15 @@ impl ApiServer {
             rollup: None,
             deployments: None,
             slos: None,
+            compaction: None,
         }
+    }
+
+    /// Attach a live view of the three compactors' merge passes (built by `photon-server`).
+    /// Leaving it unset omits `compaction` from `GET /api/data/storage`.
+    pub fn with_compaction_status(mut self, status: Arc<dyn usage::CompactionStatus>) -> Self {
+        self.compaction = Some(status);
+        self
     }
 
     /// Attach the uptime-vertical REST layer (built by `photon-server`). Leaving this unset
@@ -317,6 +331,7 @@ impl ApiServer {
             live: self.live,
             usage: self.usage,
             replication: self.replication,
+            compaction: self.compaction,
             rum: self.rum,
             alerts: self.alerts,
             tenants: self.tenants,
@@ -600,6 +615,7 @@ pub(crate) fn test_state_with_rum(rum: Option<rum::RumApi>) -> AppState {
         live: s.live,
         usage: s.usage,
         replication: s.replication,
+        compaction: s.compaction,
         rum,
         alerts: s.alerts,
         tenants: s.tenants,
@@ -630,6 +646,7 @@ pub(crate) fn test_state_with_tenants_and_metrics(
         live: s.live,
         usage: s.usage,
         replication: s.replication,
+        compaction: s.compaction,
         rum: s.rum,
         alerts: s.alerts,
         tenants,
@@ -660,6 +677,7 @@ pub(crate) fn test_state_for_slo(
         live: s.live,
         usage: s.usage,
         replication: s.replication,
+        compaction: s.compaction,
         rum: s.rum,
         alerts: s.alerts,
         tenants: s.tenants,
@@ -689,6 +707,7 @@ pub(crate) fn test_state_with_rollup(
         live: s.live,
         usage: s.usage,
         replication: s.replication,
+        compaction: s.compaction,
         rum: s.rum,
         alerts: s.alerts,
         tenants: s.tenants,
@@ -716,6 +735,7 @@ pub(crate) fn test_state_with_tenants(tenants: Option<tenants::TenantApi>) -> Ap
         live: s.live,
         usage: s.usage,
         replication: s.replication,
+        compaction: s.compaction,
         rum: s.rum,
         alerts: s.alerts,
         tenants,

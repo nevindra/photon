@@ -67,6 +67,34 @@ pub struct ResolvedQuery {
     pub terms: Vec<ResolvedTerm>,
 }
 
+impl ResolvedQuery {
+    /// The exact `tenant` values a matching row must have, when the query pins one.
+    ///
+    /// A federation central stamps `tenant` on every row it accepts, and the UI's Site picker
+    /// puts a `tenant:<name>` term on every query, so this is the dimension a central actually
+    /// filters by. The engine keeps a segment only when its `FileEntry::tenant_range` overlaps
+    /// one of these values — a manifest-only check, no sidecar read.
+    ///
+    /// `None` means the query says nothing about `tenant`, so every file is kept. Only un-negated
+    /// `Match` terms count: `-tenant:x` is *satisfied* by a row with no tenant at all, and
+    /// `tenant:*` is an existence test rather than a value. Terms are AND-ed, so the first such
+    /// term is a genuine requirement and pruning on it alone is sound.
+    pub fn tenant_values(&self) -> Option<&[String]> {
+        self.terms.iter().find_map(|t| {
+            if t.negated {
+                return None;
+            }
+            let ResolvedKind::Match { field, values } = &t.kind else {
+                return None;
+            };
+            let (FieldRef::Attr(k) | FieldRef::MapAttr(k)) = field else {
+                return None;
+            };
+            (k == crate::TENANT_ATTRIBUTE && !values.is_empty()).then_some(values.as_slice())
+        })
+    }
+}
+
 pub struct FieldResolver {
     promoted: HashSet<String>,
 }
@@ -167,6 +195,47 @@ mod tests {
     use super::*;
     use crate::query::ast::Cmp;
     use crate::query::parse;
+
+    /// `tenant_values` is the whole file-level prune input on a federation central, so its
+    /// boundaries are worth pinning: promoted or not, single or OR-list, and the three shapes
+    /// that must NOT prune.
+    #[test]
+    fn tenant_values_reads_the_pinned_sites_and_nothing_else() {
+        let r = FieldResolver::new(&["service.name".to_string(), "tenant".to_string()]);
+        let q = |s: &str| r.resolve(&parse(s).unwrap()).unwrap();
+
+        // promoted → FieldRef::Attr
+        assert_eq!(
+            q("tenant:jkt").tenant_values(),
+            Some(&["jkt".to_string()][..])
+        );
+        // OR-list: any of them may be in the file
+        assert_eq!(
+            q("tenant:jkt,sgp").tenant_values(),
+            Some(&["jkt".to_string(), "sgp".to_string()][..])
+        );
+        // beside other terms, in either order
+        assert_eq!(
+            q("service.name:api tenant:jkt level:error").tenant_values(),
+            Some(&["jkt".to_string()][..])
+        );
+
+        // long-tail (a central that has not promoted it yet) → FieldRef::MapAttr, same answer
+        let unpromoted = FieldResolver::new(&["service.name".to_string()]);
+        assert_eq!(
+            unpromoted
+                .resolve(&parse("tenant:jkt").unwrap())
+                .unwrap()
+                .tenant_values(),
+            Some(&["jkt".to_string()][..])
+        );
+
+        // Nothing to prune on: no term, a NEGATED term (satisfied by a row with no tenant at
+        // all), and an existence test (not a value).
+        assert_eq!(q("service.name:api").tenant_values(), None);
+        assert_eq!(q("-tenant:jkt").tenant_values(), None);
+        assert_eq!(q("tenant:*").tenant_values(), None);
+    }
 
     fn resolver() -> FieldResolver {
         FieldResolver::new(&[

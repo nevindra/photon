@@ -34,6 +34,20 @@ pub struct FileEntry {
     /// as `0`; `storage_stats` falls back to a `stat()` for those so footprint stays accurate.
     #[serde(default)]
     pub bytes: u64,
+    /// Inclusive min/max of the promoted `tenant` column, when the segment has one — the
+    /// file-level half of per-Site pruning on a federation **central**.
+    ///
+    /// The skip index carries the same range, but reading it means opening a sidecar per
+    /// candidate; having it here lets `keep_candidate` drop a file from the manifest alone, the
+    /// way `min_service`/`max_service` already do. It only prunes because `tenant` LEADS the
+    /// compactors' sort key, which makes each file a contiguous slice of Sites instead of all of
+    /// them.
+    ///
+    /// `None` for a plain single-install deployment (nothing stamps `tenant`), for segments
+    /// written before this field existed, and whenever `tenant` is not promoted — all of which
+    /// the prune path reads as "keep the file".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_range: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -105,6 +119,7 @@ mod tests {
             durable: false,
             attribute_keys: Vec::new(),
             bytes: 0,
+            tenant_range: None,
         }
     }
 

@@ -90,10 +90,12 @@ WAL-allocated IDs.
 
 The flow (identical per signal): **OTLP request → (gzip-decompress if `Content-Encoding: gzip`) +
 `max_body_bytes` cap on the decompressed body → bearer-token check (local or tenant) + tenant stamping +
-per-signal semaphore → `otlp_*_to_*` mapping → Arrow `RecordBatch` → optional federation tee
+per-signal semaphore → `otlp_*_to_*` mapping (long-tail attribute values truncated to
+`[ingest].max_attribute_value_bytes`) → Arrow `RecordBatch` → optional federation tee
 (non-blocking, full-mode only) → `wal.append`** (the group-commit `fsync` completes =
 **the ack / durability boundary**; data survives a crash from here) **+ `IngestCounters` bump →**
-the signal's background compactor `run_once` drains each _closed_ WAL segment → concat + lexsort by
+the signal's background compactor `run_once` drains each _closed_ WAL segment → concat + hoist
+promoted keys out of the attributes map (`align::hoist_promoted`) + lexsort by
 the sort key → stream one zstd Parquet (level from `[storage] zstd_level`) + build the skip-index
 `.idx` sidecar → append a `FileEntry` (carrying the Parquet's on-disk `bytes`, so `storage_stats` is
 manifest arithmetic rather than one `stat()` per file per sampler tick) to that signal's manifest →
@@ -109,6 +111,25 @@ durable deletes** for the objects they unlink from hot, so the durable replica h
 instead of accumulating every file ever written. (An empty/torn-tail segment compacts to zero rows
 and is dropped without a manifest entry; orphaned `*.tmp` files from a crash mid-write are swept at
 startup.)
+
+**Two things happen between concat and lexsort**, both in `photon-compact/src/align.rs`, and the
+order matters (**hoist first, align second**):
+
+- **`hoist_promoted`** moves a promoted key's values out of the long-tail `attributes` map and into
+  its column, for any promoted key whose column is missing or all-NULL. This is what makes a change
+  to `[schema].promoted_attributes` reach data that is *already on disk*: without it a promotion
+  only applies to segments written after the restart, and the read path pays the map probe
+  (`attr_lookup`) for a full retention period. Rows the writer already routed to the column are left
+  alone.
+- **`align_to`** then reconciles the batch with the current Arrow schema so files written across a
+  schema change still concatenate.
+
+**Long-tail attribute values are capped at ingest** (`photon-core/src/attr_limit.rs`,
+`[ingest].max_attribute_value_bytes`, default 2048, `0` = uncapped) on a UTF-8 char boundary.
+Promoted attributes are deliberately **not** capped — those are the operator's chosen identity keys
+and truncating one would corrupt a filter. The cap is not free and it is not reversible: measured on
+a production span corpus, 8 KiB saved 0.2%, 4 KiB 2.9%, 2 KiB 10.8%, 1 KiB 20.6%, 512 B 30.8%. On
+that corpus one key, `db.query.text`, was 41% of the whole tier.
 
 **Crash-consistency recipe** (all three compactors, `photon-compact/src/stream.rs`): stream one zstd
 Parquet to a temp file → `fsync` → atomic rename → `fsync` parent dir → pin the just-saved manifest
@@ -238,12 +259,14 @@ Two `object_store` backends with strict role separation:
   objects are **deleted from durable** through that same queue (NotFound-tolerant), so durable-tier
   retention is enforced. This is what survives **local-disk failure**. Never on the ack or
   hot-query path.
-- **`[storage] zstd_level`** (optional, default `1`, validated range `1..=19`) tunes the zstd
+- **`[storage] zstd_level`** (optional, default `6`, validated range `1..=19`) tunes the zstd
   compression level all three compactors pass to `write_parquet_streamed` (`photon-compact/src/
   stream.rs`) when streaming a compacted/merged Parquet file to disk. **Higher is not reliably
-  smaller** — measured on a production corpus, level 3 came out ~3% *larger* than level 1; the
-  next level that actually pays is 6 (~−9 pp on spans, ~2.7× the compaction CPU), and 19 costs
-  ~20× the CPU. Raise it only with a measurement on your own data.
+  smaller** — measured on a production corpus, level 3 came out ~3% *larger* than level 1. 6 is the
+  next level that actually pays and it pays well: −9 pp on spans against level 1, for ~2.7× the
+  compaction CPU on a task that is idle most of the time. 19 costs ~20× the CPU for another ~2 pp.
+  The default was 1 until this measurement; nodes written at 1 stay readable and get level 6 as
+  their files pass through `merge_once`. Raise it past 6 only with a measurement on your own data.
 - **Per-column Parquet encodings** are chosen in `writer_properties` (`photon-compact/src/
   stream.rs`) from the Arrow type, not configured. parquet-rs defaults every column to
   dictionary-first, which is right for the low-cardinality string/enum columns and wrong for two
@@ -277,6 +300,27 @@ the RUM app registry (`rum_apps` table), the detected-release table (`deployment
 uptime subsystem. RUM apps are registered/edited/rotated/removed at runtime (UI or the
 `/api/rum/apps*` management API — see [`subsystems/rum.md`](subsystems/rum.md)), not via config;
 there is no `[[rum.apps]]` config surface anymore.
+
+### Merge visibility
+
+`merge_once` is the only thing standing between a node and an unbounded file count, and it used to
+fail silently: the three compaction loops printed `merge_once failed: {e}` to stderr and carried on.
+A production node stopped merging on 2026-08-21 at 10:26 and nobody noticed for 12 days — the hot
+tier grew by exactly 1,440 unmerged files per signal per day (one per closed WAL segment), reaching
+48,979 files where a healthy tier holds a few hundred, and a 7-day RED query went from 1.8 s to
+14.9 s. Nothing in the product said so.
+
+`photon-server/src/merge_health.rs` fixes both halves of that. Per signal it records when merging
+last succeeded, how many passes have failed in a row, and the last message, behind the
+`photon_api::CompactionStatus` seam that `GET /api/storage` reports as its `compaction` array (the
+`/data` page's Storage tab shows a banner and a per-signal pill — `lib/data/compaction.ts` owns the
+judgment). A merge always re-selects the *oldest* small files, so one bad input fails identically
+forever: a non-zero streak is a stall, not a blip. The log escalates rather than repeats — the first
+three failures print, then only powers of two, each carrying how long merging has been down.
+
+An idle pass that merged nothing counts as a **success**: "nothing was small enough to merge" and
+"merging works" are the same fact, and calling a quiet node unhealthy would make the number useless
+on exactly the nodes that are fine.
 
 ## API surface
 
@@ -322,7 +366,10 @@ backend can't be silently replaced with demo data.
   `GET/PATCH/DELETE /api/alerts/channels/:id`, `POST /api/alerts/channels/:id/test` (send a sample
   webhook), `GET /api/alerts/incidents` (`?status=triggered|resolved&rule_id=&limit=`) — see
   [`subsystems/alerts.md`](subsystems/alerts.md).
-- **Data / usage / retention:** `GET /api/storage`, `GET /api/usage/series`, `GET /api/usage/services` (per-service footprint — an ESTIMATE, `service rows × the signal's mean bytes/row`, because Parquet sorts by `service.name` and compresses a service's rows together; metrics are reported `attributed: false` with the reason, since a metric series is keyed by name and most belong to a host, a browser app or the rollup rather than a service), `GET/PUT /api/retention`,
+- **Data / usage / retention:** `GET /api/storage` (per-signal footprint + the `durable`
+  replication block + a `compaction` array — one `{signal, last_ok_ms, consecutive_failures,
+  last_error}` per signal, present only when a compactor is wired in, see **Merge visibility**
+  below), `GET /api/usage/series`, `GET /api/usage/services` (per-service footprint — an ESTIMATE, `service rows × the signal's mean bytes/row`, because Parquet sorts by `service.name` and compresses a service's rows together; metrics are reported `attributed: false` with the reason, since a metric series is keyed by name and most belong to a host, a browser app or the rollup rather than a service), `GET/PUT /api/retention`,
   `POST /api/data/purge`.
 - **Federation (central + tenant):** `GET /api/tenants` (central list all), `POST /api/tenants`
   (central create), `PATCH/DELETE /api/tenants/:name` (central update/remove),
@@ -362,6 +409,14 @@ bodies, so streaming is never buffered.
   skip-index range degrades to "keep the file". There is no migration. The metrics skip index additionally ranges over
   `host.name` (binary sidecar format v2; a missing host block in an older v1 sidecar decodes as
   `None`, which — per the no-false-negative rule below — keeps the file rather than pruning it).
+  **On a federation central, `tenant` leads the sort key of all three signals** whenever the segment
+  carries the column, i.e. whenever the operator promoted it (`stream::tenant_sort_key`; a no-op on
+  a single install, where there is no such column and the key is unchanged). The skip index then
+  ranges over it (sidecar format **v3**, a missing tenant block in v1/v2 decoding as `None` = keep)
+  and the manifest carries it as `FileEntry.tenant_range`, which is what `photon_query::
+  tenant_excluded` prunes on. Promotion alone does nothing here: a column no file is *ordered* by
+  has a range spanning every tenant. Measured on a simulated 8-tenant central, one tenant's query
+  read 100% of the bytes with `tenant` merely promoted and **12.2%** with it leading the sort.
 - **`search` is two-pass (late materialization).** Pass 1 applies the predicate but projects only
   `timestamp`, sorts DESC, takes `limit`, finds the cutoff; pass 2 re-runs with `timestamp >= cutoff`
   and returns full rows — so the wide `attributes` map is decoded only for survivors. Don't collapse

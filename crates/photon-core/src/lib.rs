@@ -29,11 +29,18 @@ pub enum PhotonError {
     Alerts(String),
 }
 
+/// The resource attribute a federation **central** stamps on every row it accepts, naming the
+/// Site the row came from. Spelled once here because four crates key off it: `photon-ingest`
+/// writes it, `photon-compact` sorts by it, `photon-index` ranges over it, and `photon-query`
+/// prunes on it.
+pub const TENANT_ATTRIBUTE: &str = "tenant";
+
 /// Federation: bearer token → tenant name, shared live between the tenant registry (which
 /// rebuilds it on every mutation) and the ingest receivers (which read it per request).
 pub type TenantTokenMap =
     std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>;
 
+pub mod attr_limit;
 pub mod config;
 pub mod ingest_counters;
 pub mod manifest;

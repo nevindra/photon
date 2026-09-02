@@ -190,6 +190,101 @@ pub(crate) const PRUNE_CHUNKS: usize = 64;
 /// on a single blocking task instead.
 pub(crate) const PRUNE_PARALLEL_MIN_CANDIDATES: usize = 64;
 
+/// Whether `entry` provably holds no row for any Site in `wanted` — the file-level half of
+/// per-Site pruning on a federation **central**, shared by all three engines' prune paths.
+///
+/// It reads the manifest and nothing else: no `.idx` open, no Parquet open. That only prunes
+/// because `tenant` LEADS the compactors' sort key, which makes each file a contiguous slice of
+/// Sites rather than all of them (`photon_compact::stream::tenant_sort_key`). Measured on a
+/// simulated 10-Site central over 1,050,786 real spans, the bytes one `tenant:<name>` query must
+/// decode: 100% with `tenant` in the attributes map, 100% with it promoted but sorted
+/// `(service, time)`, 12.2% once it leads.
+///
+/// Conservative in the same direction as every other pruner here, so it can only ever add scan
+/// work and never drop a real row: a query that pins no tenant keeps every file, and so does a
+/// segment with no recorded range (a single install, a pre-`tenant_range` segment, or `tenant`
+/// not promoted).
+pub(crate) fn tenant_excluded(
+    entry: &photon_core::manifest::FileEntry,
+    wanted: Option<&[String]>,
+) -> bool {
+    let (Some(wanted), Some((lo, hi))) = (wanted, entry.tenant_range.as_ref()) else {
+        return false;
+    };
+    // An empty list is "no constraint", not "nothing matches" — `tenant_values` never returns one,
+    // and the inverted `any` below would otherwise exclude EVERY file.
+    if wanted.is_empty() {
+        return false;
+    }
+    !wanted
+        .iter()
+        .any(|t| t.as_str() >= lo.as_str() && t.as_str() <= hi.as_str())
+}
+
+#[cfg(test)]
+mod tenant_prune_tests {
+    use super::tenant_excluded;
+    use photon_core::manifest::FileEntry;
+    use photon_core::segment::SegmentId;
+
+    fn entry(range: Option<(&str, &str)>) -> FileEntry {
+        FileEntry {
+            path: "data/seg-1.parquet".into(),
+            segment_id: SegmentId(1),
+            min_ts_nanos: 0,
+            max_ts_nanos: 10,
+            min_service: "api".into(),
+            max_service: "web".into(),
+            row_count: 1,
+            durable: false,
+            attribute_keys: Vec::new(),
+            bytes: 0,
+            tenant_range: range.map(|(a, b)| (a.to_string(), b.to_string())),
+        }
+    }
+    fn want(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_site_outside_the_files_range_is_dropped() {
+        let e = entry(Some(("jkt", "sgp")));
+        assert!(tenant_excluded(&e, Some(&want(&["tokyo"]))));
+        assert!(tenant_excluded(&e, Some(&want(&["ams"]))));
+    }
+
+    #[test]
+    fn a_site_inside_the_range_is_kept_including_the_endpoints() {
+        let e = entry(Some(("jkt", "sgp")));
+        for site in ["jkt", "sgp", "kul"] {
+            assert!(!tenant_excluded(&e, Some(&want(&[site]))), "{site}");
+        }
+    }
+
+    #[test]
+    fn an_or_list_keeps_the_file_when_any_one_could_be_in_it() {
+        let e = entry(Some(("jkt", "jkt")));
+        assert!(!tenant_excluded(&e, Some(&want(&["tokyo", "jkt"]))));
+        assert!(tenant_excluded(&e, Some(&want(&["tokyo", "sgp"]))));
+    }
+
+    /// The conservative direction, which is the property that matters: pruning may only ever add
+    /// scan work, never drop a real row. Both unknowns keep the file.
+    #[test]
+    fn an_unknown_range_or_an_unpinned_query_keeps_the_file() {
+        assert!(!tenant_excluded(&entry(None), Some(&want(&["tokyo"]))));
+        assert!(!tenant_excluded(&entry(Some(("jkt", "sgp"))), None));
+        assert!(!tenant_excluded(&entry(None), None));
+    }
+
+    #[test]
+    fn an_empty_wanted_list_keeps_the_file() {
+        // `tenant_values` never returns an empty slice, but the predicate must not silently
+        // exclude everything if it ever did.
+        assert!(!tenant_excluded(&entry(Some(("jkt", "sgp"))), Some(&[])));
+    }
+}
+
 /// A parsed manifest cached against the `(mtime, len)` of the file it was read from. The
 /// compactor (same process) rewrites `manifest.json` roughly every 2s, and one UI page load can
 /// fire 6-10 engine calls (search, count, facet, histogram, fields) that each used to re-read
@@ -544,6 +639,12 @@ impl QueryEngine {
         // Timestamp overlap with [start, end]. `manifest.candidates()` already filtered on this
         // exact pair, so this is a cheap belt-and-suspenders re-check, not new pruning power.
         if entry.max_ts_nanos < req.start_ts_nanos || entry.min_ts_nanos > req.end_ts_nanos {
+            return Ok(false);
+        }
+
+        // On a federation central, the Site the query pinned must fall inside this file's tenant
+        // range. Manifest-only — it drops the file before any sidecar is opened.
+        if tenant_excluded(entry, req.query.as_ref().and_then(|q| q.tenant_values())) {
             return Ok(false);
         }
 
@@ -1227,6 +1328,7 @@ mod storage_stats_tests {
                 attribute_keys: vec![],
                 // Legacy entries (bytes == 0) → the footprint comes from the stat() fallback.
                 bytes: 0,
+                tenant_range: None,
             });
         }
         std::fs::write(hot.join(MANIFEST_OBJECT_PATH), m.to_json().unwrap()).unwrap();
@@ -1270,6 +1372,7 @@ mod storage_stats_tests {
                 durable: false,
                 attribute_keys: vec![],
                 bytes,
+                tenant_range: None,
             });
         }
         std::fs::write(hot.join(MANIFEST_OBJECT_PATH), m.to_json().unwrap()).unwrap();
@@ -1456,6 +1559,7 @@ mod corrupt_idx_keep_tests {
             durable: false,
             attribute_keys: vec![],
             bytes: 0,
+            tenant_range: None,
         });
         let man_path = hot.join(MANIFEST_OBJECT_PATH);
         std::fs::create_dir_all(man_path.parent().unwrap()).unwrap();

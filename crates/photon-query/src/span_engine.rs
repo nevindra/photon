@@ -529,6 +529,12 @@ impl SpanQueryEngine {
             return Ok(false);
         }
 
+        // On a federation central, the Site the query pinned must fall inside this file's tenant
+        // range. Manifest-only — it drops the file before any sidecar is opened.
+        if crate::tenant_excluded(entry, req.query.as_ref().and_then(|q| q.tenant_values())) {
+            return Ok(false);
+        }
+
         // Required long-tail keys (`req.required_attr_keys`, plus whatever the grammar's un-negated
         // map terms demand). A segment that declares its keys and lists none of them cannot hold a
         // matching row, so drop it whole — this is what makes the Backend Issues surface cheap:
@@ -675,6 +681,7 @@ mod tests {
                 durable: false,
                 attribute_keys: vec![],
                 bytes,
+                tenant_range: None,
             });
         }
         std::fs::write(hot.join(SPANS_MANIFEST_OBJECT_PATH), m.to_json().unwrap()).unwrap();

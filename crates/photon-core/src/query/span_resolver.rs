@@ -60,6 +60,32 @@ pub struct SpanResolvedQuery {
 }
 
 impl SpanResolvedQuery {
+    /// The exact `tenant` values a matching row must have, when the query pins one.
+    ///
+    /// A federation central stamps `tenant` on every row it accepts, and the UI's Site picker
+    /// puts a `tenant:<name>` term on every query, so this is the dimension a central actually
+    /// filters by. The engine keeps a segment only when its `FileEntry::tenant_range` overlaps
+    /// one of these values — a manifest-only check, no sidecar read.
+    ///
+    /// `None` means the query says nothing about `tenant`, so every file is kept. Only un-negated
+    /// `Match` terms count: `-tenant:x` is *satisfied* by a row with no tenant at all, and
+    /// `tenant:*` is an existence test rather than a value. Terms are AND-ed, so the first such
+    /// term is a genuine requirement and pruning on it alone is sound.
+    pub fn tenant_values(&self) -> Option<&[String]> {
+        self.terms.iter().find_map(|t| {
+            if t.negated {
+                return None;
+            }
+            let SpanResolvedKind::Match { field, values } = &t.kind else {
+                return None;
+            };
+            let (SpanFieldRef::Attr(k) | SpanFieldRef::MapAttr(k)) = field else {
+                return None;
+            };
+            (k == crate::TENANT_ATTRIBUTE && !values.is_empty()).then_some(values.as_slice())
+        })
+    }
+
     /// Long-tail attribute keys a matching row MUST carry. A segment whose manifest entry declares
     /// its keys and lists none of these cannot hold a single matching row, so the query engine
     /// prunes the whole file — the same conservative shape as the skip index (a segment that does
@@ -235,6 +261,30 @@ mod tests {
     }
     fn r(input: &str) -> SpanResolvedQuery {
         resolver().resolve(&parse(input).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn tenant_values_reads_the_pinned_sites() {
+        // Spans are the signal a central mirrors most of, so this is where the prune pays.
+        let promoted = SpanFieldResolver::new(&["service.name".into(), "tenant".into()]);
+        let q = |s: &str| promoted.resolve(&parse(s).unwrap()).unwrap();
+        assert_eq!(
+            q("tenant:jkt").tenant_values(),
+            Some(&["jkt".to_string()][..])
+        );
+        assert_eq!(
+            q("tenant:jkt,sgp service:api").tenant_values(),
+            Some(&["jkt".to_string(), "sgp".to_string()][..])
+        );
+        // long-tail spelling (a central that has not promoted it yet) resolves the same
+        assert_eq!(
+            r("tenant:jkt").tenant_values(),
+            Some(&["jkt".to_string()][..])
+        );
+        // and the three shapes that must not prune
+        assert_eq!(q("service:api").tenant_values(), None);
+        assert_eq!(q("-tenant:jkt").tenant_values(), None);
+        assert_eq!(q("tenant:*").tenant_values(), None);
     }
 
     #[test]

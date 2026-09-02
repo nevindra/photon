@@ -1676,6 +1676,13 @@ export const mockStorage = {
     uptime: { monitor_count: 4, heartbeat_count: 51_200, incident_count: 3, oldest_heartbeat_ts: 1_749_000_000_000, newest_heartbeat_ts: 1_751_000_000_000 },
   },
   durable: { configured: true, pending: 3, last_replicated_ms: 1_751_000_000_000 },
+  // Merge health. Two healthy signals and one stalled, because the stalled shape is the one worth
+  // being able to look at in mock mode — a production node once ran 12 days like this.
+  compaction: [
+    { signal: 'logs', last_ok_ms: 1_751_000_000_000, consecutive_failures: 0, last_error: null },
+    { signal: 'traces', last_ok_ms: 1_749_900_000_000, consecutive_failures: 97, last_error: 'parquet: invalid footer in data-spans/0193.parquet' },
+    { signal: 'metrics', last_ok_ms: 1_751_000_000_000, consecutive_failures: 0, last_error: null },
+  ],
 }
 // Per-signal retention in days, mirroring GET/PUT /api/retention. `let`, not `const`: api.js's
 // setRetention() mock fallback mutates it in place so repeated calls in mock mode are consistent.

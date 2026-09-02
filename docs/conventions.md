@@ -60,7 +60,10 @@ public API, adding a dependency, or touching the query/chart data path.
   Measured on a production corpus: −18.3% (logs), −11.5% (spans), 0% (metrics), at equal or lower
   encode CPU. Write-side only — the encoding is recorded per column in each file's own metadata, so
   old files stay readable and need no migration. Related trap: **`zstd_level` is not monotonic.**
-  Level 3 measured ~3% *larger* than level 1 on this data; the next level that pays is 6.
+  Level 3 measured ~3% *larger* than level 1 on this data; the next level that pays is 6, which is
+  now the default (−9 pp on spans against level 1, ~2.7× the compaction CPU on a task that idles
+  most of the time). Nodes written at level 1 stay readable and re-encode at 6 as their files pass
+  through `merge_once`.
 - **Prometheus remote-write type inference:** RW 1.0 samples carry no type tag, so
   `promrw_mapping::classify` infers it from the metric-name suffix — `_total`/`_bucket`/`_count`/
   `_sum` → cumulative monotonic `SUM`, else `GAUGE`. This mirrors the OTel Collector's Prometheus
@@ -72,9 +75,17 @@ public API, adding a dependency, or touching the query/chart data path.
   `attributes` map is 63% of the file's bytes and **96% of its decoded bytes**, so referencing it at
   all costs roughly the same however many keys are probed. Promotion is what gets a query off it;
   `span_engine::attr_lookup` picks the cheapest correct form per key and drops the map column
-  entirely when the manifest proves no surviving file carries it. Changing the list only affects
-  segments written from then on — a query spanning the change reads both layouts correctly, and the
-  speed arrives once the older segments age out.
+  entirely when the manifest proves no surviving file carries it. A query spanning a change to the
+  list reads both layouts correctly. Files already on disk pick the new layout up as they pass
+  through `merge_once` — `align::hoist_promoted` moves a promoted key's values out of the map and
+  into its column on every compaction and merge, so a promotion no longer has to wait a full
+  retention period to pay.
+- **Promoting a key does not make it prune.** Pruning comes from the min/max range on a column the
+  file is *sorted* by; a promoted column nothing is ordered by has a range spanning everything.
+  Measured on a simulated 8-tenant federation central: `tenant:t3` read 100% of the bytes with
+  `tenant` promoted, and 12.2% once `tenant` also led the sort key. `tenant` is the one key wired
+  that way (`stream::tenant_sort_key`, skip-index sidecar **v3**, `FileEntry.tenant_range`,
+  `photon_query::tenant_excluded`); every other promoted key buys decode cost, not pruning.
 - **Parquet filter pushdown stays OFF.** Photon reads with an explicit schema, and in DataFusion 43
   pushdown over files whose schemas differ from it empties any `LIMIT` plan — silently. The failure
   hides behind any sort or aggregate, so it shows up as "this metric does not exist" on exactly the

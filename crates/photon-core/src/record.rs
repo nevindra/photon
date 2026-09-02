@@ -41,6 +41,14 @@ pub struct RecordBatchBuilder {
     /// `schema.promoted` as a set, so attribute routing is an O(1) lookup
     /// instead of an O(promoted) linear scan per attribute.
     promoted_set: HashSet<String>,
+    /// Cap on the byte length of one **long-tail** attribute value, from
+    /// `[ingest].max_attribute_value_bytes` via [`crate::attr_limit`]; `0` is no cap. Read once
+    /// here rather than per row so a builder's limit cannot change mid-batch.
+    ///
+    /// Promoted attributes are deliberately NOT capped: they are the operator's chosen identity
+    /// keys, and the read path filters and groups on them, so a truncated `service.name` would
+    /// silently split a service in two. The long tail has no such contract.
+    max_attr_bytes: usize,
     timestamp: TimestampNanosecondBuilder,
     observed_timestamp: TimestampNanosecondBuilder,
     severity_number: Int32Builder,
@@ -54,10 +62,19 @@ pub struct RecordBatchBuilder {
 }
 
 impl RecordBatchBuilder {
+    /// Override the process-wide attribute-value cap for this builder. Production sets the cap
+    /// once via [`crate::attr_limit::set_max_attribute_value_bytes`]; this exists so a test can
+    /// exercise truncation without touching global state that other tests share.
+    pub fn with_max_attribute_value_bytes(mut self, bytes: usize) -> Self {
+        self.max_attr_bytes = bytes;
+        self
+    }
+
     pub fn new(schema: &LogSchema) -> RecordBatchBuilder {
         RecordBatchBuilder {
             schema: schema.clone(),
             promoted_set: schema.promoted.iter().cloned().collect(),
+            max_attr_bytes: crate::attr_limit::max_attribute_value_bytes(),
             timestamp: TimestampNanosecondBuilder::new(),
             observed_timestamp: TimestampNanosecondBuilder::new(),
             severity_number: Int32Builder::new(),
@@ -84,6 +101,7 @@ impl RecordBatchBuilder {
         RecordBatchBuilder {
             schema: schema.clone(),
             promoted_set: schema.promoted.iter().cloned().collect(),
+            max_attr_bytes: crate::attr_limit::max_attribute_value_bytes(),
             timestamp: TimestampNanosecondBuilder::with_capacity(rows),
             observed_timestamp: TimestampNanosecondBuilder::with_capacity(rows),
             severity_number: Int32Builder::with_capacity(rows),
@@ -127,7 +145,9 @@ impl RecordBatchBuilder {
                 continue;
             }
             self.attributes.keys().append_value(k);
-            self.attributes.values().append_value(v);
+            self.attributes
+                .values()
+                .append_value(crate::attr_limit::cap_value(v, self.max_attr_bytes));
         }
         // close this row's map entry (append_option-style boolean = valid row)
         self.attributes.append(true).expect("map row append");
@@ -162,7 +182,9 @@ impl RecordBatchBuilder {
                 continue;
             }
             self.attributes.keys().append_value(k);
-            self.attributes.values().append_value(v);
+            self.attributes
+                .values()
+                .append_value(crate::attr_limit::cap_value(v, self.max_attr_bytes));
         }
         self.attributes.append(true).expect("map row append");
     }
@@ -271,7 +293,7 @@ pub fn log_record_from_batch(batch: &RecordBatch, row: usize) -> LogRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, StringArray, TimestampNanosecondArray};
+    use arrow::array::{Array, MapArray, StringArray, TimestampNanosecondArray};
 
     fn rec(ts: i64, service: &str, extra: &[(&str, &str)]) -> LogRecord {
         let mut attributes = BTreeMap::new();
@@ -285,6 +307,87 @@ mod tests {
             attributes,
             ..Default::default()
         }
+    }
+
+    /// The long-tail value for `key` on `row`, straight out of the Map column.
+    fn map_value(batch: &RecordBatch, row: usize, key: &str) -> Option<String> {
+        let map = batch
+            .column_by_name(crate::schema::ATTRIBUTES)?
+            .as_any()
+            .downcast_ref::<MapArray>()?
+            .clone();
+        let offsets = map.value_offsets();
+        let entries = map.entries();
+        let keys = entries.column(0).as_any().downcast_ref::<StringArray>()?;
+        let values = entries.column(1).as_any().downcast_ref::<StringArray>()?;
+        (offsets[row] as usize..offsets[row + 1] as usize)
+            .find(|i| keys.value(*i) == key)
+            .map(|i| values.value(i).to_string())
+    }
+
+    #[test]
+    fn a_long_tail_attribute_is_capped_and_a_promoted_one_is_not() {
+        // `service.name` is promoted; the read path filters and groups on it, so truncating it
+        // would silently split one service into two. The long tail carries no such contract.
+        let schema = LogSchema::new(&["service.name".to_string()]);
+        let long_service = "a".repeat(40);
+        let long_query = "b".repeat(40);
+        let mut b = RecordBatchBuilder::new(&schema).with_max_attribute_value_bytes(8);
+        b.append(&rec(100, &long_service, &[("db.query.text", &long_query)]));
+        let batch = b.finish().unwrap();
+
+        assert_eq!(
+            map_value(&batch, 0, "db.query.text").as_deref(),
+            Some("bbbbbbbb")
+        );
+        let svc = batch
+            .column_by_name("service.name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(svc.value(0), long_service);
+    }
+
+    #[test]
+    fn no_cap_is_the_default_and_leaves_values_whole() {
+        let schema = LogSchema::new(&["service.name".to_string()]);
+        let long_query = "b".repeat(4096);
+        let mut b = RecordBatchBuilder::new(&schema).with_max_attribute_value_bytes(0);
+        b.append(&rec(100, "api", &[("db.query.text", &long_query)]));
+        let batch = b.finish().unwrap();
+        assert_eq!(map_value(&batch, 0, "db.query.text"), Some(long_query));
+    }
+
+    #[test]
+    fn the_streaming_append_path_caps_too() {
+        // Two append paths exist (`append` from a LogRecord, `append_streaming` straight off
+        // OTLP) and only the streaming one runs in production. Both must cap.
+        let schema = LogSchema::new(&["service.name".to_string()]);
+        let long_query = "b".repeat(40);
+        let mut b = RecordBatchBuilder::new(&schema).with_max_attribute_value_bytes(8);
+        let attrs = vec![
+            ("service.name", "api"),
+            ("db.query.text", long_query.as_str()),
+        ];
+        b.append_streaming(
+            LogFixed {
+                timestamp_nanos: 1,
+                observed_timestamp_nanos: None,
+                severity_number: None,
+                severity_text: None,
+                body: Some("hello"),
+                trace_id: None,
+                span_id: None,
+                scope_name: None,
+            },
+            attrs.into_iter(),
+        );
+        let batch = b.finish().unwrap();
+        assert_eq!(
+            map_value(&batch, 0, "db.query.text").as_deref(),
+            Some("bbbbbbbb")
+        );
     }
 
     #[test]

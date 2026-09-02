@@ -711,9 +711,18 @@ export interface SignalStorage {
   oldest_heartbeat_ts?: number
   newest_heartbeat_ts?: number
 }
+// One signal's `merge_once` health. Absent from the payload entirely on a node with no compactor
+// attached (`PHOTON_DISABLE_COMPACTION`) — the UI treats that as "unknown", never as healthy.
+export interface CompactionHealth {
+  signal: string
+  last_ok_ms: number | null
+  consecutive_failures: number
+  last_error: string | null
+}
 export interface StorageStats {
   signals: Record<string, SignalStorage>
   durable: { configured: boolean; pending: number; last_replicated_ms: number }
+  compaction?: CompactionHealth[]
 }
 export interface UsageBucket {
   ts: number

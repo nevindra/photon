@@ -8,14 +8,22 @@
 // signals (logs/traces/metrics) show size, rows/files, the footprint trend, a signal-hued "share of
 // disk" bar and a "durable replication" meter. Uptime (only when the `[uptime]` store exists) keeps
 // its distinct shape: heartbeat / monitor / incident counts, no bytes and no trend.
+//
+// It also carries the ONE place merge health is visible in the product. `merge_once` failing is
+// silent by nature — ingest still acks and search still answers, the file count just climbs
+// forever and every query gets slower. A stalled signal gets a banner at the top and a pill on its
+// own card; the judgment itself lives in `lib/data/compaction.ts` so it is testable without a DOM.
 import { computed } from 'vue'
-import { Clock } from 'lucide-vue-next'
+import { Clock, AlertTriangle } from 'lucide-vue-next'
+import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 import { Card } from '@/components/ui/card'
 import { Meter } from '@/components/ui/meter'
+import { StatusPill } from '@/components/ui/status-pill'
 import MiniAreaChart from '@/components/charts/MiniAreaChart.vue'
 import { Spinner } from '@/components/ui/spinner'
 import { signalColor, signalIcon } from '@/lib/core/signalMeta'
 import { formatBytes, formatNumber } from '@/lib/core/format'
+import { judgeAll, isDegraded } from '@/lib/data/compaction'
 import { useStorage, useUsageSeries, usageWindow } from '@/lib/data/dataQueries'
 
 const { data: storage, isLoading: storageLoading } = useStorage()
@@ -88,11 +96,38 @@ function timeSpan(card) {
 }
 
 const durable = computed(() => storage.value?.durable)
+
+// Merge health, keyed by signal so a card can look up its own verdict. Empty on a node with no
+// compactor attached — the cards then simply show no pill.
+const compaction = computed(() => judgeAll(storage.value?.compaction))
+const compactionBySignal = computed(() => Object.fromEntries(compaction.value.map((v) => [v.signal, v])))
+// Only the signals worth interrupting the page for. The banner leads because a stall is invisible
+// otherwise: everything else on this page keeps looking normal while it happens.
+const stalled = computed(() => compaction.value.filter(isDegraded))
 </script>
 
 <template>
   <Spinner v-if="storageLoading" size="sm">Loading…</Spinner>
   <div v-else class="flex flex-col gap-3">
+    <!-- Merge stall banner. Above the durable band on purpose: replication lagging is a copy that
+         has not landed yet, a stalled merge is a tier quietly getting slower every day. -->
+    <Alert v-if="stalled.length" :variant="stalled.some((v) => v.tone === 'error') ? 'error' : 'warning'">
+      <AlertTriangle />
+      <AlertTitle>
+        Compaction {{ stalled.length === 1 ? 'is' : 'are' }} not merging
+        ({{ stalled.map((v) => v.signal).join(', ') }})
+      </AlertTitle>
+      <AlertDescription class="flex flex-col gap-0.5">
+        <span v-for="v in stalled" :key="v.signal" class="tabular-nums">
+          <span class="capitalize">{{ v.signal }}</span>: {{ v.detail
+          }}<template v-if="v.lastError"> — <span class="font-mono text-xs">{{ v.lastError }}</span></template>
+        </span>
+        <span class="opacity-80">
+          Small files keep accumulating until this clears, and every query over them gets slower.
+        </span>
+      </AlertDescription>
+    </Alert>
+
     <!-- Durable replication band -->
     <div
       v-if="durable?.configured"
@@ -130,6 +165,13 @@ const durable = computed(() => storage.value?.durable)
             <component :is="signalIcon(card.key)" class="size-4" :style="{ color: signalColor(card.key) }" />
           </span>
           <span class="text-sm font-medium capitalize text-card-foreground">{{ card.key }}</span>
+          <StatusPill
+            v-if="!card.uptime && compactionBySignal[card.key]"
+            :tone="compactionBySignal[card.key].tone"
+            :title="compactionBySignal[card.key].detail"
+          >
+            {{ compactionBySignal[card.key].label }}
+          </StatusPill>
           <span
             v-if="card.uptime"
             class="ml-auto rounded-full border border-border bg-muted/60 px-2 py-0.5 text-[11px] font-medium text-muted-foreground"
@@ -211,12 +253,21 @@ const durable = computed(() => storage.value?.durable)
           </div>
         </template>
 
-        <!-- Shared footer: oldest→newest span -->
+        <!-- Shared footer: oldest→newest span, plus this signal's merge line when there is one -->
         <div
-          class="mt-auto flex items-center gap-1.5 border-t border-border pt-2.5 text-[11px] text-muted-foreground"
+          class="mt-auto flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-border pt-2.5 text-[11px] text-muted-foreground"
         >
-          <Clock class="size-3 shrink-0" />
-          <span class="tabular-nums">{{ timeSpan(card) }}</span>
+          <span class="flex items-center gap-1.5">
+            <Clock class="size-3 shrink-0" />
+            <span class="tabular-nums">{{ timeSpan(card) }}</span>
+          </span>
+          <span
+            v-if="!card.uptime && compactionBySignal[card.key]"
+            class="tabular-nums"
+            :class="isDegraded(compactionBySignal[card.key]) ? 'text-sev-warn' : ''"
+          >
+            {{ compactionBySignal[card.key].detail }}
+          </span>
         </div>
       </Card>
     </div>
