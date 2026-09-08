@@ -24,3 +24,4 @@ Cargo.lock.orig
 /photon.tenant.toml
 /.photon-tenant/
 .photon-prod-compact/
+.playwright-mcp/

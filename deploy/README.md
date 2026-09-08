@@ -225,8 +225,13 @@ Every flag has an environment-variable equivalent (flags win):
 | Flag | Env var | Default | Purpose |
 |---|---|---|---|
 | `--endpoint` | `PHOTON_AGENT_ENDPOINT` | `http://127.0.0.1:4318/v1/metrics` | Where to send metrics |
-| `--token` | `PHOTON_INGEST_TOKEN` | `dev-ingest-token` | Must match the server's ingest token |
-| `--host-name` | `PHOTON_AGENT_HOST` | the OS hostname | The name shown in the UI |
+| `--ingest-token` | `PHOTON_INGEST_TOKEN` | `dev-ingest-token` | Must match the server's ingest token (metrics only) |
+| `--server` | `PHOTON_SERVER` | — | Photon's URL; enables Docker fleet management (Part 2b) |
+| `--token` | `PHOTON_AGENT_TOKEN` | — | The per-host **agent token** (`ak_…`) minted when you add the host in the UI — not the ingest token |
+| `--docker-read` / `--docker-lifecycle` / `--docker-apply` / `--docker-exec` | `PHOTON_AGENT_DOCKER_*` | off | Which Docker powers this host grants (each opt-in; the server cannot enable one) |
+| `--poll` | `PHOTON_AGENT_POLL` | `15s` | Sync interval for the control channel (floor 5s) |
+| `--data-dir` | `PHOTON_AGENT_DATA_DIR` | `/var/lib/photon-agent` | Local state + the compose stacks Photon deploys |
+| `--host-name` | `PHOTON_AGENT_HOST_NAME` (or `PHOTON_AGENT_HOST`) | the OS hostname | The name shown in the UI |
 | `--interval-secs` | `PHOTON_AGENT_INTERVAL` | `15` | Seconds between samples |
 | `--no-gpu` | `PHOTON_AGENT_NO_GPU` | off | Skip GPU sampling |
 
@@ -248,6 +253,45 @@ dynamically linked: the NVIDIA library is loaded at runtime.)
   user it runs as can read `/dev/nvidia*` (worst case, add it to the `video` group).
 
 ---
+
+## Part 2b — Manage Docker on your hosts (fleet management)
+
+The same agent, with a Docker capability switched on, turns a host into a **managed host**: its
+containers, images, volumes and networks appear under **Infra → host → Containers**, one-shot
+actions (restart, pull, recreate, prune…) run from the UI, compose **stacks** deploy from
+**templates**, and staged **rollouts** push a version to many sites. The agent only ever dials
+*out* to Photon (`POST /api/agent/sync`, long-polled) — no inbound port on the customer's LAN.
+
+1. In the UI: **Infra → Add host**. Either fill in SSH details and let Photon install the agent
+   itself, or pick *I'll install it myself* and copy the snippet it prints. The snippet is the
+   whole install — it fetches `photon-agent` **from this Photon** (`GET /api/agent/download`, so
+   air-gapped sites need no internet) and runs `photon-agent install` with a freshly minted
+   per-host token:
+
+   ```bash
+   curl -fsSL -o /usr/local/bin/photon-agent "https://photon.example/api/agent/download?arch=$(uname -m)"
+   chmod +x /usr/local/bin/photon-agent
+   sudo photon-agent install --server https://photon.example --token ak_… --host-name edge-01 \
+     --docker-read --docker-lifecycle --docker-apply --poll 15s
+   ```
+
+   `install` writes `/etc/photon-agent/agent.env` (0600) and a systemd unit and starts it. The
+   host appears in the UI once its first sync lands (seconds). The token is shown once; rotate it
+   from the host's **Agent** tab if it leaks.
+2. Capabilities are **opt-in on the host** and nothing else: an agent installed with only
+   `--docker-read` cannot be made to restart a container, whatever the server asks. Stacks need
+   `--docker-apply` and the `docker compose` v2 plugin on the host; a shell needs `--docker-exec`
+   *and* the admin role in the UI.
+3. Set `PHOTON_DEPLOY_SERVER_ORIGIN` on the server to the URL agents reach it at (used for the
+   install snippet, agent self-upgrades, and the metrics endpoint agents are told to use); the
+   agent then needs only its `ak_` token — no ingest token on the host.
+4. `photon-agent uninstall` removes the service and its env file. Containers and stacks keep
+   running; Photon just stops managing them (R9.5).
+
+Roles: every login has a **role** — `viewer` (read everything), `operator` (lifecycle actions,
+template deploys, rollouts), `admin` (templates, agents, users, arbitrary compose, shell). The
+first account is the admin; manage roles under **Settings → Users**. Every change Photon makes to
+a host is in **Manage → Audit**.
 
 ## Part 3 — Send application telemetry
 
@@ -276,6 +320,12 @@ with `PHOTON_CONFIG=/etc/photon/photon.toml`); env vars override individual fiel
 | `PHOTON_INGEST_GRPC_ADDR` | | `0.0.0.0:4317` | OTLP/gRPC bind |
 | `PHOTON_INGEST_MAX_IN_FLIGHT` | | `256` | Max in-flight ingest requests |
 | `PHOTON_STORAGE_HOT_DIR` | | `/var/lib/photon/hot` | Hot tier (WAL + Parquet + index) |
+| `PHOTON_DEPLOY_SERVER_ORIGIN` | | request Host | The URL managed-host agents dial (fleet management) |
+| `PHOTON_DEPLOY_INGEST_ORIGIN` | | server origin + `:4318` | Where those agents send metrics |
+| `PHOTON_DEPLOY_SECRET_KEY_FILE` | | `deploy.key` beside the DB | AES-256 key for stack secrets at rest |
+| `PHOTON_DEPLOY_AGENT_BINARIES_DIR` | | `agents/` beside the DB | `photon-agent-<arch>` files served to hosts (the image ships its own arch beside the server) |
+| `PHOTON_DEPLOY_SSH_BOOTSTRAP` | | `true` | The "Add host over SSH" installer |
+| `PHOTON_DEPLOY_ENABLED` | | `true` | Mount the fleet-management routes at all |
 | `PHOTON_STORAGE_DB_PATH` | | `/var/lib/photon/photon.db` | Control-plane SQLite db |
 | `PHOTON_RETENTION_DAYS` | | `30` | Log retention (days, > 0) |
 | `PHOTON_PROMOTED_ATTRIBUTES` | | `service.name,host.name,deployment.environment,tenant,http.response.status_code` | Comma-separated promoted columns (must include `service.name`). Promotion routes a key out of the wide `attributes` map into its own column — the map is 63% of a span file's bytes and 96% of its decoded bytes, so a query that must probe it pays for all of it. Only affects segments written from now on |

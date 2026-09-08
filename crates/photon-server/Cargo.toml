@@ -17,6 +17,9 @@ photon-ingest = { path = "../photon-ingest" }
 photon-api = { path = "../photon-api" }
 photon-uptime = { path = "../photon-uptime" }
 photon-alerts = { path = "../photon-alerts" }
+photon-deploy = { path = "../photon-deploy" }
+base64 = "0.22"
+aes-gcm = "0.10"
 argon2 = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
@@ -26,9 +29,16 @@ prost = { workspace = true }
 # unlike photon-agent/photon-loadgen (local http:// only) this needs a real TLS backend.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rusqlite = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tikv-jemallocator = { workspace = true }
+# SSH bootstrap installer (deploy/bootstrap.rs): `ring` rather than russh's default `aws-lc-rs`
+# backend, because reqwest's rustls already pulls ring into the workspace and aws-lc needs a C
+# toolchain + cmake at build time.
+russh = { version = "0.63", default-features = false, features = ["ring", "rsa"] }
+# deploy/cipher.rs decodes the hex-encoded AES key file.
+hex = "0.4"
 
 [dev-dependencies]
 arrow = { workspace = true }

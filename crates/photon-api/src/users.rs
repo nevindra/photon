@@ -17,6 +17,9 @@ pub struct StoredUser {
     pub password_hash: String,
     /// Unix milliseconds.
     pub created_at: i64,
+    /// `viewer` / `operator` / `admin` (see `photon_deploy::model::Role`). Rows that predate
+    /// roles read as `admin`: that era's single implicit role could do everything.
+    pub role: String,
 }
 
 /// Persistence boundary for UI users. Async so handlers can `.await` it uniformly; the SQLite
@@ -30,7 +33,20 @@ pub trait UserStore: Send + Sync {
     /// All users, sorted by username ascending.
     async fn list(&self) -> Result<Vec<StoredUser>, PhotonError>;
     /// Insert a user. Returns an error if the username already exists (PRIMARY KEY conflict).
-    async fn create(&self, username: &str, password_hash: &str) -> Result<(), PhotonError>;
+    async fn create(
+        &self,
+        username: &str,
+        password_hash: &str,
+        role: &str,
+    ) -> Result<(), PhotonError>;
+    /// Change a user's role. Returns `true` if a row was updated.
+    async fn set_role(&self, username: &str, role: &str) -> Result<bool, PhotonError>;
+    /// Replace a user's password hash. Returns `true` if a row was updated.
+    async fn set_password_hash(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<bool, PhotonError>;
     /// Delete a user. Returns `true` if a row was removed.
     async fn delete(&self, username: &str) -> Result<bool, PhotonError>;
 }
@@ -50,7 +66,8 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     username      TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'admin'
 );
 "#;
 
@@ -85,6 +102,12 @@ impl SqliteUserStore {
 
     fn from_conn(conn: Connection) -> Result<Self, PhotonError> {
         conn.execute_batch(SCHEMA).map_err(err)?;
+        // Additive migration for pre-existing DBs: existing users keep everything they could do
+        // (`admin`); the `let _ =` swallows the duplicate-column error once migrated.
+        let _ = conn.execute(
+            "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'",
+            [],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -95,7 +118,7 @@ impl SqliteUserStore {
     pub(crate) fn seed(&self, username: &str, password_hash: &str) {
         let c = self.conn.lock().unwrap();
         c.execute(
-            "INSERT INTO users (username,password_hash,created_at) VALUES (?1,?2,0)",
+            "INSERT INTO users (username,password_hash,created_at,role) VALUES (?1,?2,0,'admin')",
             params![username, password_hash],
         )
         .unwrap();
@@ -107,6 +130,7 @@ fn row_to_user(r: &rusqlite::Row) -> rusqlite::Result<StoredUser> {
         username: r.get(0)?,
         password_hash: r.get(1)?,
         created_at: r.get(2)?,
+        role: r.get(3)?,
     })
 }
 
@@ -123,7 +147,7 @@ impl UserStore for SqliteUserStore {
     async fn get(&self, username: &str) -> Result<Option<StoredUser>, PhotonError> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c
-            .prepare("SELECT username,password_hash,created_at FROM users WHERE username=?1")
+            .prepare("SELECT username,password_hash,created_at,role FROM users WHERE username=?1")
             .map_err(err)?;
         let mut rows = stmt
             .query_map(params![username], row_to_user)
@@ -137,20 +161,51 @@ impl UserStore for SqliteUserStore {
     async fn list(&self) -> Result<Vec<StoredUser>, PhotonError> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c
-            .prepare("SELECT username,password_hash,created_at FROM users ORDER BY username")
+            .prepare("SELECT username,password_hash,created_at,role FROM users ORDER BY username")
             .map_err(err)?;
         let rows = stmt.query_map([], row_to_user).map_err(err)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
     }
 
-    async fn create(&self, username: &str, password_hash: &str) -> Result<(), PhotonError> {
+    async fn create(
+        &self,
+        username: &str,
+        password_hash: &str,
+        role: &str,
+    ) -> Result<(), PhotonError> {
         let c = self.conn.lock().unwrap();
         c.execute(
-            "INSERT INTO users (username,password_hash,created_at) VALUES (?1,?2,?3)",
-            params![username, password_hash, now_ms()],
+            "INSERT INTO users (username,password_hash,created_at,role) VALUES (?1,?2,?3,?4)",
+            params![username, password_hash, now_ms(), role],
         )
         .map_err(err)?;
         Ok(())
+    }
+
+    async fn set_role(&self, username: &str, role: &str) -> Result<bool, PhotonError> {
+        let c = self.conn.lock().unwrap();
+        let n = c
+            .execute(
+                "UPDATE users SET role=?2 WHERE username=?1",
+                params![username, role],
+            )
+            .map_err(err)?;
+        Ok(n > 0)
+    }
+
+    async fn set_password_hash(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<bool, PhotonError> {
+        let c = self.conn.lock().unwrap();
+        let n = c
+            .execute(
+                "UPDATE users SET password_hash=?2 WHERE username=?1",
+                params![username, password_hash],
+            )
+            .map_err(err)?;
+        Ok(n > 0)
     }
 
     async fn delete(&self, username: &str) -> Result<bool, PhotonError> {
@@ -172,13 +227,23 @@ mod tests {
         assert_eq!(store.count().await.unwrap(), 0);
         assert!(store.get("alice").await.unwrap().is_none());
 
-        store.create("alice", "hash-a").await.unwrap();
-        store.create("bob", "hash-b").await.unwrap();
+        store.create("alice", "hash-a", "admin").await.unwrap();
+        store.create("bob", "hash-b", "viewer").await.unwrap();
         assert_eq!(store.count().await.unwrap(), 2);
 
         let alice = store.get("alice").await.unwrap().unwrap();
         assert_eq!(alice.username, "alice");
         assert_eq!(alice.password_hash, "hash-a");
+        assert_eq!(alice.role, "admin");
+        assert!(store.set_role("bob", "operator").await.unwrap());
+        assert_eq!(store.get("bob").await.unwrap().unwrap().role, "operator");
+        assert!(!store.set_role("nobody", "operator").await.unwrap());
+        assert!(store.set_password_hash("bob", "hash-b2").await.unwrap());
+        assert_eq!(
+            store.get("bob").await.unwrap().unwrap().password_hash,
+            "hash-b2"
+        );
+        assert!(!store.set_password_hash("nobody", "x").await.unwrap());
 
         // list() is sorted by username.
         let names: Vec<String> = store
@@ -198,8 +263,8 @@ mod tests {
     #[tokio::test]
     async fn create_rejects_duplicate_username() {
         let store = SqliteUserStore::open_in_memory().unwrap();
-        store.create("alice", "hash-a").await.unwrap();
-        assert!(store.create("alice", "hash-a2").await.is_err());
+        store.create("alice", "hash-a", "viewer").await.unwrap();
+        assert!(store.create("alice", "hash-a2", "viewer").await.is_err());
     }
 
     #[tokio::test]
@@ -209,7 +274,7 @@ mod tests {
         let p = path.to_str().unwrap();
         {
             let store = SqliteUserStore::open(p).unwrap();
-            store.create("alice", "hash-a").await.unwrap();
+            store.create("alice", "hash-a", "viewer").await.unwrap();
         }
         // Re-open the same file: the user survives.
         let store = SqliteUserStore::open(p).unwrap();

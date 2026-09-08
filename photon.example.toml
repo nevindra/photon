@@ -207,3 +207,15 @@ default_apdex_threshold_ms = 500
 #                                                  # (default all four: logs, traces, metrics, rum)
 # interval_secs = 30                               # optional: summary push interval in seconds (default 30, min 5)
 # queue_batches = 1024                             # optional: full-mode tee queue size (default 1024, min 16); dropped on overflow
+
+# --- Docker fleet management ---------------------------------------------------------------
+# Optional. Managed agents, container inventory and lifecycle, compose stacks, templates, staged
+# rollouts, and the audit log (docs/subsystems/deploy.md). Always on; omit the section to accept
+# the defaults. UI users get a role (viewer / operator / admin) that gates every mutating button.
+# [deploy]
+# enabled            = true
+# server_origin      = "https://photon.example"       # the URL agents dial; default: the request's Host
+# ingest_origin      = "http://photon.example:4318"   # where agents POST metrics; default: server_origin + the [ingest] port
+# secret_key_file    = "./data/deploy.key"            # AES-256 key for secret variables at rest (generated when absent)
+# agent_binaries_dir = "./data/agents"                # photon-agent-<arch> served by /api/agent/download + pushed over SSH
+# ssh_bootstrap      = true                           # the "Add host" SSH installer

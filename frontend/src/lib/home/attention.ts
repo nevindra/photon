@@ -34,7 +34,12 @@ import type {
   Monitor,
   RumVitalRow,
   TenantSummary,
+  Stack,
+  Rollout,
+  ManagedHost,
 } from '@/lib/core/api'
+import { driftSummary } from '@/lib/deploy/stacks'
+import { targetCounts } from '@/lib/deploy/rollouts'
 
 // --- Attention Level ---------------------------------------------------------------------------
 
@@ -60,8 +65,8 @@ export type LevelMeta = StatusMeta
 
 // --- Worlds & Subjects -------------------------------------------------------------------------
 
-export type WorldKey = 'frontend' | 'backend' | 'infra' | 'ops' | 'sites'
-export type SubjectKind = 'service' | 'rumApp' | 'host' | 'monitor' | 'site'
+export type WorldKey = 'frontend' | 'backend' | 'infra' | 'deploy' | 'ops' | 'sites'
+export type SubjectKind = 'service' | 'rumApp' | 'host' | 'monitor' | 'site' | 'stack' | 'rollout'
 
 export interface WorldMeta {
   key: WorldKey
@@ -76,10 +81,14 @@ export const WORLDS: WorldMeta[] = [
   { key: 'frontend', name: 'Frontend', noun: 'RUM apps', dest: '/rum' },
   { key: 'backend', name: 'Backend', noun: 'services', dest: '/services' },
   { key: 'infra', name: 'Infra', noun: 'hosts', dest: '/infra' },
-  { key: 'ops', name: 'Ops', noun: 'monitors', dest: '/uptime' },
+  { key: 'ops', name: 'Uptime', noun: 'monitors', dest: '/uptime' },
 ]
 
 export const SITES_WORLD: WorldMeta = { key: 'sites', name: 'Sites', noun: 'sites', dest: '/tenants' }
+// The Deploy world exists once something is under management: stacks (compose projects under
+// desired state) and rollouts. A failed apply or a paused rollout is just another Subject at
+// Critical — no new severity vocabulary (docs/subsystems/deploy.md).
+export const DEPLOY_WORLD: WorldMeta = { key: 'deploy', name: 'Deploy', noun: 'stacks & rollouts', dest: '/deploy/stacks' }
 
 /**
  * Which Worlds this install can show.
@@ -89,9 +98,11 @@ export const SITES_WORLD: WorldMeta = { key: 'sites', name: 'Sites', noun: 'site
  * are always Central's own. Showing them beside `eu-west`'s services under an "eu-west" filter
  * would claim they belong to eu-west, which is a lie the page must not tell.
  */
-export function boardWorlds({ sites = false, ops = true }: { sites?: boolean; ops?: boolean } = {}): WorldMeta[] {
+export function boardWorlds({ sites = false, ops = true, deploy = false }: { sites?: boolean; ops?: boolean; deploy?: boolean } = {}): WorldMeta[] {
   const base = ops ? WORLDS : WORLDS.filter((w) => w.key !== 'ops')
-  return sites ? [...base, SITES_WORLD] : base
+  // Deploy sits between Infra and Uptime (world key `ops`), where the nav puts it.
+  const withDeploy = deploy ? [...base.filter((w) => w.key !== 'ops'), DEPLOY_WORLD, ...base.filter((w) => w.key === 'ops')] : base
+  return sites ? [...withDeploy, SITES_WORLD] : withDeploy
 }
 
 export const KIND_LABEL: Record<SubjectKind, string> = {
@@ -100,6 +111,8 @@ export const KIND_LABEL: Record<SubjectKind, string> = {
   host: 'Host',
   monitor: 'Monitor',
   site: 'Site',
+  stack: 'Stack',
+  rollout: 'Rollout',
 }
 
 /** On Central: how many Sites a Service is unhealthy in, out of how many run it. */
@@ -361,7 +374,7 @@ export function vanishedHostSubject(host: string): Subject {
 // --- Monitors ----------------------------------------------------------------------------------
 
 /**
- * One uptime monitor → an Ops Subject. A monitor is the one Subject kind whose native state IS the
+ * One uptime monitor → an Uptime Subject. A monitor is the one Subject kind whose native state IS the
  * judgment: it is a synthetic probe, so "down" means down, not "probably degraded".
  */
 export function monitorSubject(m: Monitor): Subject {
@@ -429,6 +442,138 @@ export function siteSubject(t: TenantSummary, nowMs: number): Subject {
 // --- Incidents ---------------------------------------------------------------------------------
 
 /** `k=v,k=v` (canonically sorted, `""` = no labels) → a map. Values may themselves contain `=`. */
+// --- Deploy: stacks & rollouts ----------------------------------------------------------------
+
+/**
+ * One Stack → a Deploy Subject. Failed is Critical (the last apply did not succeed, the host may be
+ * running the old version or nothing); Drifted is Warning (what runs no longer matches what was
+ * applied — somebody changed it, and reconciling is a decision). Pending is NOT a level: a host
+ * that has not answered is the normal case on-prem, and a rendered-not-applied generation is an
+ * operator's own choice. Gone stacks are history and do not appear.
+ */
+export function stackSubject(s: Stack): Subject | null {
+  if (s.status === 'gone') return null
+  let level: AttentionLevel = 'ok'
+  const reasons: Reason[] = []
+  let sinceMs: number | null = null
+  if (s.status === 'failed') {
+    level = 'critical'
+    reasons.push({ label: 'Apply failed', value: s.last_error ?? 'the last apply did not succeed' })
+    sinceMs = s.updated_ms
+  } else if (s.status === 'drifted') {
+    level = 'warning'
+    reasons.push({ label: 'Drifted', value: driftSummary(s.drift) })
+    sinceMs = s.drift.reduce<number | null>((m, d) => (m == null || d.since_ms < m ? d.since_ms : m), null)
+  }
+  return {
+    id: `stack:${s.host}/${s.name}`,
+    kind: 'stack',
+    world: 'deploy',
+    name: `${s.name} @ ${s.host}`,
+    sites: level !== 'ok' && s.site ? [s.site] : [],
+    local: !s.site,
+    level,
+    reasons,
+    sinceMs,
+    incidents: 0,
+    spread: null,
+    dest: `/deploy/stacks/${encodeURIComponent(s.id)}`,
+  }
+}
+
+/**
+ * One Rollout → a Deploy Subject, only while it is someone's problem: paused on failures is
+ * Critical, waiting at the gate is Warning (an operator has to decide), running is OK. Finished
+ * rollouts are history.
+ */
+export function rolloutSubject(r: Rollout): Subject | null {
+  if (r.state === 'completed' || r.state === 'aborted' || r.state === 'rolled_back' || r.state === 'draft') return null
+  const c = targetCounts(r.targets)
+  let level: AttentionLevel = 'ok'
+  const reasons: Reason[] = []
+  if (r.state === 'paused_threshold') {
+    level = 'critical'
+    reasons.push({ label: 'Paused', value: `${c.failed} failed in stage ${r.stage} of ${r.stages}` })
+  } else if (r.state === 'paused_gate') {
+    level = 'warning'
+    reasons.push({ label: 'At the gate', value: `canary done, ${c.queued + c.pending} host${c.queued + c.pending === 1 ? '' : 's'} waiting for promote` })
+  } else {
+    reasons.push({ label: 'Running', value: `stage ${r.stage} of ${r.stages} · ${c.healthy}/${c.total} healthy` })
+  }
+  const sites = Array.from(new Set(r.targets.map((t) => t.site).filter((x): x is string => !!x)))
+  return {
+    id: `rollout:${r.id}`,
+    kind: 'rollout',
+    world: 'deploy',
+    name: r.name,
+    sites: level !== 'ok' ? sites : [],
+    local: !sites.length,
+    level,
+    reasons,
+    sinceMs: r.updated_ms,
+    incidents: 0,
+    spread: null,
+    dest: `/deploy/rollouts/${encodeURIComponent(r.id)}`,
+  }
+}
+
+/**
+ * One managed agent → an Infra Subject (host page, Agent tab). Offline is Down: it reported, then
+ * stopped, and the stopping is the news. Waiting for first sync is Unknown: enrolled, never seen,
+ * and Photon says which rather than guessing. A full Docker disk is the number that actually
+ * kills on-prem boxes, so it is judged here too — Critical at 90%, Warning at 80% — with the
+ * reclaimable bytes in the reason, because "prune would free 3.1 GB" is the action.
+ */
+export function agentSubject(h: ManagedHost, nowMs: number): Subject | null {
+  let level: AttentionLevel = 'ok'
+  const reasons: Reason[] = []
+  let sinceMs: number | null = null
+  if (h.status === 'offline') {
+    level = 'down'
+    reasons.push({ label: 'Agent offline', value: h.last_seen_ms ? `last sync ${compactAge(nowMs - h.last_seen_ms)} ago` : 'stopped reporting' })
+    sinceMs = h.last_seen_ms
+  } else if (h.status === 'pending') {
+    level = 'unknown'
+    reasons.push({ label: 'Waiting for first sync', value: 'enrolled, agent not heard from yet' })
+    sinceMs = h.enrolled_ms
+  }
+  const d = h.docker?.disk
+  if (d && d.total_bytes && d.used_bytes != null) {
+    const pct = d.used_bytes / d.total_bytes
+    if (pct >= 0.9 || pct >= 0.8) {
+      const lvl: AttentionLevel = pct >= 0.9 ? 'critical' : 'warning'
+      if (LEVEL_RANK[lvl] < LEVEL_RANK[level] || level === 'ok' || level === 'unknown') level = LEVEL_RANK[lvl] < LEVEL_RANK[level] ? lvl : level
+      reasons.push({ label: 'Disk', value: `${Math.round(pct * 100)}% used${d.reclaimable_bytes ? ` · prune would free ${(d.reclaimable_bytes / 1024 ** 3).toFixed(1)} GB` : ''}` })
+    }
+  }
+  return {
+    id: `host:${h.host}`,
+    kind: 'host',
+    world: 'infra',
+    name: h.host,
+    sites: level !== 'ok' && h.site ? [h.site] : [],
+    local: !h.site,
+    level,
+    reasons,
+    sinceMs,
+    incidents: 0,
+    spread: null,
+    dest: `/infra/${encodeURIComponent(h.host)}/agent`,
+  }
+}
+
+/** Fold a second judgment about the same Subject into the first: worst level wins, reasons add up. */
+export function mergeSubject(into: Subject, from: Subject): Subject {
+  if (LEVEL_RANK[from.level] < LEVEL_RANK[into.level]) {
+    into.level = from.level
+    into.sinceMs = from.sinceMs ?? into.sinceMs
+    into.dest = from.dest
+  }
+  into.reasons.push(...from.reasons)
+  for (const s of from.sites) if (!into.sites.includes(s)) into.sites.push(s)
+  return into
+}
+
 export function parseSeriesKey(key: string | null | undefined): Record<string, string> {
   const out: Record<string, string> = {}
   for (const part of (key ?? '').split(',')) {

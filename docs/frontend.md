@@ -131,30 +131,57 @@ the picker that was just used. It does apply the Site term — environments are 
 | `/metrics` · `/metrics/catalog` | `MetricsExplorer.vue` (reused) | Metrics explorer |
 | `/rum` · `/rum/:appId` · `/rum/:appId/pages[/:route]` · `/rum/:appId/errors` | `Rum*View.vue` | RUM (apps · vitals · pages/detail · errors) |
 | `/uptime` | `UptimeDashboard.vue` | Uptime |
-| `/infra` · `/infra/:host` | `InfraHostsView.vue` · `InfraHostDetailView.vue` | Infrastructure (host/GPU resource monitoring) |
+| `/infra` · `/infra/:host` · `/infra/:host/containers` · `/infra/:host/agent` | `InfraHostsView.vue` · `InfraHostDetailView.vue` · `InfraHostContainersView.vue` · `InfraHostAgentView.vue` | Infrastructure (host/GPU resource monitoring; the Agent tab is Docker fleet management, see [`subsystems/deploy.md`](subsystems/deploy.md)) |
 | `/data` | `DataView.vue` | Usage / storage / retention |
 | `/alerts` | `AlertsView.vue` | Alerts (webhook rules, incidents, channels) |
 | `/tenants` | `TenantsView.vue` | Federation: live fleet-health board + tenant registry (central-side) |
+| `/deploy/templates` · `/deploy/templates/:id` | `TemplatesView.vue` · `TemplateDetailView.vue` | The Deploy world: the template catalog and the deploy wizard (see [`subsystems/deploy.md`](subsystems/deploy.md)) |
+| `/deploy/rollouts` · `/deploy/rollouts/:id` | `RolloutsView.vue` · `RolloutDetailView.vue` | The Deploy world: staged rollouts of a template version (see [`subsystems/deploy.md`](subsystems/deploy.md)) |
+| `/deploy/stacks` · `/deploy/stacks/:id` | `StacksView.vue` · `StackDetailView.vue` | The Deploy world: compose stacks under desired state (see [`subsystems/deploy.md`](subsystems/deploy.md)) |
+| `/audit` | `AuditView.vue` | The audit log — every mutation Photon made to a host (see [`subsystems/deploy.md`](subsystems/deploy.md)) |
+| `/settings/users` (`/settings` redirects here) | `UsersView.vue` | Who can sign in and what each may change: the paged users table (in-place role picker for an admin, a key that sets a password — your own with the current one, anyone's as admin — and a Remove that explains a refusal), the "Add a user" modal with inline validation, a password confirmation and role cards, and the anti-lockout note (see [`subsystems/auth.md`](subsystems/auth.md)). Reached from the rail's gear; replaced the Settings modal |
 | `/login` · `/onboarding` | `LoginView.vue` · `OnboardingView.vue` | Auth (public) |
 
 `router/index.js` has a global `beforeEach` guard: cached `hydrate()` auth probe, onboarding-first
 gating, then login gating. Static sub-paths are declared **before** dynamic catch-alls (e.g.
 `/traces/metrics` before `/traces/:traceId`; `/rum/:appId/pages` before `/rum/:appId`).
 
-NavRail (`components/common/NavRail.vue`) groups routes into ownership **worlds** rather than a flat
-per-signal list: an ungrouped **Home** entry, then three worlds — **Frontend** (→ `/rum`), **Backend**
-(→ `/services`), **Infrastructure** (two items: **Hosts** → `/infra`, **Ops** → `/uptime`) — Frontend
-and Backend are each today a single landing item into an existing route (room to grow their own
-sub-nav later), then **Explore** (Logs · Traces · Metrics, the raw per-signal browsers) and **Manage**
-(Data, then Alerts — the cross-signal webhook alert engine — then Tenants, the federation tenant registry). The rail is 74px wide, so a group
-**heading** has room for ~10 characters at its 9px uppercase/`tracking-wider` size — the
-Infrastructure world is headed **"Infra"** for that reason (the full word overflowed both edges and
-was clipped by the rail border, reading as a mis-centred label; it stays full-length in breadcrumbs).
-Headings also `truncate`, so an over-long one clips cleanly instead of bleeding. `AppShell.vue`
-derives which group to
-highlight from the route via a `ROUTE_GROUP` map (e.g.
-`/rum` → `frontend`, `/infra` → `infra`) and the inverse `LANDING` map picks the route a NavRail click
-pushes to.
+NavRail (`components/common/NavRail.vue`) groups routes by **what the operator is trying to do**
+rather than as a flat per-signal list: an ungrouped **Home** entry, then four groups, each headed by a
+verb —
+
+- **Monitor** — the health of what you run, ordered outside-in: **Frontend** (→ `/rum`), **Backend**
+  (→ `/services`), **Hosts** (→ `/infra`), **Uptime** (→ `/uptime`). These are the ownership *worlds*
+  the Attention Board rolls up by; the item labelled "Ops" is now "Uptime" (the old word named nothing
+  a first-time user could guess, and `/uptime` is what it opens).
+- **Explore** — the raw signals underneath those judgments: Logs · Traces · Metrics.
+- **Deploy** — changing what runs: Templates · Stacks · Rollouts.
+- **Manage** — Photon itself: Alerts (the cross-signal alert engine), Data (storage + retention),
+  Tenants (the federation registry), Audit (what Photon changed on your hosts).
+
+The previous layout was seven groups for sixteen items — two one-item worlds whose headings were
+suppressed, and an "Infra" heading over Hosts + Ops — which read as a list with random gaps. Each
+heading now sits on a hairline so the four groups read as four groups in a 74px column. A heading
+has room for ~10 characters at its 9px uppercase/`tracking-wider` size ("Infrastructure" once
+overflowed both edges and was clipped by the rail border; "Monitor" fits) and `truncate`s so an
+over-long one clips cleanly instead of bleeding. The group column scrolls with a hidden scrollbar
+(and a bottom fade while it actually overflows) rather than pushing the account cluster off a short
+viewport.
+
+**Every item has its own two-tone icon** (`components/common/nav-icons/`, one SFC per item wrapping
+`NavIconBase.vue`). Two colours only: the NEUTRAL parts inherit `currentColor` (muted grey idle, the
+foreground ink on the active item) and the ACCENT parts read the `--ni-accent` custom property, which
+NavRail sets to Photon Cyan — softened to 70% while idle so fifteen accents stay a rail and not a
+rainbow, full strength on hover and on the active item. Each accent is the part that *does* the
+item's job: the heartbeat inside Home's house, the user's cursor in Frontend's browser window, the
+needle on Backend's gauge, the lit LEDs on Hosts' rack, the pulse through Uptime's probe ring, the
+highlighted line in Logs, the selected span in Traces' waterfall, the trend over Metrics' bars, the
+header block of Templates' layout, the top layer of Stacks, Rollouts' rocket window + flame, Alerts'
+badge, the stored band of Data's cylinder, the Central hub among Tenants' sites, and Audit's check.
+The classes are `ni-accent` (accent stroke), `ni-accent-fill` (accent fill + stroke) and `ni-fill`
+(neutral fill); outside the rail an icon falls back to the plain brand token. `AppShell.vue` derives
+which item to highlight from the route via a `ROUTE_GROUP` map (e.g. `/rum` → `frontend`, `/uptime`
+→ `uptime`) and the inverse `LANDING` map picks the route a NavRail click pushes to.
 
 ## The Attention Board (`/home`)
 
@@ -182,13 +209,16 @@ Central) is in [`../CONTEXT.md`](../CONTEXT.md). What matters for the code:
   gives hosts a finer signal). This is what stops a service falling to zero traffic from reading as
   a calm neutral nothing and disappearing — the old `idle` level covered both facts at once and is
   retired.
+- **The Deploy world joins the board once something is under management** (`DEPLOY_WORLD`,
+  `stackSubject`, `rolloutSubject`): a failed apply or a rollout paused on failures is Critical,
+  drift or a rollout waiting at its gate is Warning — the same five words as everything else.
 - **The roll-up cards are the filter.** No tabs. Each card always shows its World's full tallies and
   toggles `?world=<key>` in place.
 - **Merging across Sites is Services-only.** `RedRow.tenant` is populated for `group=service`, so
   same-named service rows merge into one Subject carrying a **Spread** (`2 of 3 sites`). Hosts and
   monitors never merge. RUM apps could not merge without one query per Site, so they do not.
 - **A tenant filter is a lens, and the board narrows honestly.** Services, RUM apps and hosts carry
-  the tenant dimension; uptime and the alert engine do not, so under a lens the **Ops** world is
+  the tenant dimension; uptime and the alert engine do not, so under a lens the **Uptime** world (key `ops`) is
   dropped rather than mislabelled as the Site's, and incidents that resolve to another Site's
   Subject stay out of the Unattributed banner. Per-row Site labelling (the Site badge, the Spread
   chip, the `central` marker) also switches off — the board spans one place and the breadcrumb
@@ -307,14 +337,27 @@ release you want is almost always a recent one.
   forward their `SearchBar` into that slot via `AppShell`'s `toolbar` slot; non-searchable views
   leave it empty and the breadcrumb labels the page), `PhotonMark`, `SearchBar` (query-language
   input + autocomplete), `RelatedMenu` ("Related ▾" cross-signal destination dropdown),
-  `TimeRangePicker`, `ColumnPicker`, `LiveControl` (refresh mode), `ThemeToggle`, `SettingsDialog`,
-  `SettingsUsers`.
+  `TimeRangePicker`, `ColumnPicker`, `LiveControl` (refresh mode), `ThemeToggle`. The rail's gear
+  navigates to `/settings/users` (nav key `settings`); the Settings modal it used to open is gone.
+- **`settings/`** (the `/settings/users` page) — `UsersTable.vue` (rows with `UserAvatar`, a
+  `RoleBadge` or an in-place `SelectMenu` for an admin, an age from `addedLabel`, a key whose
+  disabled reason comes from `passwordBlockedReason`, and a Remove whose disabled reason comes from
+  `removeBlockedReason`; the view pages its rows through `lib/core/users.ts`'s `paginate` and the
+  `ui/pagination` strip), `AddUserDialog.vue` (the modal off the header's `GatedButton`: server rules
+  restated by `validateCredentials` before the round trip, three radio cards for the role, and the
+  form reset on every open), `PasswordFields.vue` (password + confirmation with one reveal toggle and
+  live "Long enough." / "Matches." checks, shared by both dialogs), `ChangePasswordDialog.vue` (two
+  shapes in one: your own asks for the current password, an admin's reset of someone else does not),
+  `RolesCard.vue` (the role explainer, shown beside the table to a non-admin), `RemoveUserDialog.vue`
+  (one plain confirmation), `RoleBadge.vue`, `UserAvatar.vue`.
 - **`logs/` · `traces/` · `services/` · `metrics/` · `uptime/` · `data/` · `rum/` · `infra/` ·
   `alerts/`** — the per-signal domain components (see the per-feature docs in
   [`subsystems/`](subsystems/) for the file lists). `infra/` (host/GPU resource monitoring):
-  `HostFleetKpis.vue` (the `/infra` fleet KPI band — host/warning/critical counts, avg CPU, GPU
-  hosts, derived client-side from the host list) + `HostCard.vue` (the host card grid replacing the
-  old `HostTable.vue` — CPU/MEM/DSK/GPU meters, a worst-resource degraded flag, last-seen),
+  `HostFleetSummary.vue` (the `/infra` fleet in one line — host / critical / warning / waiting
+  counts that double as the `?status=` filter, avg CPU, GPU hosts, containers) +
+  `HostFleetTable.vue` (the fleet as one table, metrics hosts and managed agents unioned by
+  `lib/infra/fleet.ts`, ranked worst first, a "why" column in words beside the CPU/MEM/DSK/GPU
+  meters),
   `HostStatTiles.vue` (the
   `/infra/:host` glance stat-tile row — last-point derivation off a shared series bundle, 80%/90%
   warn/error tint), `HostResourcePanels.vue` (presentational per-resource trend cards — each chart in
@@ -336,6 +379,36 @@ release you want is almost always a recent one.
   Customize into a `:seed`-ed `AlertRuleDialog`; templates come from `lib/alertTemplates.ts`),
   `IncidentsTable`, `ChannelsGrid`/`ChannelCard`/`ChannelDialog` — see
   [`subsystems/alerts.md`](subsystems/alerts.md).
+- **`docker/`** (the read-only Docker inventory on `/infra/:host/containers`,
+  [`subsystems/deploy.md`](subsystems/deploy.md)) — `HostContainersPanel` (owns the inventory
+  query + `?view=`/`?q=`/`?c=`), `ContainerKpis`, `ContainerGroup` (one compose project as a panel
+  of flat rows), `ImagesTable`/`VolumesTable`/`NetworksTable`, `DockerEventsFeed`, and the
+  `ContainerDrawer` with `ContainerLogView` (tail + 1s follow poll, pinned-to-bottom with a "new
+  lines" chip), `ContainerStatsView` (six `MiniAreaChart`s), `ContainerDetails`. Lifecycle (phase 2):
+  `ContainerActionMenu` (primary + more, disabled-with-reason), `ActionConfirmDialog` (risk-sized
+  confirmation, offline → queued), `PruneDialog` (preview first, volumes opt-in + typed),
+  `HostActionsStrip` (queued / running / done rows, beside the events feed).
+- **`deploy/`** (Docker fleet management, [`subsystems/deploy.md`](subsystems/deploy.md)) —
+  `GatedButton.vue` (a Button that knows the role it needs: disabled + a tooltip naming the role
+  when the signed-in user falls short — never hidden), `AuditTable.vue` (the `/audit` rows with a
+  click-to-expand detail line); the Stacks pieces: `StacksTable`/`StackStatusPill`,
+  `NewStackDialog` (write compose or adopt a running project), `ComposeEditor` (file tabs + a
+  live Checks panel) with `ComposeWarnings` (one acknowledgement per dangerous construct) and
+  `DeployOptionsForm`, `StackActionDialog` (apply / restart / redeploy / down / destroy /
+  reconcile, sized confirmations), `StackServicesGrid`, `StackDriftPanel`; the Templates pieces:
+  `TemplateCard`/`TemplateIcon`, `VariableField`/`VariablesForm` (typed controls off the manifest),
+  `DeployTemplateDialog` (Target → Variables → Preflight → Deploy; also the upgrade path),
+  `PreflightList`, `DiffView` (collapsed line diff), `RegistriesDialog` (+ Portainer JSON import),
+  `PublishVersionDialog` (structured manifest, immutable versions); the Rollouts pieces:
+  `RolloutStatePill`/`TargetStatusPill`, `RolloutProgressBar`, `RolloutStageBoard` (stages with the
+  gate drawn between them), `RolloutActionDialog`, `NewRolloutDialog` (Template → Targets →
+  Variables → Strategy → Review with per-target preflight and acknowledgements); the tie-ins
+  `DeployImpactPanel` ("did it work?" — before/after RED with a verdict), `CanaryVerdictPanel`,
+  `TemplateVersionMatrix`, `VersionDiff`; `DeployUnavailable` (what a Deploy surface shows on a
+  server without the subsystem). Under `infra/`: `HostScaffold.vue` + `HostSubNav.vue` (the shared
+  chrome of every `/infra/:host/*` tab, like `ServiceScaffold`), `HostAgentPanel.vue` (the Agent
+  tab), `AddHostDialog.vue` (SSH bootstrap with a per-host stepper, or a minted token shown once),
+  `CapabilityPicker.vue`, `AgentTokenPanel.vue`, `DockerDiskBar.vue`.
 - **`home/`** (the Attention Board) — `WatchRangePicker.vue` (the bounded 5m/15m/1h/6h Segmented that
   replaces the global time picker on `/home`), `WorldRollupCard.vue` (one World's tallies, and the
   page's filter control — the card IS the filter), `SubjectRow.vue` (one Subject that needs
@@ -370,12 +443,14 @@ flat/instant density rule above.
 | `status-dot` / `status-pill` | small tone-colored dot / pill label. `StatusPill` also takes `solid` — the full-strength tone with reversed text, spent on the ONE state per screen that must not be mistaken for a milder neighbour (`/home` gives it to **Down**); two solid pills side by side cancel each other out | TS |
 | `peek-drawer` | Sheet-based side drawer with prev/next stepping through a list | JS |
 | `meter` | horizontal 0–1 proportion bar, tone-colored | TS |
-| `select-menu` | compact toolbar dropdown-select on Popover (jsdom-testable, unlike Reka Select); recessed field | JS |
+| `select-menu` | dropdown-select on Popover (jsdom-testable, unlike Reka Select). `size="sm"` (default) is the compact toolbar trigger; `size="md"` is a form field sized exactly like `Input` (h-9, text-sm, full width) so it sits level beside inputs in a dialog form. `id`/`class` are forwarded to the trigger — the root is renderless — and a caller's `id` is seeded into Reka's popover context so a `FormField`'s `for=` and the content's `aria-labelledby` both resolve to it | JS |
 | `empty-state` | no-data placeholder | TS |
 | `kbd` | keyboard-key chip | TS |
 | `number-field` | numeric form control; recessed field | TS |
 | `date-picker` | single-date popover picker modeled on `TimeRangePicker` (preset "older than" cutoffs + a specific calendar date); emits an ISO `YYYY-MM-DD` string | TS |
 | `facet` | the Fields facet catalog (search + promoted/attribute grouping + `useQueries` fan-out); data-source-agnostic via an injected page adapter | JS |
+| `textarea` | multi-line sibling of `input`, same flat field look; `mono` for code (compose files, keys, address lists) | TS |
+| `pagination` | the strip under a client-paged table: `from–to of total`, a per-page `select-menu`, Previous/Next; every number comes from the parent's `paginate()` result so it never disagrees with the rows | TS |
 
 > The **switcher rule**: `Segmented` = in-place toggle between mutually-exclusive views; Reka `Tabs` =
 > in-page panels; `nav-tabs` = route-level sub-navigation. Don't conflate them.
@@ -474,6 +549,13 @@ follow the same contract) plus its signal-specific helpers:
 - `alertTemplates.ts` (root `lib/`) — the static, read-only 23-template quick-setup catalog (Service/
   App/Host/Global) + `build(target)` target substitution, consumed by `TemplatePickerDialog`; frontend-
   only, no backend counterpart.
+
+**`deploy/` — Docker fleet management** ([`subsystems/deploy.md`](subsystems/deploy.md)):
+`roles.ts` (the viewer/operator/admin model + `roleAllows`/`permissionHint`; `lib/core/auth.ts`
+exposes the signed-in user's `role` and `can()` over it), `agentStatus.ts` (agent status/capability
+vocabulary + the install snippet), `audit.ts` (action phrases, result tones, the *Since* picker), `containers.ts` (container state/health tones, compose-project grouping, port formatting, event labels), `actions.ts` (the one-shot Action vocabulary and its confirmation policy), `stacks.ts` (stack status vocabulary, generation labels, drift summaries, list filters), `compose.ts` (the dangerous-construct lint, service/variable scans, `.env` parsing, path and size rules), `templates.ts` (variable types, defaults, validation, `.env` render, semver, manifest YAML), `diff.ts` (LCS line diff + collapse), `portainer.ts` (Portainer v2/v3 JSON → templates), `rollouts.ts` (rollout/target vocabulary, selector resolution, canary staging), `impact.ts` (the before/after RED judge), `availability.ts` (the demo switch and `DeployUnavailableError`),
+`deployQueries.ts` (agents, enrolment, bootstrap-job polling, audit). The mock corpus is
+`core/mockDeploy.ts`, kept apart from the telemetry corpus in `core/mock.ts`.
 
 ## Conventions
 

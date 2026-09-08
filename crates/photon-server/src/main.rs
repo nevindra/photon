@@ -46,6 +46,7 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 /// The alerts `ConditionSource` seam over the three query engines (wired into the scheduler in a
 /// later task). Kept as a module so it can carry its own tests without bloating `main`.
 mod alerts_source;
+mod deploy;
 /// Tenant-side federation: the summary pusher (always on when `[federation]` is present) and,
 /// in `full` mode, the OTLP tee/forwarder that mirrors raw batches to central.
 mod federation;
@@ -705,6 +706,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(photon_api::TenantApi::new(tenant_store, tenant_tokens.clone()).await?)
     };
 
+    let deploy_api = if cfg.deploy.enabled {
+        Some(spawn_deploy(&cfg, deployment_store.clone())?)
+    } else {
+        None
+    };
+
     let api = ApiServer::new(
         query,
         span_query,
@@ -712,6 +719,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_store,
         &cfg.auth.session_secret,
     )
+    .with_deploy(deploy_api)
     .with_uptime(Some(uptime_api))
     .with_alerts(Some(alerts_api))
     .with_data_admin(Some(data_admin))
@@ -859,6 +867,87 @@ async fn seed_retention(settings: &dyn SettingsStore, signal: &str, default: u32
 /// (or replication) has silently stopped, letting WAL segments accumulate until disk fills.
 /// Detect + log only, deliberately not respawning: turns a silently wedged task into a visible
 /// operator-facing error instead.
+/// Docker fleet management: the SQLite store, the secrets cipher, the in-memory hub, the SSH
+/// bootstrapper, and the supervisor tick — wired into one `DeployApi` for photon-api.
+fn spawn_deploy(
+    cfg: &Config,
+    deployments: Arc<dyn photon_api::deployments::DeploymentStore>,
+) -> Result<photon_api::deploy::DeployApi, Box<dyn std::error::Error>> {
+    use photon_api::deploy::{DeployApi, DeployHub, IngestHint};
+    let db_dir = std::path::Path::new(&cfg.storage.db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let store = Arc::new(deploy::store::SqliteDeployStore::open(
+        &cfg.storage.db_path,
+    )?);
+    let key_file = cfg
+        .deploy
+        .secret_key_file
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| db_dir.join("deploy.key"));
+    let cipher = Arc::new(deploy::cipher::AesCipher::open(&key_file)?);
+    let binaries = cfg
+        .deploy
+        .agent_binaries_dir
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| db_dir.join("agents"));
+    // The ingest hint: where an agent should POST its metrics. `[deploy].ingest_origin` wins;
+    // else the server origin with the ingest port; else `{host}` with the ingest port, which
+    // the sync handler fills in from the host the agent reached us at.
+    let ingest = {
+        let port = cfg
+            .ingest
+            .http_addr
+            .rsplit(':')
+            .next()
+            .unwrap_or("4318")
+            .to_string();
+        let origin = cfg.deploy.ingest_origin.clone().or_else(|| {
+            cfg.deploy.server_origin.as_ref().map(|o| {
+                let o = o.trim_end_matches('/');
+                // Replace the port (or add one) on the server origin.
+                let (scheme, rest) = o.split_once("://").unwrap_or(("http", o));
+                let host = rest.split('/').next().unwrap_or(rest);
+                let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+                format!("{scheme}://{host}:{port}")
+            })
+        });
+        let origin = origin.or_else(|| Some(format!("http://{{host}}:{port}")));
+        origin.map(|o| IngestHint {
+            metrics_endpoint: format!("{}/v1/metrics", o.trim_end_matches('/')),
+            logs_endpoint: format!("{}/v1/logs", o.trim_end_matches('/')),
+            token: cfg.ingest.token.clone(),
+        })
+    };
+    let bootstrapper: Option<Arc<dyn photon_api::deploy::Bootstrapper>> =
+        if cfg.deploy.ssh_bootstrap {
+            Some(Arc::new(deploy::bootstrap::SshBootstrapper))
+        } else {
+            None
+        };
+    let latest_agent_version = deploy::bundled_agent_version(&binaries);
+    let api = DeployApi {
+        store,
+        cipher,
+        hub: Arc::new(DeployHub::new()),
+        bootstrapper,
+        agent_binaries_dir: Some(binaries),
+        ingest,
+        latest_agent_version,
+        server_origin: cfg.deploy.server_origin.clone(),
+        deployments: Some(deployments),
+    };
+    supervise(
+        "deploy-supervisor",
+        tokio::spawn(photon_api::deploy::supervisor::run(api.clone())),
+    );
+    Ok(api)
+}
+
 fn supervise(name: &'static str, handle: tokio::task::JoinHandle<()>) {
     tokio::spawn(async move {
         match handle.await {

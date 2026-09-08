@@ -10,6 +10,7 @@ pub mod alerts;
 mod assets;
 mod auth;
 mod data;
+pub mod deploy;
 pub mod deployments;
 mod facet;
 mod federation;
@@ -47,7 +48,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::FromRef;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{middleware, Router};
 use axum_extra::extract::cookie::Key;
 
@@ -116,6 +117,8 @@ pub struct ApiServer {
     /// `/api/deployments` returning 404 — set via [`ApiServer::with_deployments`].
     deployments: Option<Arc<dyn deployments::DeploymentStore>>,
     slos: Option<Arc<dyn slo::SloStore>>,
+    /// Docker fleet management (`deploy.rs`): agents, stacks, templates, rollouts, audit.
+    deploy: Option<deploy::DeployApi>,
 }
 
 /// Shared, immutable application state: a cheap-to-clone handle over an `Arc`. Handlers pull
@@ -157,6 +160,7 @@ pub(crate) struct AppStateInner {
     pub(crate) deployments: Option<Arc<dyn deployments::DeploymentStore>>,
     /// The SLO table; read by `slo.rs`. `None` disables `/api/services/:service/slos*`.
     pub(crate) slos: Option<Arc<dyn slo::SloStore>>,
+    pub(crate) deploy: Option<deploy::DeployApi>,
 }
 
 impl std::ops::Deref for AppState {
@@ -201,6 +205,7 @@ impl ApiServer {
             rollup: None,
             deployments: None,
             slos: None,
+            deploy: None,
             compaction: None,
         }
     }
@@ -306,6 +311,14 @@ impl ApiServer {
         self
     }
 
+    /// Docker fleet management: the session+role routes under `/api/agents|stacks|templates|
+    /// registries|image-registries|rollouts|audit|exec` and the agent-token control channel under
+    /// `/api/agent/*`.
+    pub fn with_deploy(mut self, deploy: Option<deploy::DeployApi>) -> Self {
+        self.deploy = deploy;
+        self
+    }
+
     /// Bind `addr` and serve until the process is terminated.
     pub async fn serve(self, addr: SocketAddr) -> Result<(), PhotonError> {
         let app = self.into_router();
@@ -339,6 +352,7 @@ impl ApiServer {
             rollup: self.rollup,
             deployments: self.deployments,
             slos: self.slos,
+            deploy: self.deploy,
         }));
 
         // Everything except `/api/login` requires a valid signed `photon_session` cookie.
@@ -485,7 +499,102 @@ impl ApiServer {
             .route("/federation/status", get(federation::status))
             .route("/logout", post(auth::logout))
             .route("/users", get(auth::list_users).post(auth::create_user))
-            .route("/users/:username", axum::routing::delete(auth::delete_user))
+            .route(
+                "/users/:username",
+                axum::routing::patch(auth::update_user_role).delete(auth::delete_user),
+            )
+            .route("/users/:username/password", put(auth::change_password))
+            .route(
+                "/agents",
+                get(deploy::agents::list).post(deploy::agents::enroll),
+            )
+            .route("/agents/bootstrap", post(deploy::agents::start_bootstrap))
+            .route("/agents/bootstrap/:id", get(deploy::agents::bootstrap_job))
+            .route(
+                "/agents/:host",
+                get(deploy::agents::get)
+                    .patch(deploy::agents::patch)
+                    .delete(deploy::agents::remove),
+            )
+            .route("/agents/:host/rotate-key", post(deploy::agents::rotate))
+            .route("/agents/:host/upgrade", post(deploy::agents::upgrade))
+            .route("/agents/:host/inventory", get(deploy::inventory::inventory))
+            .route(
+                "/agents/:host/containers/:id/logs",
+                get(deploy::inventory::logs),
+            )
+            .route(
+                "/agents/:host/containers/:id/stats",
+                get(deploy::inventory::stats),
+            )
+            .route(
+                "/agents/:host/containers/:id/exec",
+                post(deploy::inventory::open_exec),
+            )
+            .route("/agents/:host/events", get(deploy::inventory::events))
+            .route(
+                "/agents/:host/actions",
+                get(deploy::actions::list).post(deploy::actions::create),
+            )
+            .route(
+                "/agents/:host/prune/preview",
+                get(deploy::inventory::prune_preview),
+            )
+            .route(
+                "/agents/:host/compose-projects",
+                get(deploy::inventory::compose_projects),
+            )
+            .route("/exec/:id/input", post(deploy::inventory::exec_input))
+            .route(
+                "/exec/:id",
+                axum::routing::delete(deploy::inventory::close_exec),
+            )
+            .route("/audit", get(deploy::audit::list))
+            .route(
+                "/stacks",
+                get(deploy::stacks::list).post(deploy::stacks::create),
+            )
+            .route("/stacks/validate", post(deploy::stacks::validate))
+            .route("/stacks/adopt", post(deploy::stacks::adopt))
+            .route(
+                "/stacks/:id",
+                get(deploy::stacks::get).patch(deploy::stacks::patch),
+            )
+            .route("/stacks/:id/:kind", post(deploy::stacks::action))
+            .route("/templates", get(deploy::templates::list))
+            .route("/templates/versions", post(deploy::templates::publish))
+            .route("/templates/versions/:id", get(deploy::templates::version))
+            .route("/templates/import", post(deploy::templates::import))
+            .route("/templates/dry-run", post(deploy::templates::dry_run))
+            .route("/templates/deploy", post(deploy::templates::deploy))
+            .route("/templates/:id", get(deploy::templates::get))
+            .route(
+                "/registries",
+                get(deploy::templates::registries).post(deploy::templates::add_registry),
+            )
+            .route(
+                "/registries/:id",
+                axum::routing::delete(deploy::templates::delete_registry),
+            )
+            .route(
+                "/registries/:id/sync",
+                post(deploy::templates::sync_registry),
+            )
+            .route(
+                "/image-registries",
+                get(deploy::image_registries::list).post(deploy::image_registries::create),
+            )
+            .route(
+                "/image-registries/:id",
+                axum::routing::patch(deploy::image_registries::update)
+                    .delete(deploy::image_registries::delete),
+            )
+            .route(
+                "/rollouts",
+                get(deploy::rollouts::list).post(deploy::rollouts::create),
+            )
+            .route("/rollouts/:id", get(deploy::rollouts::get))
+            .route("/rollouts/:id/:kind", post(deploy::rollouts::action))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 auth::require_auth,
@@ -512,11 +621,25 @@ impl ApiServer {
             Router::new().route("/rum", post(rum::beacon)).layer(cors)
         };
 
+        // The agent control channel: per-host bearer token inside each handler, no cookie.
+        let agent_router = Router::new()
+            .route("/agent/sync", post(deploy::sync::sync))
+            .route("/agent/secrets", post(deploy::sync::secrets))
+            .route("/agent/registry-auth", post(deploy::sync::registry_auth))
+            .route("/agent/stream/:session", post(deploy::sync::stream_upload))
+            .route(
+                "/agent/stream/:session/input",
+                get(deploy::sync::stream_input),
+            )
+            .route("/agent/download", get(deploy::agents::download))
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+
         let api = Router::new()
             .route("/login", post(auth::login))
             .route("/setup", post(auth::setup))
             .route("/session", get(auth::session))
             .merge(rum_router)
+            .merge(agent_router)
             .merge(protected);
 
         Router::new()
@@ -623,6 +746,7 @@ pub(crate) fn test_state_with_rum(rum: Option<rum::RumApi>) -> AppState {
         rollup: s.rollup.clone(),
         deployments: s.deployments.clone(),
         slos: s.slos.clone(),
+        deploy: None,
     }))
 }
 
@@ -654,6 +778,7 @@ pub(crate) fn test_state_with_tenants_and_metrics(
         rollup: s.rollup.clone(),
         deployments: s.deployments.clone(),
         slos: s.slos.clone(),
+        deploy: None,
     }))
 }
 
@@ -685,6 +810,7 @@ pub(crate) fn test_state_for_slo(
         rollup,
         deployments: s.deployments.clone(),
         slos,
+        deploy: None,
     }))
 }
 
@@ -715,6 +841,7 @@ pub(crate) fn test_state_with_rollup(
         rollup,
         deployments: s.deployments.clone(),
         slos: s.slos.clone(),
+        deploy: None,
     }))
 }
 
@@ -743,6 +870,7 @@ pub(crate) fn test_state_with_tenants(tenants: Option<tenants::TenantApi>) -> Ap
         rollup: s.rollup.clone(),
         deployments: s.deployments.clone(),
         slos: s.slos.clone(),
+        deploy: None,
     }))
 }
 

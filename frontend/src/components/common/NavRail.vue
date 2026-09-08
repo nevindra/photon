@@ -1,23 +1,25 @@
 <script setup>
-import { ref, computed } from 'vue'
-import {
-  Home,
-  MonitorSmartphone,
-  Gauge,
-  Activity,
-  Server,
-  ScrollText,
-  Waypoints,
-  BarChart3,
-  Database,
-  Building2,
-  Bell,
-  Settings,
-  LogOut,
-} from 'lucide-vue-next'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { Settings, LogOut } from 'lucide-vue-next'
 import PhotonMark from '@/components/common/PhotonMark.vue'
 import ThemeToggle from '@/components/common/ThemeToggle.vue'
-import SettingsDialog from '@/components/common/SettingsDialog.vue'
+import {
+  HomeIcon,
+  FrontendIcon,
+  BackendIcon,
+  HostsIcon,
+  UptimeIcon,
+  LogsIcon,
+  TracesIcon,
+  MetricsIcon,
+  TemplatesIcon,
+  StacksIcon,
+  RolloutsIcon,
+  AlertsIcon,
+  DataIcon,
+  TenantsIcon,
+  AuditIcon,
+} from '@/components/common/nav-icons'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import {
   DropdownMenu,
@@ -36,51 +38,79 @@ defineProps({
 })
 const emit = defineEmits(['select', 'logout'])
 
-const settingsOpen = ref(false)
+// The group column scrolls on a short viewport (the rail carries more items than a 900px screen
+// holds). A hidden scrollbar hides the fact, so a bottom fade says "more below" only while the
+// column actually overflows — a fade on a column that fits would just dim the last item.
+const column = ref(null)
+const overflowing = ref(false)
+let ro = null
+function measure() {
+  const el = column.value
+  overflowing.value = !!el && el.scrollHeight > el.clientHeight + 1
+}
+onMounted(() => {
+  measure()
+  if (typeof ResizeObserver !== 'undefined' && column.value) {
+    ro = new ResizeObserver(measure)
+    ro.observe(column.value)
+  }
+})
+onBeforeUnmount(() => ro?.disconnect())
 // Two-letter avatar initials from the signed-in username (falls back to '?').
 const initials = computed(() => (username.value || '?').slice(0, 2).toUpperCase())
 
-// Nav is grouped into ownership "worlds" (Frontend / Backend / Ops — each a single
-// landing item today, room to grow into their own sub-nav later), an Explore section for the raw
-// signal browsers (Logs/Traces/Metrics), and Manage for cross-cutting admin (Data). Home sits
-// ungrouped at the top. `route` is the landing path AppShell pushes to on select (see
-// AppShell.vue's LANDING map); `key` is what's compared against `active` and stamped as
-// `data-nav` for tests/E2E hooks.
+// The rail is grouped by what the operator is trying to DO — four verbs under an ungrouped Home:
+//
+//   Monitor — the health of what you run, outside-in: Frontend (your users' browsers), Backend
+//             (your services), Hosts (the machines), Uptime (the probes watching from outside).
+//   Explore — the raw signals underneath those judgments: Logs, Traces, Metrics.
+//   Deploy  — changing what runs: Templates (recipes), Stacks (what is applied), Rollouts
+//             (applying it in stages).
+//   Manage  — Photon itself: Alerts (the rules and channels), Data (storage + retention),
+//             Tenants (the federation registry), Audit (what Photon changed on your hosts).
+//
+// The earlier layout split Monitor into three fragments (a hidden "Frontend" heading, a hidden
+// "Backend" heading, an "Infra" heading over Hosts + "Ops") — seven groups for sixteen items, with
+// "Ops" an opaque name for the uptime page. Four headings, every one a verb, is the whole idea.
+//
+// `route` is the landing path AppShell pushes to on select (see AppShell.vue's LANDING map); `key`
+// is what's compared against `active` and stamped as `data-nav` for tests/E2E hooks. Headings must
+// fit the 74px rail: ~66px of content at 9px + tracking-wider is about 10 characters ("Monitor",
+// "Explore", "Deploy", "Manage" all do; "Infrastructure" once bled past both edges).
 const NAV_GROUPS = [
-  { items: [{ key: 'home', label: 'Home', icon: Home, route: '/home' }] },
+  { items: [{ key: 'home', label: 'Home', icon: HomeIcon, route: '/home' }] },
   {
-    label: 'Frontend',
-    items: [{ key: 'frontend', label: 'Frontend', icon: MonitorSmartphone, route: '/rum' }],
-  },
-  {
-    label: 'Backend',
-    items: [{ key: 'backend', label: 'Backend', icon: Gauge, route: '/services' }],
-  },
-  {
-    // Rail group labels must fit the 74px rail (~66px of content at 9px + tracking-wider, i.e.
-    // ~10 characters). "Infrastructure" needed ~84px: it bled past both edges and was clipped by
-    // the rail border, reading as a mis-centred label. Short form only here — the world is still
-    // "Infrastructure" everywhere it has room (breadcrumbs, docs), and `/infra` is the route.
-    label: 'Infra',
+    label: 'Monitor',
     items: [
-      { key: 'infra', label: 'Hosts', icon: Server, route: '/infra' },
-      { key: 'infrastructure', label: 'Ops', icon: Activity, route: '/uptime' },
+      { key: 'frontend', label: 'Frontend', icon: FrontendIcon, route: '/rum' },
+      { key: 'backend', label: 'Backend', icon: BackendIcon, route: '/services' },
+      { key: 'infra', label: 'Hosts', icon: HostsIcon, route: '/infra' },
+      { key: 'uptime', label: 'Uptime', icon: UptimeIcon, route: '/uptime' },
     ],
   },
   {
     label: 'Explore',
     items: [
-      { key: 'logs', label: 'Logs', icon: ScrollText, route: '/logs' },
-      { key: 'traces', label: 'Traces', icon: Waypoints, route: '/traces' },
-      { key: 'metrics', label: 'Metrics', icon: BarChart3, route: '/metrics' },
+      { key: 'logs', label: 'Logs', icon: LogsIcon, route: '/logs' },
+      { key: 'traces', label: 'Traces', icon: TracesIcon, route: '/traces' },
+      { key: 'metrics', label: 'Metrics', icon: MetricsIcon, route: '/metrics' },
+    ],
+  },
+  {
+    label: 'Deploy',
+    items: [
+      { key: 'templates', label: 'Templates', icon: TemplatesIcon, route: '/deploy/templates' },
+      { key: 'stacks', label: 'Stacks', icon: StacksIcon, route: '/deploy/stacks' },
+      { key: 'rollouts', label: 'Rollouts', icon: RolloutsIcon, route: '/deploy/rollouts' },
     ],
   },
   {
     label: 'Manage',
     items: [
-      { key: 'data', label: 'Data', icon: Database, route: '/data' },
-      { key: 'alerts', label: 'Alerts', icon: Bell, route: '/alerts' },
-      { key: 'tenants', label: 'Tenants', icon: Building2, route: '/tenants' },
+      { key: 'alerts', label: 'Alerts', icon: AlertsIcon, route: '/alerts' },
+      { key: 'data', label: 'Data', icon: DataIcon, route: '/data' },
+      { key: 'tenants', label: 'Tenants', icon: TenantsIcon, route: '/tenants' },
+      { key: 'audit', label: 'Audit', icon: AuditIcon, route: '/audit' },
     ],
   },
 ]
@@ -102,16 +132,29 @@ function onSelect(item) {
       />
     </div>
 
-    <div class="mt-6 flex w-full flex-col items-center gap-1">
+    <!-- The group column scrolls (scrollbar hidden) rather than pushing the account cluster off a
+         short viewport now that the rail carries more than a dozen items. -->
+    <div
+      ref="column"
+      data-testid="nav-column"
+      :class="cn('mt-4 flex min-h-0 w-full flex-col items-center gap-0.5 overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden', overflowing && '[mask-image:linear-gradient(to_bottom,black_calc(100%-28px),transparent)]')"
+      @scroll="measure"
+    >
       <template v-for="group in NAV_GROUPS" :key="group.label ?? 'root'">
+        <!-- A heading with a hairline above it: the line, not just the whitespace, is what makes
+             four groups read as four groups in a column this narrow. -->
         <div
           v-if="group.label"
           data-nav-group
-          class="mb-1 mt-3 w-full truncate px-1 text-center text-[9px] font-semibold uppercase tracking-wider text-muted-foreground/50"
+          class="mb-0.5 mt-1.5 w-full truncate border-t border-border/70 px-1 pt-1.5 text-center text-[9px] font-semibold uppercase tracking-wider text-muted-foreground/60"
         >
           {{ group.label }}
         </div>
 
+        <!-- Two-tone icons: the neutral strokes follow the button's text colour (muted when idle,
+             ink when active) and the cyan accent is set through --ni-accent by the `nav-item`
+             rules below — softened while idle so fifteen accents stay a rail and not a rainbow,
+             full strength on hover and on the active item. -->
         <button
           v-for="item in group.items"
           :key="item.key"
@@ -119,9 +162,9 @@ function onSelect(item) {
           :data-nav="item.key"
           :class="
             cn(
-              'relative flex w-[58px] flex-col items-center gap-1 rounded-lg py-2 transition-colors',
+              'nav-item relative flex w-[58px] flex-col items-center gap-[3px] rounded-lg py-1 transition-colors',
               item.key === active
-                ? 'bg-brand-soft text-brand'
+                ? 'is-active bg-brand-soft text-brand'
                 : 'text-muted-foreground hover:bg-muted hover:text-foreground',
             )
           "
@@ -131,17 +174,20 @@ function onSelect(item) {
             v-if="item.key === active"
             class="absolute -left-2 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-r-full bg-brand"
           />
-          <component :is="item.icon" class="size-[18px]" />
+          <component
+            :is="item.icon"
+            :class="cn('size-5', item.key === active && 'text-foreground')"
+          />
           <span class="text-[10px] font-medium leading-none">{{ item.label }}</span>
         </button>
       </template>
     </div>
 
-    <div class="mt-auto flex flex-col items-center gap-3 pb-1">
+    <div class="mt-auto flex flex-col items-center gap-1.5 pb-1 pt-2">
       <Tooltip>
         <TooltipTrigger as-child>
           <span
-            class="flex size-8 cursor-default items-center justify-center"
+            class="flex h-4 w-8 cursor-default items-center justify-center"
             :aria-label="mock ? 'demo data' : 'connected'"
           >
             <span
@@ -153,16 +199,25 @@ function onSelect(item) {
         <TooltipContent side="right">{{ mock ? 'demo data' : 'connected' }}</TooltipContent>
       </Tooltip>
 
-      <button
-        type="button"
-        class="flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-        aria-label="Settings"
-        @click="settingsOpen = true"
-      >
-        <Settings class="size-[18px]" />
-      </button>
-
-      <ThemeToggle />
+      <!-- Settings and the theme toggle share a row: the rail is 74px wide, two 32px buttons fit,
+           and the vertical space matters more than the symmetry. -->
+      <div class="flex items-center gap-0.5">
+        <button
+          type="button"
+          data-nav="settings"
+          :class="
+            cn(
+              'flex size-8 items-center justify-center rounded-lg transition-colors',
+              active === 'settings' ? 'bg-brand-soft text-brand' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+            )
+          "
+          aria-label="Settings"
+          @click="emit('select', 'settings')"
+        >
+          <Settings class="size-[18px]" />
+        </button>
+        <ThemeToggle />
+      </div>
 
       <DropdownMenu>
         <DropdownMenuTrigger as-child>
@@ -190,6 +245,17 @@ function onSelect(item) {
       </DropdownMenu>
     </div>
 
-    <SettingsDialog v-if="settingsOpen" v-model:open="settingsOpen" />
   </nav>
 </template>
+
+<style scoped>
+/* The accent tone of a two-tone nav icon (see nav-icons/NavIconBase.vue). Idle items carry the
+   cyan softened; hover and the active item bring it to full strength. */
+.nav-item {
+  --ni-accent: hsl(var(--brand) / 0.7);
+}
+.nav-item:hover,
+.nav-item.is-active {
+  --ni-accent: hsl(var(--brand));
+}
+</style>

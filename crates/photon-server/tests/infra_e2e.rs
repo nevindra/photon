@@ -215,7 +215,7 @@ async fn spawn_infra_server() -> InfraServer {
     let db_path = hot.join("photon.db");
     let user_store = SqliteUserStore::open(db_path.to_str().unwrap()).unwrap();
     user_store
-        .create("admin", &hash_password("admin"))
+        .create("admin", &hash_password("admin"), "admin")
         .await
         .unwrap();
 

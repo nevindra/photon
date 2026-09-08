@@ -5,12 +5,14 @@
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use axum::extract::{Path, Request, State};
+use axum::extract::{FromRequestParts, Path, Request, State};
+use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, SameSite, SignedCookieJar};
+use photon_deploy::model::{Permission, Role};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -41,6 +43,23 @@ pub(crate) struct SetupRequest {
 pub(crate) struct CreateUserRequest {
     username: String,
     password: String,
+    /// New users default to `viewer` — the least a login can do.
+    #[serde(default)]
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RolePatch {
+    role: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PasswordChange {
+    password: String,
+    /// Required when changing your own password — the session cookie proves who is sitting
+    /// here, not that they are the one who set it. An admin resetting someone else's omits it.
+    #[serde(default)]
+    current_password: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -48,12 +67,62 @@ struct SessionResponse {
     authenticated: bool,
     username: Option<String>,
     needs_setup: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
 }
 
 #[derive(Serialize)]
 struct UserView {
     username: String,
     created_at: i64,
+    role: String,
+}
+
+/// The signed-in user, as `require_auth` resolved it. Handlers extract it to learn who is acting
+/// (the audit actor) and what they may do; `require_role` is the 403 gate.
+#[derive(Debug, Clone)]
+pub struct CurrentUser {
+    pub username: String,
+    pub role: Role,
+}
+
+impl CurrentUser {
+    /// `Err(403 {error})` when the role may not perform `perm` — worded the way the UI expects
+    /// ("Requires the Operator role").
+    #[allow(clippy::result_large_err)]
+    pub fn require(&self, perm: Permission) -> Result<(), Response> {
+        if self.role.allows(perm) {
+            Ok(())
+        } else {
+            let needed = Role::required(perm);
+            let label = match needed {
+                Role::Viewer => "Viewer",
+                Role::Operator => "Operator",
+                Role::Admin => "Admin",
+            };
+            Err(error_response(
+                StatusCode::FORBIDDEN,
+                &format!("Requires the {label} role"),
+            ))
+        }
+    }
+}
+
+#[axum::async_trait]
+impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
+    type Rejection = Response;
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<CurrentUser>()
+            .cloned()
+            .ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())
+    }
+}
+
+/// A stored role string as the enum; unknown/legacy values read as `admin` (see `StoredUser`).
+fn role_of(u: &crate::users::StoredUser) -> Role {
+    Role::parse(&u.role).unwrap_or(Role::Admin)
 }
 
 fn error_response(status: StatusCode, msg: &str) -> Response {
@@ -111,17 +180,20 @@ pub(crate) async fn session(State(state): State<AppState>, jar: SignedCookieJar)
     };
     let mut authenticated = false;
     let mut username = None;
+    let mut role = None;
     if let Some(c) = jar.get(SESSION_COOKIE) {
         let name = c.value().to_string();
-        if matches!(state.users.get(&name).await, Ok(Some(_))) {
+        if let Ok(Some(u)) = state.users.get(&name).await {
             authenticated = true;
             username = Some(name);
+            role = Some(role_of(&u).as_str().to_string());
         }
     }
     Json(SessionResponse {
         authenticated,
         username,
         needs_setup,
+        role,
     })
     .into_response()
 }
@@ -146,10 +218,15 @@ pub(crate) async fn setup(
         Ok(h) => h,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    if state.users.create(&username, &hash).await.is_err() {
+    // The first account is the admin: somebody has to be able to make the second one.
+    if state.users.create(&username, &hash, "admin").await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    (set_session(jar, &username), Json(json!({}))).into_response()
+    (
+        set_session(jar, &username),
+        Json(json!({ "role": "admin" })),
+    )
+        .into_response()
 }
 
 /// `POST /api/login` — verify credentials against the store, then set a signed session cookie.
@@ -158,15 +235,22 @@ pub(crate) async fn login(
     jar: SignedCookieJar,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    let verified = match state.users.get(&body.username).await {
-        Ok(Some(u)) => verify_password(&body.password, &u.password_hash),
-        Ok(None) => false,
+    let (verified, role) = match state.users.get(&body.username).await {
+        Ok(Some(u)) => (
+            verify_password(&body.password, &u.password_hash),
+            role_of(&u),
+        ),
+        Ok(None) => (false, Role::Viewer),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     if !verified {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    (set_session(jar, &body.username), Json(json!({}))).into_response()
+    (
+        set_session(jar, &body.username),
+        Json(json!({ "role": role.as_str() })),
+    )
+        .into_response()
 }
 
 /// `POST /api/logout` — clear the session cookie. Always `204`.
@@ -182,7 +266,7 @@ pub(crate) async fn list_users(State(state): State<AppState>) -> Response {
         Ok(users) => Json(json!({
             "users": users
                 .into_iter()
-                .map(|u| UserView { username: u.username, created_at: u.created_at })
+                .map(|u| UserView { role: role_of(&u).as_str().to_string(), username: u.username, created_at: u.created_at })
                 .collect::<Vec<_>>()
         }))
         .into_response(),
@@ -193,11 +277,27 @@ pub(crate) async fn list_users(State(state): State<AppState>) -> Response {
 /// `POST /api/users` — add a user (authenticated). 201 / 409 duplicate / 400 invalid.
 pub(crate) async fn create_user(
     State(state): State<AppState>,
+    me: CurrentUser,
     Json(body): Json<CreateUserRequest>,
 ) -> Response {
+    if let Err(r) = me.require(Permission::Users) {
+        return r;
+    }
     if let Err(msg) = validate_credentials(&body.username, &body.password) {
         return error_response(StatusCode::BAD_REQUEST, &msg);
     }
+    let role = match body.role.as_deref() {
+        None => Role::Viewer,
+        Some(r) => match Role::parse(r) {
+            Some(r) => r,
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "role must be viewer, operator or admin",
+                )
+            }
+        },
+    };
     let username = body.username.trim().to_string();
     match state.users.get(&username).await {
         Ok(Some(_)) => return error_response(StatusCode::CONFLICT, "user already exists"),
@@ -208,19 +308,109 @@ pub(crate) async fn create_user(
         Ok(h) => h,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    match state.users.create(&username, &hash).await {
-        Ok(()) => (StatusCode::CREATED, Json(json!({ "username": username }))).into_response(),
+    match state.users.create(&username, &hash, role.as_str()).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(json!({ "username": username, "role": role.as_str() })),
+        )
+            .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
-/// `DELETE /api/users/:username` — remove a user (authenticated). Anti-lockout: you cannot delete
+/// `PATCH /api/users/:username` — change a role (admin). Anti-lockout: the last admin cannot be
+/// demoted, by anyone, including themselves.
+pub(crate) async fn update_user_role(
+    State(state): State<AppState>,
+    me: CurrentUser,
+    Path(username): Path<String>,
+    Json(body): Json<RolePatch>,
+) -> Response {
+    if let Err(r) = me.require(Permission::Users) {
+        return r;
+    }
+    let role = match Role::parse(&body.role) {
+        Some(r) => r,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "role must be viewer, operator or admin",
+            )
+        }
+    };
+    let users = match state.users.list().await {
+        Ok(u) => u,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(target) = users.iter().find(|u| u.username == username) else {
+        return error_response(StatusCode::NOT_FOUND, "user not found");
+    };
+    let admins = users.iter().filter(|u| role_of(u) == Role::Admin).count();
+    if role_of(target) == Role::Admin && role != Role::Admin && admins <= 1 {
+        return error_response(StatusCode::BAD_REQUEST, "cannot demote the last admin");
+    }
+    match state.users.set_role(&username, role.as_str()).await {
+        Ok(true) => Json(json!({ "username": username, "role": role.as_str() })).into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "user not found"),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `PUT /api/users/:username/password` — set a password. Your own needs `current_password`
+/// (any role); someone else's needs the Users permission and no current password, because a
+/// reset is what an admin does when the person has forgotten it. 204 / 400 / 403 / 404.
+/// Sessions are stateless signed cookies, so an existing sign-in survives the change.
+pub(crate) async fn change_password(
+    State(state): State<AppState>,
+    me: CurrentUser,
+    Path(username): Path<String>,
+    Json(body): Json<PasswordChange>,
+) -> Response {
+    if body.password.len() < MIN_PASSWORD_LEN {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("password must be at least {MIN_PASSWORD_LEN} characters"),
+        );
+    }
+    let target = match state.users.get(&username).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "user not found"),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if me.username == username {
+        let ok = body
+            .current_password
+            .as_deref()
+            .map(|p| verify_password(p, &target.password_hash))
+            .unwrap_or(false);
+        if !ok {
+            return error_response(StatusCode::BAD_REQUEST, "current password is incorrect");
+        }
+    } else if let Err(r) = me.require(Permission::Users) {
+        return r;
+    }
+    let hash = match hash_password_prod(&body.password) {
+        Ok(h) => h,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match state.users.set_password_hash(&username, &hash).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "user not found"),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `DELETE /api/users/:username` — remove a user (admin). Anti-lockout: you cannot delete
 /// yourself, nor the last remaining user.
 pub(crate) async fn delete_user(
     State(state): State<AppState>,
+    me: CurrentUser,
     jar: SignedCookieJar,
     Path(username): Path<String>,
 ) -> Response {
+    if let Err(r) = me.require(Permission::Users) {
+        return r;
+    }
     if let Some(c) = jar.get(SESSION_COOKIE) {
         if c.value() == username {
             return error_response(
@@ -251,11 +441,16 @@ pub(crate) async fn delete_user(
 pub(crate) async fn require_auth(
     State(state): State<AppState>,
     jar: SignedCookieJar,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if let Some(c) = jar.get(SESSION_COOKIE) {
-        if matches!(state.users.get(c.value()).await, Ok(Some(_))) {
+        if let Ok(Some(u)) = state.users.get(c.value()).await {
+            let me = CurrentUser {
+                username: u.username.clone(),
+                role: role_of(&u),
+            };
+            request.extensions_mut().insert(me);
             return next.run(request).await;
         }
     }
@@ -563,5 +758,188 @@ mod tests {
             .unwrap();
         // Self-delete guard fires first here (admin is the caller); either way it is refused.
         assert_eq!(last.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn login_status(app: &axum::Router, user: &str, pw: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "application/json")
+                    .body(json_body(
+                        serde_json::json!({"username": user, "password": pw}),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn put_password(
+        app: &axum::Router,
+        cookie: &str,
+        user: &str,
+        body: serde_json::Value,
+    ) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/users/{user}/password"))
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn own_password_needs_the_current_one() {
+        let app = router_with(&[("admin", "hunter2")]);
+        let cookie = crate::session_cookie(&app).await;
+        // No current password, or the wrong one → 400 and nothing changes.
+        assert_eq!(
+            put_password(
+                &app,
+                &cookie,
+                "admin",
+                serde_json::json!({"password":"newpass99"})
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            put_password(
+                &app,
+                &cookie,
+                "admin",
+                serde_json::json!({"password":"newpass99","current_password":"nope"})
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(login_status(&app, "admin", "hunter2").await, StatusCode::OK);
+        // Too short is refused before the current password is even checked.
+        assert_eq!(
+            put_password(
+                &app,
+                &cookie,
+                "admin",
+                serde_json::json!({"password":"short","current_password":"hunter2"})
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        // The right one → 204; the old password stops working, the new one signs in.
+        assert_eq!(
+            put_password(
+                &app,
+                &cookie,
+                "admin",
+                serde_json::json!({"password":"newpass99","current_password":"hunter2"})
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            login_status(&app, "admin", "hunter2").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            login_status(&app, "admin", "newpass99").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_resets_anyone_but_a_viewer_only_themselves() {
+        let store = SqliteUserStore::open_in_memory().unwrap();
+        store.seed("admin", &hash("hunter2"));
+        store
+            .create("bob", &hash("bobpass1"), "viewer")
+            .await
+            .unwrap();
+        store
+            .create("eve", &hash("evepass1"), "viewer")
+            .await
+            .unwrap();
+        let users: Arc<dyn UserStore> = Arc::new(store);
+        let app = crate::test_server_with_users(users).into_router();
+        let admin = crate::session_cookie(&app).await;
+
+        // An admin resets bob without bob's current password.
+        assert_eq!(
+            put_password(
+                &app,
+                &admin,
+                "bob",
+                serde_json::json!({"password":"bobpass22"})
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(login_status(&app, "bob", "bobpass22").await, StatusCode::OK);
+        assert_eq!(
+            put_password(
+                &app,
+                &admin,
+                "ghost",
+                serde_json::json!({"password":"whatever1"})
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+
+        // Bob (a viewer) may change his own, not eve's.
+        let bob_login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "application/json")
+                    .body(json_body(
+                        serde_json::json!({"username":"bob","password":"bobpass22"}),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bob = bob_login
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            put_password(
+                &app,
+                &bob,
+                "eve",
+                serde_json::json!({"password":"evepass22"})
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            put_password(
+                &app,
+                &bob,
+                "bob",
+                serde_json::json!({"password":"bobpass33","current_password":"bobpass22"})
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(login_status(&app, "bob", "bobpass33").await, StatusCode::OK);
     }
 }

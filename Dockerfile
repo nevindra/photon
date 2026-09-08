@@ -21,18 +21,22 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Compile just the dependencies (cached until Cargo.toml/Cargo.lock change).
-RUN cargo chef cook --release -p photon-server --recipe-path recipe.json
+RUN cargo chef cook --release -p photon-server -p photon-agent --recipe-path recipe.json
 # Now the real sources...
 COPY . .
 # ...and the built frontend where rust-embed expects it (../../frontend/dist from photon-api).
 COPY --from=frontend /app/frontend/dist ./frontend/dist
-RUN cargo build --release -p photon-server
+# The agent ships INSIDE the server image: `GET /api/agent/download` and the SSH bootstrap serve
+# the `photon-agent` beside `photon-server` (docs/subsystems/deploy.md), so an air-gapped site
+# never needs the internet to install it.
+RUN cargo build --release -p photon-server -p photon-agent
 # Hand an empty, correctly-owned data dir to the runtime image (fresh named volumes inherit it).
 RUN mkdir -p /var/lib/photon
 
 # ---- Stage 3: runtime (distroless glibc, non-root) -----------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 COPY --from=builder /app/target/release/photon-server /usr/local/bin/photon-server
+COPY --from=builder /app/target/release/photon-agent /usr/local/bin/photon-agent
 COPY --from=builder --chown=65532:65532 /var/lib/photon /var/lib/photon
 ENV PHOTON_STORAGE_HOT_DIR=/var/lib/photon/hot \
     PHOTON_STORAGE_DB_PATH=/var/lib/photon/photon.db \

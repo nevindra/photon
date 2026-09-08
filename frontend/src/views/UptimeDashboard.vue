@@ -74,7 +74,7 @@ function setView(v) {
 </script>
 
 <template>
-  <AppShell :mock="api.mock" crumb="Ops">
+  <AppShell :mock="api.mock" crumb="Uptime">
     <section class="p-6">
       <header class="mb-6 flex items-center justify-between gap-4">
         <div>

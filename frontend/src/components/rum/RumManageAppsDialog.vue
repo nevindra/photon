@@ -3,7 +3,7 @@
 // apps view. Apps are the browser apps allowed to POST beacons; `key` is a PUBLIC client identifier
 // (safe to display) — the real auth boundary is the Origin allowlist, not the key. Mutations go
 // through the rumQueries composables (Task 9), which already invalidate the apps list + toast on
-// the `{ ok, error }` result shape — so, like MonitorDetailDialog/SettingsUsers, this component
+// the `{ ok, error }` result shape — so, like MonitorDetailDialog/UsersView, this component
 // doesn't track its own error state and just fires the mutation.
 import { ref, watch } from 'vue'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'

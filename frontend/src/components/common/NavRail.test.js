@@ -85,9 +85,10 @@ describe('NavRail — connected indicator', () => {
   })
 })
 
-describe('NavRail — grouped worlds', () => {
-  // Task 10 regroup: Home + Frontend/Backend/Ops worlds + Explore (Logs/Traces/
-  // Metrics) + Manage (Data), each item stamped with data-nav="item.key" for lookup/E2E hooks.
+describe('NavRail — grouped by verb', () => {
+  // Home, then four verb-named groups — Monitor (Frontend/Backend/Hosts/Uptime), Explore
+  // (Logs/Traces/Metrics), Deploy (Templates/Stacks/Rollouts), Manage (Alerts/Data/Tenants/Audit) —
+  // each item stamped with data-nav="item.key" for lookup/E2E hooks.
   function wrap(active) {
     return mount(
       {
@@ -98,20 +99,34 @@ describe('NavRail — grouped worlds', () => {
     )
   }
 
-  it('renders Home + the three worlds + Explore tools + Manage', () => {
-    const t = wrap('home').text()
-    for (const label of [
-      'Home',
-      'Frontend',
-      'Backend',
-      'Ops',
-      'Logs',
-      'Traces',
-      'Metrics',
-      'Data',
-    ]) {
-      expect(t).toContain(label)
+  it('renders Home + the four groups in do-this order, every item under one heading', () => {
+    const w = wrap('home')
+    const headings = w.findAll('[data-nav-group]').map((h) => h.text())
+    expect(headings).toEqual(['Monitor', 'Explore', 'Deploy', 'Manage'])
+    const items = w.findAll('[data-nav]').map((b) => b.attributes('data-nav'))
+    expect(items).toEqual([
+      'home',
+      'frontend', 'backend', 'infra', 'uptime',
+      'logs', 'traces', 'metrics',
+      'templates', 'stacks', 'rollouts',
+      'alerts', 'data', 'tenants', 'audit',
+      'settings',
+    ])
+    // The uptime page is labelled by what it is, not "Ops".
+    expect(w.get('[data-nav="uptime"]').text()).toBe('Uptime')
+    expect(w.text()).not.toContain('Ops')
+    w.unmount()
+  })
+
+  it('draws every item with a two-tone icon: neutral strokes plus a brand accent', () => {
+    const w = wrap('home')
+    for (const btn of w.findAll('[data-nav]').filter((b) => b.attributes('data-nav') !== 'settings')) {
+      const svg = btn.find('svg')
+      expect(svg.exists()).toBe(true)
+      expect(svg.attributes('stroke')).toBe('currentColor')
+      expect(svg.find('.ni-accent, .ni-accent-fill').exists()).toBe(true)
     }
+    w.unmount()
   })
 
   // The rail is 74px wide (~66px of content). At 9px semibold uppercase + tracking-wider that's
@@ -126,15 +141,17 @@ describe('NavRail — grouped worlds', () => {
       expect(h.text().length).toBeLessThanOrEqual(10)
       expect(h.classes()).toContain('truncate')
     }
-    // The Infrastructure world specifically — the one that overflowed.
-    expect(w.text()).toContain('Infra')
     expect(w.text()).not.toContain('Infrastructure')
     w.unmount()
   })
 
-  it('marks the active group', () => {
+  it('marks the active item, and keeps its icon two-tone (ink strokes, not brand-on-brand)', () => {
     const w = wrap('backend')
-    expect(w.get('[data-nav="backend"]').classes().join(' ')).toContain('text-brand')
+    const btn = w.get('[data-nav="backend"]')
+    expect(btn.classes().join(' ')).toContain('text-brand')
+    expect(btn.find('svg').classes()).toContain('text-foreground')
+    expect(w.get('[data-nav="frontend"]').find('svg').classes()).not.toContain('text-foreground')
+    w.unmount()
   })
 })
 

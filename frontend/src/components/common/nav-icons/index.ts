@@ -1,0 +1,17 @@
+// The rail's icon set. Every icon is drawn in `NavIconBase` — two tones, neutral + Photon Cyan —
+// and shaped after the thing its item opens, so the rail reads at a glance without the labels.
+export { default as HomeIcon } from './HomeIcon.vue'
+export { default as FrontendIcon } from './FrontendIcon.vue'
+export { default as BackendIcon } from './BackendIcon.vue'
+export { default as HostsIcon } from './HostsIcon.vue'
+export { default as UptimeIcon } from './UptimeIcon.vue'
+export { default as LogsIcon } from './LogsIcon.vue'
+export { default as TracesIcon } from './TracesIcon.vue'
+export { default as MetricsIcon } from './MetricsIcon.vue'
+export { default as TemplatesIcon } from './TemplatesIcon.vue'
+export { default as StacksIcon } from './StacksIcon.vue'
+export { default as RolloutsIcon } from './RolloutsIcon.vue'
+export { default as AlertsIcon } from './AlertsIcon.vue'
+export { default as DataIcon } from './DataIcon.vue'
+export { default as TenantsIcon } from './TenantsIcon.vue'
+export { default as AuditIcon } from './AuditIcon.vue'

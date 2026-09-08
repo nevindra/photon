@@ -376,8 +376,24 @@ backend can't be silently replaced with demo data.
   `POST /api/tenants/:name/rotate-token` (central rotate), `GET /api/tenants/summary` (central curated
   per-tenant health + rate/incidents/disk), `GET /api/federation/status` (tenant see local federation
   config + push telemetry) — see [`subsystems/federation.md`](subsystems/federation.md).
-- **Auth / users:** `POST /api/logout`, `GET/POST /api/users`, `DELETE /api/users/:username`.
+- **Auth / users:** `POST /api/logout`, `GET/POST /api/users`, `DELETE /api/users/:username`,
+  `PUT /api/users/:username/password` (your own with `current_password`, anyone's as admin).
 
+- **Deploy (Docker fleet management, session + role):** `GET/POST /api/agents`,
+  `GET/PATCH/DELETE /api/agents/:host`, `POST /api/agents/:host/rotate-key|upgrade`,
+  `POST /api/agents/bootstrap` + `GET /api/agents/bootstrap/:id`, `GET /api/agents/:host/inventory|events|prune/preview|compose-projects`,
+  `GET/POST /api/agents/:host/actions`, `GET /api/agents/:host/containers/:id/logs|stats`,
+  `POST /api/agents/:host/containers/:id/exec`, `POST /api/exec/:id/input`, `DELETE /api/exec/:id`,
+  `GET /api/audit`, `GET/POST /api/stacks`, `POST /api/stacks/validate|adopt`, `GET/PATCH /api/stacks/:id`,
+  `POST /api/stacks/:id/:action`, `GET /api/templates[/:id]`, `GET/POST /api/templates/versions[/:id]`,
+  `POST /api/templates/import|dry-run|deploy`, `GET/POST /api/registries`, `DELETE /api/registries/:id`,
+  `POST /api/registries/:id/sync`, `GET/POST /api/image-registries` + `PATCH/DELETE /api/image-registries/:id`
+  (private-pull credentials, write-only), `GET/POST /api/rollouts`, `GET /api/rollouts/:id`, `POST /api/rollouts/:id/:action`,
+  `PATCH /api/users/:username` — see [`subsystems/deploy.md`](subsystems/deploy.md).
+- **Agent control channel (per-host `ak_…` bearer token, no cookie):** `POST /api/agent/sync`,
+  `POST /api/agent/secrets`, `POST /api/agent/registry-auth`, `POST /api/agent/stream/:session`,
+  `GET /api/agent/stream/:session/input`;
+  open: `GET /api/agent/download?arch=`.
 Everything else falls through to the embedded UI (SPA fallback to `index.html`).
 
 **Response compression:** a `tower-http` `CompressionLayer` wraps the whole HTTP surface (JSON API +
