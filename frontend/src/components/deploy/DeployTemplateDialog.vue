@@ -14,6 +14,7 @@ import { Label } from '@/components/ui/label'
 import { SelectMenu } from '@/components/ui/select-menu'
 import { Spinner } from '@/components/ui/spinner'
 import { Badge } from '@/components/ui/badge'
+import { StatusDot } from '@/components/ui/status-dot'
 import VariablesForm from './VariablesForm.vue'
 import PreflightList from './PreflightList.vue'
 import DiffView from './DiffView.vue'
@@ -251,12 +252,32 @@ const canNext = computed(() => (step.value === 'target' ? targetOk.value : step.
         </template>
       </div>
 
-      <!-- Deploy -->
-      <div v-else class="flex flex-col gap-4" data-testid="step-deploy">
+      <!-- Deploy: the knobs first, then a receipt of what is about to happen — the three facts the
+           earlier steps fixed (stack, version, host) laid out so they can be checked at a glance,
+           and one sentence on what the host does next. -->
+      <div v-else class="flex flex-col gap-5" data-testid="step-deploy">
         <DeployOptionsForm v-model="options" />
-        <div class="rounded-xl border border-border bg-muted/40 p-3 text-sm">
-          <p class="font-medium text-foreground"><Rocket class="mr-1 inline size-4 text-brand" /> {{ existing ? 'Upgrade' : 'Deploy' }} <span class="font-mono">{{ name }}</span> ({{ template.name }} {{ version?.version }}) on <span class="font-mono">{{ host }}</span></p>
-          <p class="mt-1 text-xs text-muted-foreground">The rendered files are stored as a new generation and the host applies them on its next sync. A release marker lands on the service graphs once the first spans arrive.<span v-if="hostAgent && hostAgent.status !== 'online'"> The host is {{ AGENT_STATUS_META[hostAgent.status].label.toLowerCase() }}, so this waits as pending.</span></p>
+        <div class="overflow-hidden rounded-xl border border-border bg-card" data-testid="deploy-summary">
+          <div class="flex items-center gap-2.5 border-b border-border bg-muted/40 px-4 py-2.5">
+            <span class="flex size-6 items-center justify-center rounded-full bg-brand-soft text-brand"><Rocket class="size-3.5" /></span>
+            <p class="text-sm font-medium text-foreground">{{ existing ? 'Ready to upgrade' : 'Ready to deploy' }}</p>
+            <p v-if="hostAgent && hostAgent.status !== 'online'" class="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground"><StatusDot :tone="AGENT_STATUS_META[hostAgent.status].tone" /> Waits as pending, host is {{ AGENT_STATUS_META[hostAgent.status].label.toLowerCase() }}</p>
+          </div>
+          <dl class="grid divide-y divide-border sm:grid-cols-3 sm:divide-x sm:divide-y-0">
+            <div class="flex flex-col gap-0.5 px-4 py-3">
+              <dt class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Stack</dt>
+              <dd class="truncate font-mono text-sm text-foreground">{{ name }}</dd>
+            </div>
+            <div class="flex flex-col gap-0.5 px-4 py-3">
+              <dt class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{{ existing ? 'Upgrade to' : 'Template' }}</dt>
+              <dd class="truncate text-sm text-foreground">{{ template.name }} <span class="font-mono text-muted-foreground">{{ version?.version }}</span><span v-if="existing?.template_version" class="text-muted-foreground"> · from {{ existing.template_version }}</span></dd>
+            </div>
+            <div class="flex flex-col gap-0.5 px-4 py-3">
+              <dt class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Host</dt>
+              <dd class="flex items-center gap-1.5 truncate text-sm text-foreground"><StatusDot v-if="hostAgent" :tone="AGENT_STATUS_META[hostAgent.status].tone" /><span class="truncate font-mono">{{ host }}</span><span v-if="hostAgent?.site" class="truncate text-muted-foreground">· {{ hostAgent.site }}</span></dd>
+            </div>
+          </dl>
+          <p class="border-t border-border px-4 py-2.5 text-xs leading-relaxed text-muted-foreground">The rendered files are stored as a new generation and the host applies them on its next sync. A release marker lands on the service graphs once the first spans arrive.</p>
         </div>
       </div>
 

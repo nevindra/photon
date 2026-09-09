@@ -278,8 +278,11 @@ capability: an agent without `--docker-apply` can adopt, watch for drift, and is
 applying changes from here is what needs the reinstall). The Segmented sits beside the title. The
 compose path is a settings sheet — Stack name and Host as label-left / control-right rows (managed
 hosts, with "no apply" / offline noted in the picker) — then `ComposeEditor` at full width, then
-`DeployOptionsForm` (pull missing/always/never, force recreate, recreate anonymous volumes behind a
-data-loss line) **folded** into a `<details>` row whose summary shows the current values as badges,
+`DeployOptionsForm` — two groups: **Images**, the pull policy as three option cards
+(missing / always / never), each saying what it does so "never" is never a guess; and
+**Containers**, force recreate and recreate anonymous volumes as switch rows on one settings list,
+the volumes row turning to the warn tint with its data-loss line when on — **folded** into a
+`<details>` row whose summary shows the current values as badges,
 since most stacks never change them. The *Apply right away* switch and the button (which says what
 will happen to which host) sit in an action row pinned to the bottom of the dialog: the rest
 scrolls, the actions do not.
@@ -395,8 +398,10 @@ what the host publishes, images "checked by the agent at apply"; `PreflightList`
 `fail`, states a `warn`, admits a `skip`; then what will be minted / resolved on the agent, the
 dangerous-construct acknowledgements, and a **line diff** of the rendered compose against what
 the host runs now (`DiffView`, `lib/deploy/diff.ts`) with the rendered `.env` behind a
-disclosure), **Deploy** (deploy options and a one-sentence summary of what will happen to which
-host). The same wizard is the **upgrade** path: a template stack whose catalog has a newer
+disclosure), **Deploy** (the deploy options, then a receipt: "Ready to deploy / upgrade" over the
+three facts the earlier steps fixed — stack name, template + version (and the version it comes
+from on an upgrade), host with its status dot and site — an offline host noted as "waits as
+pending" in the receipt's header, and one sentence on what the host does next). The same wizard is the **upgrade** path: a template stack whose catalog has a newer
 version shows "2.4.2 available" and an *Upgrade* button on its page, which opens the wizard
 seeded with the stack's host, name and variables and diffs against its current generation. A
 deploy whose host already runs a stack of that name **says so on the Target step** (a full-width
