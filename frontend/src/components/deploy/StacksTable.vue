@@ -4,7 +4,8 @@
 // line: status, name (with the failure or drift under it, where it is read), the recipe that
 // produced it (and whether a newer version exists), the services BY NAME with their own state,
 // the generation (with the gap when a newer one waits) and what happened last. Rows stay flat;
-// click drills in. Columns are bounded so a wide screen does not spread them across the page.
+// click drills in. The list fills the page; the grid columns are proportional so a wide screen
+// widens Stack / Source / Services rather than leaving a gutter on the right.
 import { useRouter, RouterLink } from 'vue-router'
 import { ChevronRight, Server } from 'lucide-vue-next'
 import { Badge } from '@/components/ui/badge'
@@ -41,7 +42,7 @@ const COLS = 'grid-cols-[7rem_minmax(0,1.4fr)_minmax(0,1.3fr)_minmax(0,1.6fr)_6.
 </script>
 
 <template>
-  <div class="flex max-w-[1480px] flex-col gap-2.5" data-testid="stacks-table">
+  <div class="flex flex-col gap-2.5" data-testid="stacks-table">
     <section v-for="g in groupStacksByHost(stacks)" :key="g.host" class="overflow-hidden rounded-xl border border-border bg-card shadow-1" data-testid="host-group" :data-host="g.host">
       <header class="flex flex-wrap items-center gap-2.5 border-b border-border bg-muted/40 px-3.5 py-2 text-sm">
         <span class="inline-flex items-center gap-1.5 font-mono text-[12.5px] font-medium text-foreground"><Server class="size-3.5 text-muted-foreground" /> {{ g.host }}</span>
