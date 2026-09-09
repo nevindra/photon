@@ -379,8 +379,9 @@ backend can't be silently replaced with demo data.
 - **Auth / users:** `POST /api/logout`, `GET/POST /api/users`, `DELETE /api/users/:username`,
   `PUT /api/users/:username/password` (your own with `current_password`, anyone's as admin).
 
-- **Deploy (Docker fleet management, session + role):** `GET/POST /api/agents`,
-  `GET/PATCH/DELETE /api/agents/:host`, `POST /api/agents/:host/rotate-key|upgrade`,
+- **Deploy (Docker fleet management, session + role):** `GET/POST /api/agents` (enroll returns
+  the token ONCE plus `server_url` + `agent_archs` for the install snippet),
+  `GET/PATCH/DELETE /api/agents/:host`, `POST /api/agents/:host/rotate-key|upgrade` (rotate returns the same trio),
   `POST /api/agents/bootstrap` + `GET /api/agents/bootstrap/:id`, `GET /api/agents/:host/inventory|events|prune/preview|compose-projects`,
   `GET/POST /api/agents/:host/actions`, `GET /api/agents/:host/containers/:id/logs|stats`,
   `POST /api/agents/:host/containers/:id/exec`, `POST /api/exec/:id/input`, `DELETE /api/exec/:id`,

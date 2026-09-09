@@ -66,7 +66,9 @@ const formError = ref('')
 
 // Manual fields
 const manualHost = ref('')
-const minted = ref<{ token: string; host: string } | null>(null)
+// The token plus what the server told us about itself: the URL agents should dial and the
+// architectures it can serve a binary for — the panel shows both before anything is pasted.
+const minted = ref<{ token: string; host: string; serverUrl: string | null; archs: string[] | null } | null>(null)
 
 const enroll = useEnrollAgent()
 const start = useStartBootstrap()
@@ -153,7 +155,7 @@ async function mint(): Promise<void> {
     return
   }
   const res = await enroll.mutateAsync({ host: name, site: site.value || null, capabilities: capabilities.value, poll_secs: pollSecs.value })
-  if (res.ok && res.token) minted.value = { token: res.token, host: name }
+  if (res.ok && res.token) minted.value = { token: res.token, host: name, serverUrl: res.server_url ?? null, archs: res.agent_archs ?? null }
   else formError.value = res.error ?? 'Could not enroll the host.'
 }
 
@@ -211,7 +213,7 @@ const jobTitle = computed(() => {
         <DialogTitle>{{ job ? jobTitle : minted ? 'Host enrolled' : 'Add a host' }}</DialogTitle>
         <DialogDescription>
           <template v-if="job">{{ job.hosts.length === 1 ? 'One host' : `${job.hosts.length} hosts` }} over SSH{{ job.hosts.some((h) => h.address.includes('@')) ? '' : ` as ${sshUser}` }}. {{ job.credentials_kept ? 'SSH credentials were kept for reinstalls.' : 'SSH credentials were used once and discarded.' }}</template>
-          <template v-else-if="minted">Install the agent on the host with this token. It appears under Hosts once its first sync lands.</template>
+          <template v-else-if="minted">Three steps on the host and it appears under Hosts. The token is shown only here.</template>
           <template v-else>Put a machine under Docker management. Metrics need nothing more than the agent; Docker needs the capabilities you pick here.</template>
         </DialogDescription>
       </DialogHeader>
@@ -242,14 +244,8 @@ const jobTitle = computed(() => {
         </div>
       </div>
 
-      <!-- Manual: minted token -->
-      <div v-else-if="minted" class="flex flex-col gap-3">
-        <AgentTokenPanel :token="minted.token" :host="minted.host" :capabilities="capabilities" :poll-secs="pollSecs" />
-        <div class="flex justify-end gap-2">
-          <Button variant="ghost" @click="minted = null; manualHost = ''">Add another</Button>
-          <Button data-testid="manual-open-host" @click="openHost(minted.host)"><ExternalLink class="size-4" /> Open {{ minted.host }}</Button>
-        </div>
-      </div>
+      <!-- Manual: minted token. The actions live in the pinned footer below, like the form's. -->
+      <AgentTokenPanel v-else-if="minted" :token="minted.token" :host="minted.host" :capabilities="capabilities" :poll-secs="pollSecs" :server-url="minted.serverUrl" :agent-archs="minted.archs" />
 
       <!-- Form: first the one choice that decides everything else (two radio cards), then only
            that path's fields, then the agent settings that rarely change folded under a line
@@ -263,12 +259,12 @@ const jobTitle = computed(() => {
             role="radio"
             :aria-checked="mode === m.key"
             :data-mode="m.key"
-            :class="cn('grid grid-cols-[1rem_1fr] items-start gap-3 rounded-xl border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring', mode === m.key ? 'border-brand bg-brand-soft' : 'border-border hover:border-foreground/20')"
+            :class="cn('relative grid grid-cols-[2.25rem_1fr] items-start gap-3 rounded-xl border p-3.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring', mode === m.key ? 'border-brand bg-brand-soft' : 'border-border bg-card hover:border-foreground/20')"
             @click="mode = m.key"
           >
-            <span :class="cn('mt-0.5 size-4 rounded-full border', mode === m.key ? 'border-[5px] border-brand' : 'border-border-strong')" />
-            <span>
-              <span class="flex items-center gap-1.5 text-sm font-semibold text-foreground"><component :is="m.icon" class="size-3.5 text-muted-foreground" /> {{ m.title }}</span>
+            <span :class="cn('flex size-9 items-center justify-center rounded-lg', mode === m.key ? 'bg-brand text-brand-foreground' : 'bg-muted text-muted-foreground')"><component :is="m.icon" class="size-4.5" /></span>
+            <span class="min-w-0">
+              <span class="flex items-center justify-between gap-2 text-sm font-semibold text-foreground">{{ m.title }}<span :class="cn('size-4 shrink-0 rounded-full border', mode === m.key ? 'border-[5px] border-brand' : 'border-border-strong')" /></span>
               <span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">{{ m.blurb }}</span>
             </span>
           </button>
@@ -345,6 +341,15 @@ const jobTitle = computed(() => {
         </details>
         <p v-if="formError" class="font-mono text-xs text-sev-error" data-testid="add-host-error">{{ formError }}</p>
       </form>
+      </div>
+
+      <!-- The minted token's action row: same pinned footer, so "Open host" is always in reach. -->
+      <div v-if="minted" class="flex shrink-0 items-center justify-between gap-2 border-t border-border bg-surface-2 px-6 py-3" data-testid="minted-actions">
+        <span class="text-xs text-muted-foreground">Closing this loses the token. Copy it first.</span>
+        <div class="flex items-center gap-2">
+          <Button type="button" variant="ghost" @click="minted = null; manualHost = ''">Add another</Button>
+          <Button type="button" data-testid="manual-open-host" @click="openHost(minted.host)"><ExternalLink class="size-4" /> Open {{ minted.host }}</Button>
+        </div>
       </div>
 
       <!-- The action row: outside the scroll, so Install is always in reach. -->

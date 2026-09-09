@@ -1353,10 +1353,19 @@ export interface EnrollInput {
   poll_secs?: number
   labels?: Record<string, string>
 }
-export interface EnrollResult extends MutationResult {
-  host?: ManagedHost
+// What comes back with a freshly minted or rotated agent token — everything the install
+// snippet needs so the UI never guesses it from its own origin (a Vite dev server on :5173 is
+// not where the sync endpoint lives; neither is a reverse proxy's internal name).
+export interface TokenIssue {
   // The per-host agent token, minted server-side and shown ONCE.
   token?: string
+  // The URL the host should dial: `[deploy].server_origin`, else derived from the request.
+  server_url?: string
+  // Architectures `GET /api/agent/download` can serve right now; empty = the download would 404.
+  agent_archs?: string[]
+}
+export interface EnrollResult extends MutationResult, TokenIssue {
+  host?: ManagedHost
 }
 export interface AgentPatch {
   poll_secs?: number
@@ -3307,9 +3316,9 @@ export const api = {
     }
   },
 
-  async rotateAgentToken(host: string, opts: RequestOpts = {}): Promise<MutationResult & { token?: string }> {
+  async rotateAgentToken(host: string, opts: RequestOpts = {}): Promise<MutationResult & TokenIssue> {
     try {
-      return await http.post(`agents/${encodeURIComponent(host)}/rotate-key`, { signal: opts.signal }).json<MutationResult & { token?: string }>()
+      return await http.post(`agents/${encodeURIComponent(host)}/rotate-key`, { signal: opts.signal }).json<MutationResult & TokenIssue>()
     } catch (e: any) {
       return deployMutation(e, (m) => m.mockRotateAgentToken(host))
     }

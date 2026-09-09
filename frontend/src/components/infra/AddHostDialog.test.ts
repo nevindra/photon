@@ -100,7 +100,7 @@ describe('AddHostDialog', () => {
   })
 
   it('manual path mints a token and shows it once with the install snippet', async () => {
-    enrollAgent.mockResolvedValue({ ok: true, token: 'ak_minted', host: { host: 'edge-9' } })
+    enrollAgent.mockResolvedValue({ ok: true, token: 'ak_minted', host: { host: 'edge-9' }, server_url: 'http://10.0.0.5:8080', agent_archs: ['x86_64'] })
     const wrapper = await mountDialog({ prefillHost: 'edge-9' })
     expect((q('[data-testid="manual-host"]') as HTMLInputElement).value).toBe('edge-9')
     ;(q('[data-testid="add-host-submit"]') as HTMLButtonElement).click()
@@ -108,8 +108,33 @@ describe('AddHostDialog', () => {
     expect(enrollAgent).toHaveBeenCalledWith(expect.objectContaining({ host: 'edge-9' }))
     const panel = q('[data-testid="agent-token-panel"]')
     expect(panel).not.toBeNull()
-    expect(panel!.textContent).toContain('ak_minted')
-    expect(panel!.textContent).toContain('/api/agent/download')
+    // The token is shown once, in its own field — and NOT inside the command by default.
+    expect(q('[data-testid="agent-token-value"]')?.textContent).toBe('ak_minted')
+    const snippet = q('[data-testid="agent-snippet"]')!.textContent!
+    expect(snippet).toContain('http://10.0.0.5:8080/api/agent/download')
+    expect(snippet).toContain('sudo photon-agent install --server http://10.0.0.5:8080')
+    expect(snippet).not.toContain('ak_minted')
+    // The server's URL is what the snippet dials, not this UI's origin.
+    expect((q('[data-testid="agent-origin"]') as HTMLInputElement).value).toBe('http://10.0.0.5:8080')
+    expect(q('[data-testid="agent-archs"]')?.textContent).toContain('x86_64')
+    expect(q('[data-testid="agent-no-binary"]')).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('warns when the server URL is loopback or when this Photon has no agent binary to serve', async () => {
+    enrollAgent.mockResolvedValue({ ok: true, token: 'ak_minted', host: { host: 'edge-9' }, server_url: 'http://localhost:8080', agent_archs: [] })
+    const wrapper = await mountDialog({ prefillHost: 'edge-9' })
+    ;(q('[data-testid="add-host-submit"]') as HTMLButtonElement).click()
+    await flushPromises()
+    expect(q('[data-testid="agent-origin-issue"]')?.getAttribute('data-issue')).toBe('loopback')
+    expect(q('[data-testid="agent-no-binary"]')).not.toBeNull()
+    // Editing the URL re-renders the command and clears the loopback warning.
+    const input = q('[data-testid="agent-origin"]') as HTMLInputElement
+    input.value = 'https://photon.example.com/'
+    input.dispatchEvent(new Event('input'))
+    await flushPromises()
+    expect(q('[data-testid="agent-origin-issue"]')).toBeNull()
+    expect(q('[data-testid="agent-snippet"]')!.textContent).toContain('--server https://photon.example.com ')
     wrapper.unmount()
   })
 

@@ -91,10 +91,25 @@ Cancel / Install row is pinned below the scrolling form. The two paths:
   ("1 of 2 hosts installed"); a failed host shows the step and the error and offers **Retry
   failed hosts** with just those addresses. The operator pastes nothing and never sees a token.
 - **I'll install it myself**: host name + Site + capabilities + poll interval → `POST /api/agents`
-  mints a per-host token, shown ONCE in `AgentTokenPanel` with a systemd / `docker run` install
-  snippet that downloads the binary from *this* Photon (`/api/agent/download?arch=`) — air-gapped
-  sites have no internet to fetch from. Same panel idiom as the federation tenant dialog, because
-  it is the same moment.
+  mints a per-host token, shown ONCE in `AgentTokenPanel`. The response also carries
+  `server_url` (`[deploy].server_origin`, else derived from the request's `Host` +
+  `X-Forwarded-Proto` — `agents::request_base`, shared with the sync upgrade URL) and
+  `agent_archs` (which architectures `GET /api/agent/download` can answer for right now), so the
+  panel never guesses either from the browser's origin — a Vite dev server on `:5173` is not
+  where the sync endpoint lives (the dev proxy sets `changeOrigin` so the derived URL says
+  `:8080`), and a snippet whose first line would 404 is worse than one that says so. The panel is
+  three numbered steps, each naming what can go wrong BEFORE anything is pasted: **1** the token,
+  copyable, with the shown-once warning; **2** the URL the host will dial, **editable**, flagged
+  when loopback (only works on this machine), plain `http` (the token travels in clear) or when
+  this Photon has no agent binary to hand out; **3** the command, **Install as a service**
+  (systemd, every privileged line under `sudo`, `curl -fSsL` so a failure is printed instead of
+  swallowed, ends with `systemctl status`) or **Run in the foreground** (no root, downloads into
+  the current directory, Ctrl-C stops it — the "try it first" path). The token is left OUT of the
+  command by default: `photon-agent` prompts for it (echo off) when stdin is a terminal, so it
+  never lands in shell history; a checkbox embeds `--token ak_…` for pasting into an automation
+  and the snippet then says to clear the history. The `docker run` format is gone — no
+  `photon-agent` image is published, and a container has no `docker compose` for `--docker-apply`.
+  Same panel idiom as the federation tenant dialog, because it is the same moment.
 
 ### The Agent tab (`/infra/:host/agent`)
 
@@ -107,7 +122,8 @@ Overview never waits on an agent read. `HostAgentPanel`:
   the sync channel, not SSH), Capabilities as reported, Docker facts (daemon/API/driver/OS/arch,
   containers running/total, images, labels) with `DockerDiskBar` — images / volumes / build cache
   over the disk, the reclaimable slice called out — and the admin strip: poll interval, **Rotate
-  token** (shown once, with the re-install snippet), **Remove from management** behind a
+  token** (shown once, in the same three-step `AgentTokenPanel` — `POST …/rotate-key` returns
+  `server_url` + `agent_archs` too), **Remove from management** behind a
   type-the-host-name confirmation that says what does *not* happen (containers keep running).
 
 `/infra` itself gains the **Add host** action; enrolled agents that are offline or waiting for
@@ -688,7 +704,11 @@ threshold pauses it, and rollback re-applies each stack's previous snapshot.
 `docker compose` CLI for stacks): `--server` + `--token` enable the control channel; `--docker-read /
 --docker-lifecycle / --docker-apply / --docker-exec` are the whole authority (each refusal is local);
 `--poll` (≥ 5 s), `--data-dir` (state + stack folders), `--docker-host`, `--no-metrics`; `install` /
-`uninstall` / `version` subcommands (systemd unit + `/etc/photon-agent/agent.env`); `--dry-inventory`
+`uninstall` / `version` subcommands (systemd unit + `/etc/photon-agent/agent.env`; `install` checks
+for root FIRST and says "re-run with sudo" instead of three permission-denied lines, and — like a
+foreground run with `--server` — prompts for a missing `--token` with echo off when stdin is a
+terminal (`prompt.rs`), erroring with "pass --token or PHOTON_AGENT_TOKEN" when it is not, so the
+SSH bootstrap and scripts are unaffected); `--dry-inventory`
 prints the observed document. It keeps `state.json` (known generation, applied stacks, seen action
 ids), re-bases its timestamps on the server clock (R9.3), self-upgrades from the sync response
 (R1.10), and uses the server's `ingest` hint for its metrics when `--endpoint` was not given.

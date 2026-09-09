@@ -4,7 +4,16 @@ use photon_agent::config::{Cli, Command};
 use photon_agent::{install, send, sync};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    // One place to print a failure: `photon-agent: <message>` — not the Debug quoting of a boxed
+    // error, which put every install hint inside `Error: "…"`.
+    if let Err(e) = run().await {
+        eprintln!("photon-agent: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = <Cli as clap::Parser>::parse();
     match cli.command {
         Some(Command::Version) => {
@@ -21,7 +30,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {}
     }
-    let cfg = cli.cfg;
+    let mut cfg = cli.cfg;
+    // A foreground run with --server and no token is the "try it first" path from the install
+    // snippet: ask for the token instead of failing, so it never has to sit in shell history.
+    if cfg.control_channel() && cfg.token.is_none() {
+        cfg.token = Some(
+            photon_agent::prompt::resolve_token(None, "running with --server")
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+        );
+    }
 
     if cfg.dry_inventory {
         return dry_inventory(&cfg).await;

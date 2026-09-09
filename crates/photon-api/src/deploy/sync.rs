@@ -6,6 +6,7 @@
 //! for, right before a pull; `POST /api/agent/stream/:session` receives a stream upload;
 //! `GET …/input` is the exec input long-poll.
 
+use super::agents::request_base;
 use super::hub::StatSample;
 use super::{api, DeployApi};
 use crate::AppState;
@@ -526,22 +527,6 @@ impl DeployApi {
             }),
         })
     }
-}
-
-/// The origin agents should use for the upgrade URL: configured, else the request's Host.
-fn request_base(a: &DeployApi, headers: &HeaderMap) -> String {
-    if let Some(o) = &a.server_origin {
-        return o.trim_end_matches('/').to_string();
-    }
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost:8080");
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("http");
-    format!("{proto}://{host}")
 }
 
 pub(crate) async fn sync(

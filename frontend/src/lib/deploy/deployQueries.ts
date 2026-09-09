@@ -47,6 +47,7 @@ import {
   type ManagedHost,
   type ManagedHostsResult,
   type MutationResult,
+  type TokenIssue,
   type PrunePreview,
   type SshBootstrapInput,
   type Stack,
@@ -132,7 +133,7 @@ export function useUpdateAgent() {
 export function useRotateAgentToken() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (host: string): Promise<MutationResult & { token?: string }> => api.rotateAgentToken(host),
+    mutationFn: (host: string): Promise<MutationResult & TokenIssue> => api.rotateAgentToken(host),
     onSuccess: (res: MutationResult) => {
       if (res && res.ok === false) {
         toast({ variant: 'error', title: "Couldn't rotate token", description: res.error ?? 'Please try again.' })

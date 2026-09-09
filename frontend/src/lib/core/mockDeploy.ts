@@ -22,6 +22,7 @@ import type {
   ManagedHostsResult,
   MutationResult,
   SshBootstrapInput,
+  TokenIssue,
 } from '@/lib/core/api'
 
 const MIN = 60_000
@@ -221,7 +222,7 @@ export function mockUpdateAgent(host: string, patch: { poll_secs?: number; label
   return { ok: true, host: clone(updated) }
 }
 
-export function mockRotateAgentToken(host: string): MutationResult & { token?: string } {
+export function mockRotateAgentToken(host: string): MutationResult & TokenIssue {
   if (!managedHosts.some((h) => h.host === host)) return { ok: false, error: 'no such host' }
   pushAudit({ action: 'agent.rotate_token', target: { host }, result: 'ok' })
   return { ok: true, token: mintToken() }

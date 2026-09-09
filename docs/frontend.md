@@ -408,7 +408,9 @@ release you want is almost always a recent one.
   server without the subsystem). Under `infra/`: `HostScaffold.vue` + `HostSubNav.vue` (the shared
   chrome of every `/infra/:host/*` tab, like `ServiceScaffold`), `HostAgentPanel.vue` (the Agent
   tab), `AddHostDialog.vue` (SSH bootstrap with a per-host stepper, or a minted token shown once),
-  `CapabilityPicker.vue`, `AgentTokenPanel.vue`, `DockerDiskBar.vue`.
+  `CapabilityPicker.vue`, `AgentTokenPanel.vue` (the shown-once token as three numbered steps:
+  token · editable server URL with loopback/http/no-binary warnings · the command as a systemd
+  service or a foreground run, token prompted for unless "embed" is ticked), `DockerDiskBar.vue`.
 - **`home/`** (the Attention Board) — `WatchRangePicker.vue` (the bounded 5m/15m/1h/6h Segmented that
   replaces the global time picker on `/home`), `WorldRollupCard.vue` (one World's tallies, and the
   page's filter control — the card IS the filter), `SubjectRow.vue` (one Subject that needs

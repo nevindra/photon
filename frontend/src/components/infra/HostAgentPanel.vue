@@ -27,7 +27,7 @@ import { AGENT_STATUS_META, CAPABILITIES, CAPABILITY_META, upgradeAvailable } fr
 import { ageMs, stampMs } from '@/lib/deploy/audit'
 import { formatNumber } from '@/lib/core/format'
 import { useRouter } from 'vue-router'
-import type { MutationResult } from '@/lib/core/api'
+import type { MutationResult, TokenIssue } from '@/lib/core/api'
 import { isDeployUnavailable } from '@/lib/deploy/availability'
 import DeployUnavailable from '@/components/deploy/DeployUnavailable.vue'
 
@@ -45,10 +45,10 @@ const update = useUpdateAgent()
 const remove = useDeleteAgent()
 const upgrade = useRequestAgentUpgrade()
 
-const rotated = ref<string | null>(null)
+const rotated = ref<{ token: string; serverUrl: string | null; archs: string[] | null } | null>(null)
 async function doRotate(): Promise<void> {
-  const res: MutationResult & { token?: string } = await rotate.mutateAsync(props.host)
-  if (res.ok && res.token) rotated.value = res.token
+  const res: MutationResult & TokenIssue = await rotate.mutateAsync(props.host)
+  if (res.ok && res.token) rotated.value = { token: res.token, serverUrl: res.server_url ?? null, archs: res.agent_archs ?? null }
 }
 
 const pollDraft = ref(15)
@@ -182,7 +182,7 @@ const labels = computed(() => Object.entries(agent.value?.labels ?? {}))
           </div>
           <GatedButton perm="agents" size="sm" variant="outline" :disabled="rotate.isPending.value" data-testid="agent-rotate" @click="doRotate"><KeyRound class="size-4" /> Rotate token</GatedButton>
         </div>
-        <AgentTokenPanel v-if="rotated" :token="rotated" :host="host" :capabilities="agent.capabilities" :poll-secs="agent.poll_secs" rotated />
+        <AgentTokenPanel v-if="rotated" :token="rotated.token" :host="host" :capabilities="agent.capabilities" :poll-secs="agent.poll_secs" :server-url="rotated.serverUrl" :agent-archs="rotated.archs" rotated />
       </div>
       <div class="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
         <div>

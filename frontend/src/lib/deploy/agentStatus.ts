@@ -72,40 +72,86 @@ export function upgradeAvailable(host: Pick<ManagedHost, 'agent_version' | 'late
 }
 
 // The copy-pasteable install for the manual path. The binary comes from THIS Photon (`/api/agent/
-// download`), never from the internet — an air-gapped site has no internet to download from. The
-// server URL is this UI's origin: the sync endpoint lives on the API surface, unlike the federation
-// snippet, which has to point at the OTLP ingest port.
-export type InstallFormat = 'systemd' | 'docker'
+// download`), never from the internet — an air-gapped site has no internet to download from.
+//
+// Three things the first version of this got wrong, all of which failed silently on the host:
+// it ran root-only steps without `sudo`; `curl -s` without `-S` swallowed the "permission
+// denied" that followed; and it pasted the token into the command line under a comment that
+// said to keep it out of shell history. Now every privileged line carries `sudo`, curl reports
+// its errors, and the token is left OUT of the command by default — `photon-agent` prompts for
+// it (echo off) when stdin is a terminal. `embedToken` puts it back for an operator pasting
+// into an automation, and the snippet then says so.
+export type InstallFormat = 'systemd' | 'foreground'
 
-export function installSnippet(
-  opts: { token: string; host: string; capabilities: readonly AgentCapability[]; pollSecs: number; origin: string },
-  format: InstallFormat,
-): string {
-  const flags = orderedCapabilities(opts.capabilities)
-    .map((c) => CAPABILITY_META[c].flag)
-    .join(' ')
-  if (format === 'docker') {
+export interface SnippetOpts {
+  token: string
+  host: string
+  capabilities: readonly AgentCapability[]
+  pollSecs: number
+  /** The URL the host dials — the server's own idea of it, editable in the panel. */
+  origin: string
+  /** Put `--token ak_…` in the command instead of prompting for it. Off by default. */
+  embedToken?: boolean
+}
+
+export const INSTALL_FORMAT_META: Record<InstallFormat, { label: string; blurb: string }> = {
+  systemd: { label: 'Install as a service', blurb: 'systemd unit, starts on boot. Needs root.' },
+  foreground: { label: 'Run in the foreground', blurb: 'Try it first, no root needed. Ctrl-C stops it.' },
+}
+
+/** `http://host:8080/` → `http://host:8080`. */
+export function normalizeOrigin(url: string): string {
+  return url.trim().replace(/\/+$/, '')
+}
+
+export function installSnippet(opts: SnippetOpts, format: InstallFormat): string {
+  const origin = normalizeOrigin(opts.origin)
+  const flags = [...orderedCapabilities(opts.capabilities).map((c) => CAPABILITY_META[c].flag), `--poll ${opts.pollSecs}s`]
+  const download = `"${origin}/api/agent/download?arch=$(uname -m)"`
+  const tokenArg = opts.embedToken ? ` --token ${opts.token}` : ''
+  const tokenNote = opts.embedToken
+    ? '# the token is embedded in this command — clear it from your shell history afterwards'
+    : "# you'll be asked for the token; paste it (the input is hidden)"
+  if (format === 'foreground') {
     return [
-      `docker run -d --name photon-agent --restart unless-stopped \\`,
-      `  -v /var/run/docker.sock:/var/run/docker.sock:ro \\`,
-      `  -e PHOTON_SERVER=${opts.origin} \\`,
-      `  -e PHOTON_AGENT_TOKEN=${opts.token} \\`,
-      `  -e PHOTON_AGENT_HOST_NAME=${opts.host} \\`,
-      `  ghcr.io/nodeflux/photon-agent:latest ${flags} --poll ${opts.pollSecs}s`,
+      `# 1. Fetch the agent from this Photon into the current directory (no internet needed)`,
+      `curl -fSsL -o photon-agent ${download} && chmod +x photon-agent`,
+      ``,
+      `# 2. Run it — Ctrl-C stops it, nothing is installed`,
+      tokenNote,
+      `./photon-agent --server ${origin} --host-name ${opts.host}${tokenArg} \\`,
+      `  ${flags.join(' ')}`,
     ].join('\n')
   }
   return [
-    `# 1. fetch the agent from this Photon (no internet needed)`,
-    `curl -fsSL -o /usr/local/bin/photon-agent "${opts.origin}/api/agent/download?arch=$(uname -m)"`,
-    `chmod +x /usr/local/bin/photon-agent`,
+    `# 1. Fetch the agent from this Photon (no internet needed)`,
+    `sudo curl -fSsL -o /usr/local/bin/photon-agent ${download}`,
+    `sudo chmod +x /usr/local/bin/photon-agent`,
     ``,
-    `# 2. enroll — the token is shown once, keep it out of shell history`,
-    `photon-agent install \\`,
-    `  --server ${opts.origin} \\`,
-    `  --token ${opts.token} \\`,
-    `  --host-name ${opts.host} \\`,
-    `  ${flags} --poll ${opts.pollSecs}s`,
+    `# 2. Enroll and start the service`,
+    tokenNote,
+    `sudo photon-agent install --server ${origin} --host-name ${opts.host}${tokenArg} \\`,
+    `  ${flags.join(' ')}`,
     ``,
-    `# 3. installs and starts the systemd unit; the host appears once the first sync lands`,
+    `# 3. Check it — the host appears under Hosts once the first sync lands`,
+    `systemctl status photon-agent --no-pager`,
   ].join('\n')
+}
+
+/** What can go wrong with the URL the host will dial, said before the operator pastes anything. */
+export type OriginIssue = 'invalid' | 'loopback' | 'plain-http' | null
+
+export function originIssue(url: string): OriginIssue {
+  const o = normalizeOrigin(url)
+  let u: URL
+  try {
+    u = new URL(o)
+  } catch {
+    return 'invalid'
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return 'invalid'
+  const h = u.hostname.replace(/^\[|\]$/g, '')
+  if (h === 'localhost' || h === '::1' || /^127\./.test(h) || h === '0.0.0.0') return 'loopback'
+  if (u.protocol === 'http:') return 'plain-http'
+  return null
 }

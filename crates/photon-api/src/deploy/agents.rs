@@ -6,7 +6,7 @@ use super::{api, bad, not_found, require, store_err, ApiErr, DeployApi};
 use crate::auth::CurrentUser;
 use crate::AppState;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use photon_deploy::ids::{mint_token, new_id, sha256_hex};
@@ -138,15 +138,56 @@ pub(crate) async fn get(
     Ok(Json(a.host_view(&rec)))
 }
 
+/// The origin agents should dial: `[deploy].server_origin` when configured, else the request's
+/// own `Host` (+ `X-Forwarded-Proto`). Shared by the sync upgrade URL, the install snippet and
+/// the SSH bootstrap.
+pub(crate) fn request_base(a: &DeployApi, headers: &HeaderMap) -> String {
+    if let Some(o) = &a.server_origin {
+        return o.trim_end_matches('/').to_string();
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost:8080");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("http");
+    format!("{proto}://{host}")
+}
+
+/// What the install snippet needs beyond the token, so the UI never has to guess it from its
+/// own origin: the URL the host should dial (a Vite dev server on :5173 is NOT where the sync
+/// endpoint lives, and neither is a reverse proxy's internal name), and which architectures
+/// this server can hand a binary to — a snippet whose first line would 404 is worse than one
+/// that says so up front.
+fn install_context(a: &DeployApi, headers: &HeaderMap) -> Value {
+    json!({
+        "server_url": request_base(a, headers),
+        "agent_archs": a.available_agent_archs(),
+    })
+}
+
 pub(crate) async fn enroll(
     State(state): State<AppState>,
     me: CurrentUser,
+    headers: HeaderMap,
     Json(input): Json<EnrollInput>,
 ) -> Result<Json<Value>, ApiErr> {
     let a = api(&state)?;
     require(&me, Permission::Agents)?;
     let (host, token) = a.enroll(&me, &input).await?;
-    Ok(Json(json!({ "ok": true, "host": host, "token": token })))
+    let mut out = json!({ "ok": true, "host": host, "token": token });
+    merge(&mut out, install_context(a, &headers));
+    Ok(Json(out))
+}
+
+fn merge(into: &mut Value, extra: Value) {
+    if let (Some(dst), Some(src)) = (into.as_object_mut(), extra.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
 }
 
 pub(crate) async fn patch(
@@ -224,6 +265,7 @@ pub(crate) async fn patch(
 pub(crate) async fn rotate(
     State(state): State<AppState>,
     me: CurrentUser,
+    headers: HeaderMap,
     Path(host): Path<String>,
 ) -> Result<Json<Value>, ApiErr> {
     let a = api(&state)?;
@@ -248,7 +290,9 @@ pub(crate) async fn rotate(
         None,
     )
     .await;
-    Ok(Json(json!({ "ok": true, "token": token })))
+    let mut out = json!({ "ok": true, "token": token });
+    merge(&mut out, install_context(a, &headers));
+    Ok(Json(out))
 }
 
 pub(crate) async fn remove(
@@ -452,7 +496,21 @@ impl DeployApi {
         }
         None
     }
+
+    /// The architectures `GET /api/agent/download` can answer for right now. The install
+    /// snippet shows this so an operator learns "no aarch64 binary here" from the panel,
+    /// not from a 404 on the host.
+    pub fn available_agent_archs(&self) -> Vec<String> {
+        KNOWN_ARCHS
+            .iter()
+            .filter(|a| self.agent_binary_path(a).is_some())
+            .map(|a| a.to_string())
+            .collect()
+    }
 }
+
+/// The architectures the release pipeline can produce; `available_agent_archs` probes each.
+const KNOWN_ARCHS: &[&str] = &["x86_64", "aarch64", "armv7"];
 
 /// `uname -m` and Rust spell architectures differently; the download route accepts both.
 pub fn normalize_arch(a: &str) -> String {

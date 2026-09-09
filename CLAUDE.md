@@ -345,6 +345,10 @@ photon-agent    standalone host agent (its own binary, like photon-loadgen): sam
                 control channel (default-on `docker` feature: bollard + the `docker compose` CLI) —
                 one long-polled `POST /api/agent/sync`, capabilities opt-in per flag
                 (`--docker-read/-lifecycle/-apply/-exec`), `install`/`uninstall` subcommands.
+                `install` checks for root first; a missing `--token` is PROMPTED for (echo off,
+                `prompt.rs`) at a terminal so the UI's install snippet never carries it. The
+                Dockerfile builds the shipped agent on bullseye (glibc 2.31) because it runs on
+                customers' hosts, not in the image.
 ```
 
 **Signal isolation by duplication:** logs, spans, and metrics each get their **own** WAL, Arrow

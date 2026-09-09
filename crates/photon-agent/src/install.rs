@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use crate::config::AgentConfig;
+use crate::prompt;
 
 pub const BIN_PATH: &str = "/usr/local/bin/photon-agent";
 pub const ENV_DIR: &str = "/etc/photon-agent";
@@ -59,12 +60,26 @@ fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
 }
 
 /// Install: env file (0600), binary in place, unit, enable + start.
+///
+/// Root is checked FIRST, and a missing token is prompted for (echo off) rather than demanded
+/// on the command line — see `prompt.rs` for why the snippet leaves it out.
 pub fn install(cfg: &AgentConfig) -> Result<(), String> {
-    if cfg.server.is_none() || cfg.token.is_none() {
-        return Err("install needs --server and --token (the per-host agent token)".into());
+    if cfg.server.is_none() {
+        return Err("install needs --server <url> (the Photon this host should dial)".into());
     }
-    std::fs::create_dir_all(ENV_DIR)
-        .map_err(|e| format!("creating {ENV_DIR}: {e} (run as root)"))?;
+    if !prompt::is_root() {
+        return Err(format!(
+            "install must run as root: it writes {BIN_PATH} and {ENV_PATH} and enables a systemd \
+             unit. Re-run it with sudo (the token prompt still works under sudo)."
+        ));
+    }
+    let token = prompt::resolve_token(cfg.token.clone(), "install")?;
+    let cfg = AgentConfig {
+        token: Some(token),
+        ..cfg.clone()
+    };
+    let cfg = &cfg;
+    std::fs::create_dir_all(ENV_DIR).map_err(|e| format!("creating {ENV_DIR}: {e}"))?;
     let mut env = cfg.env_lines().join("\n");
     env.push('\n');
     std::fs::write(ENV_PATH, env).map_err(|e| format!("writing {ENV_PATH}: {e}"))?;

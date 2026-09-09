@@ -38,6 +38,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     /// Install as a systemd service (writes /etc/photon-agent/agent.env + the unit, enables it).
+    /// Needs root; prompts for the agent token when --token is not given.
     Install(AgentConfig),
     /// Stop, disable and remove the systemd service and its env file. Containers keep running.
     Uninstall,
@@ -77,6 +78,8 @@ pub struct AgentConfig {
     pub server: Option<String>,
 
     /// The per-host agent token (`ak_…`) minted by the server when the host was enrolled.
+    /// Leave it out at an interactive terminal and the agent prompts for it (input hidden), so
+    /// the token never lands in shell history; scripts pass it here or via PHOTON_AGENT_TOKEN.
     #[arg(long, env = "PHOTON_AGENT_TOKEN")]
     pub token: Option<String>,
 

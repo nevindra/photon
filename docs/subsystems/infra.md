@@ -30,9 +30,9 @@ data points), `send.rs` (the sender loop: sample → POST, bearer auth, `applica
 
 | Flag | Env var | Default | Purpose |
 |---|---|---|---|
-| `--endpoint` | `PHOTON_AGENT_ENDPOINT` | `http://127.0.0.1:4318/v1/metrics` | OTLP/HTTP metrics endpoint |
-| `--token` | `PHOTON_INGEST_TOKEN` | `dev-ingest-token` | ingest bearer token (must match `[ingest].token`) |
-| `--host-name` | `PHOTON_AGENT_HOST` | OS hostname (`sysinfo::System::host_name()`) | reported `host.name` |
+| `--endpoint` | `PHOTON_AGENT_ENDPOINT` | `http://127.0.0.1:4318/v1/metrics` | OTLP/HTTP metrics endpoint (with `--server`, defaults to the endpoint the server advertises on sync) |
+| `--ingest-token` | `PHOTON_INGEST_TOKEN` | `dev-ingest-token` | ingest bearer token (must match `[ingest].token`) — NOT the `ak_` agent token, which is `--token` / `PHOTON_AGENT_TOKEN` (see [`deploy.md`](deploy.md)) |
+| `--host-name` | `PHOTON_AGENT_HOST_NAME` (legacy `PHOTON_AGENT_HOST` still read) | OS hostname (`sysinfo::System::host_name()`) | reported `host.name` |
 | `--interval-secs` | `PHOTON_AGENT_INTERVAL` | `15` | seconds between samples |
 | `--no-gpu` | `PHOTON_AGENT_NO_GPU` | `false` | disable GPU sampling even when built with the `gpu` feature |
 

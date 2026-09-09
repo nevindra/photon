@@ -15,6 +15,7 @@ pub mod docker;
 pub mod gpu;
 pub mod install;
 pub mod otlp;
+pub mod prompt;
 pub mod sample;
 pub mod send;
 pub mod state;

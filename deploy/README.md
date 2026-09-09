@@ -227,7 +227,7 @@ Every flag has an environment-variable equivalent (flags win):
 | `--endpoint` | `PHOTON_AGENT_ENDPOINT` | `http://127.0.0.1:4318/v1/metrics` | Where to send metrics |
 | `--ingest-token` | `PHOTON_INGEST_TOKEN` | `dev-ingest-token` | Must match the server's ingest token (metrics only) |
 | `--server` | `PHOTON_SERVER` | — | Photon's URL; enables Docker fleet management (Part 2b) |
-| `--token` | `PHOTON_AGENT_TOKEN` | — | The per-host **agent token** (`ak_…`) minted when you add the host in the UI — not the ingest token |
+| `--token` | `PHOTON_AGENT_TOKEN` | prompted for at a terminal | The per-host **agent token** (`ak_…`) minted when you add the host in the UI — not the ingest token. Leave it out and `install` / a run with `--server` asks for it with the input hidden |
 | `--docker-read` / `--docker-lifecycle` / `--docker-apply` / `--docker-exec` | `PHOTON_AGENT_DOCKER_*` | off | Which Docker powers this host grants (each opt-in; the server cannot enable one) |
 | `--poll` | `PHOTON_AGENT_POLL` | `15s` | Sync interval for the control channel (floor 5s) |
 | `--data-dir` | `PHOTON_AGENT_DATA_DIR` | `/var/lib/photon-agent` | Local state + the compose stacks Photon deploys |
@@ -269,11 +269,22 @@ actions (restart, pull, recreate, prune…) run from the UI, compose **stacks** 
    per-host token:
 
    ```bash
-   curl -fsSL -o /usr/local/bin/photon-agent "https://photon.example/api/agent/download?arch=$(uname -m)"
-   chmod +x /usr/local/bin/photon-agent
-   sudo photon-agent install --server https://photon.example --token ak_… --host-name edge-01 \
+   sudo curl -fSsL -o /usr/local/bin/photon-agent "https://photon.example/api/agent/download?arch=$(uname -m)"
+   sudo chmod +x /usr/local/bin/photon-agent
+   sudo photon-agent install --server https://photon.example --host-name edge-01 \
      --docker-read --docker-lifecycle --docker-apply --poll 15s
+   # → Agent token (ak_…, from the Photon UI — input is hidden):   ← paste the token here
+   systemctl status photon-agent --no-pager
    ```
+
+   Every line that touches `/usr/local/bin`, `/etc` or systemd runs under `sudo`, and `install`
+   checks for root first and tells you to re-run with sudo otherwise. The token is **not** on the
+   command line: `install` prompts for it with the input hidden, so it never lands in your shell
+   history (a script passes `--token ak_…` or `PHOTON_AGENT_TOKEN=…` instead; the UI can embed it
+   for you with a checkbox). The panel also lets you edit the URL the host will dial and warns
+   when it is a loopback address, plain `http`, or when this Photon has no agent binary to serve.
+   Want to try before installing? Pick **Run in the foreground** in the panel: it downloads into
+   the current directory and runs without root; Ctrl-C stops it.
 
    `install` writes `/etc/photon-agent/agent.env` (0600) and a systemd unit and starts it. The
    host appears in the UI once its first sync lands (seconds). The token is shown once; rotate it
@@ -323,7 +334,7 @@ with `PHOTON_CONFIG=/etc/photon/photon.toml`); env vars override individual fiel
 | `PHOTON_DEPLOY_SERVER_ORIGIN` | | request Host | The URL managed-host agents dial (fleet management) |
 | `PHOTON_DEPLOY_INGEST_ORIGIN` | | server origin + `:4318` | Where those agents send metrics |
 | `PHOTON_DEPLOY_SECRET_KEY_FILE` | | `deploy.key` beside the DB | AES-256 key for stack secrets at rest |
-| `PHOTON_DEPLOY_AGENT_BINARIES_DIR` | | `agents/` beside the DB | `photon-agent-<arch>` files served to hosts (the image ships its own arch beside the server) |
+| `PHOTON_DEPLOY_AGENT_BINARIES_DIR` | | `agents/` beside the DB | `photon-agent-<arch>` files served to hosts (the image ships its own arch beside the server, built on Debian bullseye so it runs on glibc ≥ 2.31 — Ubuntu 20.04+, Debian 11+, RHEL 9+) |
 | `PHOTON_DEPLOY_SSH_BOOTSTRAP` | | `true` | The "Add host over SSH" installer |
 | `PHOTON_DEPLOY_ENABLED` | | `true` | Mount the fleet-management routes at all |
 | `PHOTON_STORAGE_DB_PATH` | | `/var/lib/photon/photon.db` | Control-plane SQLite db |
