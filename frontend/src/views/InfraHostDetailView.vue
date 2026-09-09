@@ -3,37 +3,27 @@
 // (`HostStatTiles`) over `HostResourcePanels`' per-resource trend sections — CPU (total/per-core) +
 // load average, Memory + Network I/O, Disk, and, when the host has one, a 4-chart GPU section
 // (util/memory/temperature/power). Sets the global scope to this host on mount so "Related ▾" and
-// cross-signal correlation carry `host.name` + the active time window. Mirrors RumErrorDetailView's
-// AppShell + `#lead` back-arrow shell and its route-param normalization.
+// cross-signal correlation carry `host.name` + the active time window. The chrome (back button,
+// sub-nav, Related menu) is HostScaffold's, shared with the Agent tab.
 import { computed } from 'vue'
-import { useRoute, RouterLink } from 'vue-router'
-import { ArrowLeft } from 'lucide-vue-next'
-import AppShell from '@/components/common/AppShell.vue'
+import HostScaffold from '@/components/infra/HostScaffold.vue'
 import HostStatTiles from '@/components/infra/HostStatTiles.vue'
 import HostResourcePanels from '@/components/infra/HostResourcePanels.vue'
 import HostProcessesTable from '@/components/infra/HostProcessesTable.vue'
-import RelatedMenu from '@/components/common/RelatedMenu.vue'
 import { Spinner } from '@/components/ui/spinner'
-import { api, type InfraProcess } from '@/lib/core/api'
+import type { InfraProcess } from '@/lib/core/api'
 import { formatBytes } from '@/lib/core/format'
 import { startNs, endNs } from '@/lib/core/context'
 import { useInfraHost, useHostResourceSeries, useInfraHostProcesses } from '@/lib/infra/infraQueries'
+import { useRouteParam } from '@/lib/services/useServiceParam'
 
-const route = useRoute()
-
-// Vue Router decodes params automatically; normalize the array form defensively (same pattern
-// RumErrorDetailView/RumPageDetailView use for their app/route params).
-const host = computed<string>(() => {
-  const h = route.params.host
-  return ((Array.isArray(h) ? h[0] : h) ?? '').trim()
-})
+const host = useRouteParam('host')
 
 const q = useInfraHost(host, startNs, endNs)
 const detail = computed(() => q.data.value ?? null)
 const loading = computed(() => q.isLoading.value)
 const startMs = computed(() => Number(startNs.value) / 1_000_000)
 const endMs = computed(() => Number(endNs.value) / 1_000_000)
-const crumb = computed(() => 'Infrastructure › ' + host.value)
 const hasGpu = computed(() => (detail.value?.gpus?.length ?? 0) > 0)
 const res = useHostResourceSeries(host, startNs, endNs, hasGpu)
 
@@ -44,20 +34,7 @@ const procLoading = computed(() => procQ.isLoading.value)
 </script>
 
 <template>
-  <AppShell :mock="api.mock" :crumb="crumb">
-    <template #lead>
-      <RouterLink
-        to="/infra"
-        aria-label="Back to hosts"
-        class="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-      >
-        <ArrowLeft class="size-4" />
-      </RouterLink>
-    </template>
-    <template #actions>
-      <RelatedMenu :entity="{ kind: 'host', fields: { host: host } }" />
-    </template>
-
+  <HostScaffold :host="host">
     <main class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
       <div v-if="loading && !detail" class="flex flex-1 items-center justify-center">
         <Spinner size="lg">Loading host…</Spinner>
@@ -76,5 +53,5 @@ const procLoading = computed(() => procQ.isLoading.value)
         <HostProcessesTable :processes="processes" :loading="procLoading" />
       </template>
     </main>
-  </AppShell>
+  </HostScaffold>
 </template>

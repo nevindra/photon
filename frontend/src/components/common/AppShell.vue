@@ -30,9 +30,9 @@ defineEmits(['update:liveMode', 'refresh'])
 const route = useRoute()
 const router = useRouter()
 
-// NavRail's groups don't map 1:1 onto route segments — several sections (Frontend/Backend/
-// Ops) are "worlds" fronted by an existing route (rum/services/uptime), and Home has
-// no route segment of its own. ROUTE_GROUP translates the route's first path segment to the
+// NavRail's items don't map 1:1 onto route segments — the Monitor group's Frontend / Backend /
+// Hosts items front existing routes (rum / services / infra), and Home has no route segment of
+// its own. ROUTE_GROUP translates the route's first path segment to the
 // nav-group key that should be highlighted; LANDING is the inverse (nav-group key → the route
 // NavRail selecting that group should push to).
 const ROUTE_GROUP = {
@@ -43,31 +43,44 @@ const ROUTE_GROUP = {
   traces: 'traces',
   metrics: 'metrics',
   infra: 'infra',
-  uptime: 'infrastructure',
+  uptime: 'uptime',
   data: 'data',
   alerts: 'alerts',
   tenants: 'tenants',
+  audit: 'audit',
+  // `/deploy/<world-item>`: the second segment is the nav key (stacks / templates / rollouts).
+  deploy: 'deploy',
+  // `/settings/*` highlights the rail's gear, which is not in a group.
+  settings: 'settings',
 }
 const LANDING = {
   home: '/home',
   frontend: '/rum',
   backend: '/services',
   infra: '/infra',
-  infrastructure: '/uptime',
+  uptime: '/uptime',
   logs: '/logs',
   traces: '/traces',
   metrics: '/metrics',
   data: '/data',
   alerts: '/alerts',
   tenants: '/tenants',
+  audit: '/audit',
+  stacks: '/deploy/stacks',
+  templates: '/deploy/templates',
+  rollouts: '/deploy/rollouts',
+  settings: '/settings/users',
 }
 
 // The first path segment is the route section: '/logs' → 'logs', '/traces/abc' → 'traces',
 // resolved to a nav-group key via ROUTE_GROUP. An explicit `active` prop wins so tests can pin
 // it; otherwise the route drives the highlighted group.
-const active = computed(
-  () => props.active ?? (ROUTE_GROUP[route.path.split('/')[1]] ?? 'home'),
-)
+const active = computed(() => {
+  if (props.active) return props.active
+  const [, first, second] = route.path.split('/')
+  if (first === 'deploy') return second || 'stacks'
+  return ROUTE_GROUP[first] ?? 'home'
+})
 
 function onSelect(key) {
   router.push(LANDING[key] ?? '/' + key)

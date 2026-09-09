@@ -11,6 +11,7 @@ import { useRumApps, useRumAppsVitals } from '@/lib/rum/rumQueries'
 import { useInfraHosts } from '@/lib/infra/infraQueries'
 import { useMonitors } from '@/lib/uptime/uptimeQueries'
 import { useTenantsSummary } from '@/lib/tenants/tenantsQueries'
+import { useStacks, useRollouts, useAgents } from '@/lib/deploy/deployQueries'
 import { useRules, useIncidents as useAlertIncidents } from '@/lib/alertsQueries'
 import { tenant as activeTenant } from '@/lib/core/context'
 import { formatCompact, formatDuration } from '@/lib/core/format'
@@ -34,6 +35,10 @@ import {
   type ServiceRedRow,
   type Subject,
   type WorldKey,
+  stackSubject,
+  rolloutSubject,
+  agentSubject,
+  mergeSubject,
   type WorldRollup,
 } from '@/lib/home/attention'
 import {
@@ -172,6 +177,10 @@ export function useAttentionBoard(): AttentionBoard {
   const hostsPrev = useInfraHosts(prevWatchStartNs, prevWatchEndNs)
   const monitorsQuery = useMonitors()
   const tenantsQuery = useTenantsSummary()
+  // Deploy — stacks and rollouts. Control-plane state, not telemetry: no Watch Range applies.
+  const stacksQuery = useStacks()
+  const rolloutsQuery = useRollouts()
+  const agentsQuery = useAgents()
 
   // Alerts — the overlay that turns a threshold judgment into "somebody asked to be told".
   const rulesQuery = useRules()
@@ -197,7 +206,17 @@ export function useAttentionBoard(): AttentionBoard {
   // therefore dropped rather than mislabelled as the Site's.
   const lensed = computed(() => !!activeTenant.value)
 
-  const worlds = computed(() => boardWorlds({ sites: hasSites.value, ops: !lensed.value }))
+  // The tenant lens is applied inside useStacks/useRollouts, once, like every other signal.
+  const stackRows = computed(() => stacksQuery.data.value?.stacks ?? [])
+  const rolloutRows = computed(() => rolloutsQuery.data.value?.rollouts ?? [])
+  // Managed agents: a host under management is a Subject even before it reports metrics.
+  const agentRows = computed(() => (agentsQuery.data.value?.hosts ?? []).filter((h) => !activeTenant.value || h.site === activeTenant.value))
+  // The Deploy world exists once something is under management (an agent registry), like Sites
+  // exists once a tenant registry does — not on live stack data, which would make the card
+  // vanish when the last stack is destroyed and shift the grid as polls land.
+  const hasDeploy = computed(() => agentRows.value.length > 0 || stackRows.value.length > 0 || rolloutRows.value.length > 0)
+
+  const worlds = computed(() => boardWorlds({ sites: hasSites.value, ops: !lensed.value, deploy: hasDeploy.value }))
 
   const built = computed(() => {
     const now = watchNowMs.value
@@ -213,6 +232,24 @@ export function useAttentionBoard(): AttentionBoard {
       if (!present.has(h.host)) subjects.push(vanishedHostSubject(h.host))
     }
     if (hasSites.value) subjects.push(...sites.value.map((t) => siteSubject(t, now)))
+    // Managed agents: an offline agent is Down, a never-synced one Unknown, a full disk Warning or
+    // Critical. Merged into the host's own Subject when metrics already produced one.
+    const byName = new Map(subjects.filter((s) => s.kind === 'host').map((s) => [s.name, s]))
+    for (const a of agentRows.value) {
+      const sub = agentSubject(a, now)
+      if (!sub) continue
+      const existing = byName.get(a.host)
+      if (existing) mergeSubject(existing, sub)
+      else subjects.push(sub)
+    }
+    for (const st of stackRows.value) {
+      const sub = stackSubject(st)
+      if (sub) subjects.push(sub)
+    }
+    for (const r of rolloutRows.value) {
+      const sub = rolloutSubject(r)
+      if (sub) subjects.push(sub)
+    }
 
     const monitorNameById: Record<string, string> = {}
     for (const m of monitors.value) monitorNameById[m.id] = m.name
@@ -314,6 +351,16 @@ export function useAttentionBoard(): AttentionBoard {
             plain('Rows in', rateText(ingest)),
             plain('Open incidents there', String(open)),
             plain('Oldest push', oldest == null ? '—' : compactAge(watchNowMs.value - oldest) + ' ago'),
+          ]
+        }
+        case 'deploy': {
+          const live = stackRows.value.filter((s) => s.status !== 'gone')
+          const active = rolloutRows.value.filter((r) => r.state === 'running' || r.state === 'paused_gate' || r.state === 'paused_threshold')
+          return [
+            plain('Stacks running', `${live.filter((s) => s.status === 'running').length}/${live.length}`),
+            plain('Drifted', String(live.filter((s) => s.status === 'drifted').length)),
+            plain('Failed applies', String(live.filter((s) => s.status === 'failed').length)),
+            plain('Rollouts in flight', String(active.length)),
           ]
         }
         default:

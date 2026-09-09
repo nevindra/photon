@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 photon-core = { path = "../photon-core" }
+photon-deploy = { path = "../photon-deploy" }
+reqwest = { workspace = true }
 photon-query = { path = "../photon-query" }
 photon-uptime = { path = "../photon-uptime" }
 photon-alerts = { path = "../photon-alerts" }

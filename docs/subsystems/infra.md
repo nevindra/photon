@@ -30,9 +30,9 @@ data points), `send.rs` (the sender loop: sample → POST, bearer auth, `applica
 
 | Flag | Env var | Default | Purpose |
 |---|---|---|---|
-| `--endpoint` | `PHOTON_AGENT_ENDPOINT` | `http://127.0.0.1:4318/v1/metrics` | OTLP/HTTP metrics endpoint |
-| `--token` | `PHOTON_INGEST_TOKEN` | `dev-ingest-token` | ingest bearer token (must match `[ingest].token`) |
-| `--host-name` | `PHOTON_AGENT_HOST` | OS hostname (`sysinfo::System::host_name()`) | reported `host.name` |
+| `--endpoint` | `PHOTON_AGENT_ENDPOINT` | `http://127.0.0.1:4318/v1/metrics` | OTLP/HTTP metrics endpoint (with `--server`, defaults to the endpoint the server advertises on sync) |
+| `--ingest-token` | `PHOTON_INGEST_TOKEN` | `dev-ingest-token` | ingest bearer token (must match `[ingest].token`) — NOT the `ak_` agent token, which is `--token` / `PHOTON_AGENT_TOKEN` (see [`deploy.md`](deploy.md)) |
+| `--host-name` | `PHOTON_AGENT_HOST_NAME` (legacy `PHOTON_AGENT_HOST` still read) | OS hostname (`sysinfo::System::host_name()`) | reported `host.name` |
 | `--interval-secs` | `PHOTON_AGENT_INTERVAL` | `15` | seconds between samples |
 | `--no-gpu` | `PHOTON_AGENT_NO_GPU` | `false` | disable GPU sampling even when built with the `gpu` feature |
 
@@ -109,7 +109,7 @@ already was, without adding a new storage engine:
   `/` from being averaged away against an idle `/boot/efi`, and the mean is what stops that max
   from reading as a saturated host when one group is hot and the rest idle (a 4-GPU node with one
   card at 76% and three near zero is a 20%-average host). The UI renders them side by side —
-  see the `HostStatTiles.vue`/`HostCard.vue` notes below.
+  see the `HostStatTiles.vue`/`HostFleetTable.vue` notes below.
 - **`infra_host_detail(host, start_ns, end_ns) -> HostDetail`** — per-host metadata: latest
   `system.cpu.logical.count` (→ `cores`), `system.memory.limit` (→ `total_ram_bytes`), the latest
   `os.type` long-tail attribute (→ `os`, read via `get_field` since it's not promoted), and the
@@ -193,23 +193,31 @@ Timestamps cross the wire as decimal-nanosecond strings (JS-safe), mirroring `me
 in `router/index.js` with the static `/infra` before the dynamic `/infra/:host` (same ordering
 convention as the RUM sub-routes).
 
-- **`InfraHostsView.vue`** — the host list: `useInfraHosts` polled every 15s, rendered as a fleet
-  KPI band (`HostFleetKpis.vue`) above a card grid (`HostCard.vue`, one per host); card click
-  navigates to `/infra/:host`. Empty state ("Run photon-agent on a host…") when no hosts report.
-  - **`HostFleetKpis.vue`** — one `StatTile` row derived client-side from the host list (no extra
-    query): Hosts (count), Warning/Critical (counts, tinted `warning`/`error` when >0), Avg CPU
-    (mean of non-null `cpuUtil`), GPU hosts (count of `hasGpu`). Per-host status is the worst of
-    `cpuUtil`/`memUtil`/`diskUtil`/`gpuUtil` via the new `hostStatus` helper
-    (`lib/infra/hostStats.ts`) — a critical host counts only toward Critical, never double-counted
-    as Warning.
-  - **`HostCard.vue`** — one card per host: name + a small `⚠ <RESOURCE>` flag naming the single
-    worst-degraded resource, labeled `Meter` rows for CPU/MEM/DSK (a null value skips its row) plus
-    a GPU row when `gpuUtil` is present, and a relative last-seen footer. A warn/error border tint
-    mirrors the flag's severity. The **DSK/GPU** rows read `85% / 30%` — worst group over the mean
-    across groups, from the API pair above — dropping to a single number when the resource has one
-    group (the mean would just repeat the max). CPU/MEM are never split, so they stay single. No GPU device names (not in this API — see `HostStatTiles.vue`
-    below for those). `HostTable.vue` is removed (dead code); its coverage moved to
-    `HostCard.test.ts` and `hostStats.test.ts`.
+- **`InfraHostsView.vue`** — the host list, as **one table**. Two sources describe a host — the
+  metrics its agent samples (`useInfraHosts`, polled every 15s) and the managed-agent registry
+  (`useAgents`) — and a page built from either alone lies: metrics hide the host enrolled a minute
+  ago, the registry hides a box that only ships metrics. `lib/infra/fleet.ts` `fleetRows` unions
+  them, one row per host name, ranked worst first (`error` → `offline` → `warning` → `pending` →
+  `ok`, then by name), so the count on the page is the count in the list. Row click navigates to
+  `/infra/:host`. Empty state ("No hosts yet") when neither source has anything.
+  - **`HostFleetSummary.vue`** — the fleet in one line, and the line is the filter: "3 hosts · 1
+    critical · 1 warning · 1 waiting for first sync" as a `ui/segmented` control (`?status=`, a
+    level with zero hosts is not offered except OK; clicking the active segment clears it), then
+    the readings that describe the fleet rather than
+    judge it — avg CPU over the hosts that report one, GPU hosts, containers running / total over
+    the managed hosts (`fleetSummary`). It replaced five `StatTile`s that said the same things
+    without being clickable and cost a fifth of the screen.
+  - **`HostFleetTable.vue`** — the rows: state dot · host (with site · OS · arch from the agent's
+    Docker facts when it has one) · **why** (`hostVerdict`: the single worst-degraded resource in
+    words, error before warning, as a pill — "disk 90%" — with the number behind the number beside
+    it when the resource is label-split across several groups, "worst of 3 mounts · average 61%")
+    · CPU / memory / disk / GPU as `Meter`s with the worst-over-mean pair on the split resources ·
+    containers · agent status · last seen. A host with **no metrics** — waiting for its first sync,
+    or an agent that went quiet — is a row too, greyed, with its status across the meter columns
+    and a link to its Agent tab; a host with metrics and no agent reads "metrics only". A text
+    filter (`?q=`) matches name, site and labels. The old `HostFleetKpis`, `HostCard`,
+    `ManagedHostCard` and `AgentAttentionStrip` are gone — all four were partial views of the fleet.
+    Coverage: `InfraHostsView.test.ts`, `fleet.test.ts`, `hostStats.test.ts`.
 - **`InfraHostDetailView.vue`** — host header (OS/cores/RAM/GPU names) + a glance stat-tile row
   (`HostStatTiles.vue`) + `HostResourcePanels.vue`'s per-resource trend sections, both driven off one
   `useHostResourceSeries(host, startNs, endNs, hasGpu)` call hoisted in the view — a bundle of nine
@@ -260,7 +268,7 @@ convention as the RUM sub-routes).
   On mount, sets the global scope to `{ type: 'host', id: host, label: host }` via `lib/core/context.ts`'s
   `setScope`, so the time range + host scope carry through `AppShell`'s `ContextBar` and the
   "Related ▾" menu (`RelatedMenu`) the same way a service or RUM app scope would.
-- **Components** (`frontend/src/components/infra/`): `HostFleetKpis.vue`, `HostCard.vue`,
+- **Components** (`frontend/src/components/infra/`): `HostFleetSummary.vue`, `HostFleetTable.vue`,
   `HostStatTiles.vue`, `HostResourcePanels.vue`, `HostProcessesTable.vue` — together reuse existing
   primitives (`ui/card`, `ui/meter`, `ui/segmented`, `ui/sparkline`, `ui/stat-tile`, `ui/table`,
   `ui/empty-state`, `charts/ChartPanel`, `components/metrics/MetricChart.vue`), no bespoke chart code.
@@ -269,9 +277,19 @@ convention as the RUM sub-routes).
   above, hoisted once per host-detail view so its children share one cache read) — same TanStack
   Query contract as the other per-signal query modules (reactive inputs normalized with `toValue`
   into a computed `queryKey`, `keepPreviousData`, 15s polling for the two live views).
-- **NavRail:** the "Infrastructure" world now has two items — **Hosts** (`/infra`, `Server` icon) and
-  **Ops** (`/uptime`, `Activity` icon) — instead of a single landing item into `/uptime`.
-  `AppShell`'s `ROUTE_GROUP`/`LANDING` maps route `infra` → nav-group `infra` → landing `/infra`.
+- **NavRail:** the Infrastructure world is the two lower items of the rail's **Monitor** group —
+  **Hosts** (`/infra`, the two-tone rack icon with lit LEDs) and **Uptime** (`/uptime`, the probe
+  ring with a pulse through it) — instead of a single landing item into `/uptime`. `AppShell`'s
+  `ROUTE_GROUP`/`LANDING` maps route `infra` → nav key `infra` → landing `/infra`, and `uptime` →
+  `uptime` → `/uptime`.
 - **Correlation:** `lib/core/useCorrelate.ts` adds `'host'` to `EntityKind` and a `case 'host'` in
   `candidates()` — "Related ▾" from a host offers Logs (`host.name:<host>` query), Traces
   (`host.name:<host>`, sorted slowest-first), and Metrics (plain `/metrics`).
+
+### The Agent tab and Add host
+
+`/infra/:host` is now a scaffold (`HostScaffold` + `HostSubNav`: Overview · Agent) so Docker
+fleet management can hang its tabs off the host page without a second header. `/infra/:host/agent`
+and the `/infra` **Add host** action (SSH bootstrap or a minted token) are documented in
+[`deploy.md`](deploy.md); enrolled agents that are not reporting are rows of the `/infra` fleet
+table like any other host (see `HostFleetTable.vue` above).

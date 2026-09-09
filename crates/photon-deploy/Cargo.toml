@@ -1,0 +1,28 @@
+[package]
+name = "photon-deploy"
+version = "0.1.0"
+edition = "2021"
+
+# Docker fleet management: the pure domain. Template manifests, variable resolution and rendering,
+# compose linting, the desired-state document and drift diff, preflight, rollout planning, the
+# agent sync wire types (`proto`, shared with photon-agent), and the `DeployStore` trait that
+# photon-server implements over the control-plane SQLite. No I/O here — everything is
+# table-testable, and photon-agent compiles it with default features off for just `proto`.
+
+[dependencies]
+photon-core = { path = "../photon-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true, optional = true }
+serde_yaml = { version = "0.9", optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { version = "0.4", optional = true }
+uuid = { workspace = true, optional = true }
+
+[features]
+default = ["domain"]
+# Everything but the wire types: manifests, rendering, lint, diff, planning, the store trait.
+domain = ["dep:async-trait", "dep:serde_yaml", "dep:sha2", "dep:hex", "dep:uuid"]
+
+[dev-dependencies]
+tokio = { workspace = true }

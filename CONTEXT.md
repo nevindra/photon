@@ -149,6 +149,33 @@ Services. A browser app instrumented for tracing appears as a Caller like any ot
 latency. The whole set of Edges is the fleet's shape. Read from one Service it is that Service's
 Callers and Dependencies; read across all Services it is the map.
 
+## Docker fleet management
+
+**Host** (managed) — the same Host `/infra` already shows, once its `photon-agent` is enrolled here
+with a Docker capability. Docker is a *capability* of a Host, never a new entity, which is why the
+Containers and Agent tabs land on the host's own page. A Host belongs to at most one [[site]].
+
+**Agent** — the `photon-agent` on a Host. It connects *outbound* and asks for work; the server never
+dials in. Its **capabilities** (read / lifecycle / apply / exec) are what it admits to, granted by
+flags on the host — a customer who allows only read gets read, and the server cannot override that.
+
+**Role** — what a signed-in person may press: **Viewer** (sees everything), **Operator** (changes
+what runs on a host through the approved paths), **Admin** (changes the paths themselves). A control
+a role lacks stays visible and refuses, naming the role it needs.
+
+**Audit** — the record of every change Photon made to a Host: who, what, where, when, and whether it
+ended `ok`, `failed`, `denied` (the role said no; nothing ran) or `pending` (the host was offline and
+applies it on its next sync). Kept independently of telemetry retention. Never carries a secret.
+
+**Stack** — one deployed compose project on one Host. Its `services:` are **compose services**, not
+APM Services; the UI names them apart. **Template** — a versioned, parameterized recipe for one of our
+products; a **Template version** is immutable, and what a Stack pins. **Rollout** — applying one
+Template version to a set of targets, staged. **Drift** — observed state on a Host differs from
+desired state; reconciling it is a deliberate choice, never automatic.
+
+Deliberately *not* introduced: "Project" (vague), "Environment" (already [[environment]]), "Cluster"
+(Photon does not cluster).
+
 ## Time
 
 **Window** — the app-wide active time range. Every number on every Backend page is scoped to it.

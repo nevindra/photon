@@ -2201,7 +2201,7 @@ interface InfraHostFixture {
 // (warning/critical counts) and host card degraded-flag have something real to show. gpu-node-1 is
 // the max-vs-mean case on purpose: four GPUs, one of them at 0.76 and the rest idle, so demo mode
 // exercises the "76% max · 20% avg" pairing instead of a single-device host where they coincide.
-const INFRA_HOSTS: InfraHostFixture[] = [
+export const INFRA_HOSTS: InfraHostFixture[] = [
   { host: 'web-1', os: 'linux', cores: 8, totalRamBytes: 16 * 1024 ** 3, hasGpu: false, gpus: [], cpuUtil: 0.32, memUtil: 0.54, diskUtil: 0.45, diskUtilAvg: 0.24, diskGroups: 3, gpuUtil: null, gpuUtilAvg: null, gpuGroups: 0 },
   { host: 'web-2', os: 'linux', cores: 8, totalRamBytes: 16 * 1024 ** 3, hasGpu: false, gpus: [], cpuUtil: 0.41, memUtil: 0.61, diskUtil: 0.84, diskUtilAvg: 0.37, diskGroups: 3, gpuUtil: null, gpuUtilAvg: null, gpuGroups: 0 },
   { host: 'gpu-node-1', os: 'linux', cores: 32, totalRamBytes: 128 * 1024 ** 3, hasGpu: true, gpus: ['NVIDIA A100'], cpuUtil: 0.58, memUtil: 0.72, diskUtil: 0.63, diskUtilAvg: 0.31, diskGroups: 4, gpuUtil: 0.76, gpuUtilAvg: 0.2, gpuGroups: 4 },

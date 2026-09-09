@@ -183,6 +183,13 @@ impl Sampler for SysinfoSampler {
 /// `host.id` is never empty as long as the hostname itself resolved. Called once from
 /// `SysinfoSampler::new()` and cached for the process lifetime (host identity doesn't change
 /// between samples), not re-resolved on every `sample()`.
+/// The machine identity the control channel reports as `host.id` (same value the metrics
+/// resource carries), so the Deploy world and the Hosts world agree on who a host is.
+pub fn machine_id() -> Option<String> {
+    let hostname = sysinfo::System::host_name().unwrap_or_else(|| "unknown-host".to_string());
+    Some(stable_host_id(&hostname))
+}
+
 fn stable_host_id(hostname: &str) -> String {
     first_machine_id(&["/etc/machine-id", "/var/lib/dbus/machine-id"])
         .unwrap_or_else(|| hostname.to_string())

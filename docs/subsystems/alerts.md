@@ -188,7 +188,7 @@ incidents show up in the same Incidents view and can reuse notification channels
 
 ## UI
 
-`/alerts` → `AlertsView.vue` (Manage group in `NavRail`, next to Data): an `AlertStatBand` (Triggered
+`/alerts` → `AlertsView.vue` (first item of the Manage group in `NavRail`, above Data): an `AlertStatBand` (Triggered
 / Active rules / Paused / Channels), then three URL-synced tabs (`?tab=rules|incidents|channels`,
 same pattern as `DataView.vue`).
 

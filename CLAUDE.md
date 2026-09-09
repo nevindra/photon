@@ -127,7 +127,8 @@ surfaced by one `ContextBar` mounted once in `AppShell`
 keys — and a detail view's back button pops to the list's own history entry
 (`lib/core/useBackTo.ts`) so those filters survive a drill-in → back round trip. Routes: `/` → `/home` (`HomeView`, the
 **Attention Board** — the cross-signal landing page, which shows *judgments* rather than readings:
-every watched thing becomes a **Subject** at one ranked **Attention Level** (Down / Critical /
+every watched thing — Services, RUM apps, Hosts, Monitors, Sites, and now Stacks and Rollouts (the Deploy
+world, present once something is under management) — becomes a **Subject** at one ranked **Attention Level** (Down / Critical /
 Warning / OK, plus Unknown for the absence of a judgment), the World roll-up cards double as the
 page's filter (`?world=`, no tabs), and it judges over its own bounded **Watch Range**
 (5m/15m/1h/6h, `?watch=`) rather than the app-wide time Window — so it passes
@@ -150,26 +151,51 @@ queries, so Overview stays fast when Operations is expensive), `/metrics` (+ `/m
 sub-routes: `/rum/:appId` vitals, `/pages[/:route]`, `/errors` (search bar + fixed facet panel), and
 `/errors/:fingerprint` issue detail; with a federation tenant active, central's `/rum` becomes a
 read-only tenant lens — apps derived from mirrored data via `?tenant=`, manage UI hidden), `/uptime`, `/infra` (+ `/infra/:host` host detail — host/GPU
-resource monitoring), `/data` (Overview / Storage / **Services** — per-service footprint attribution / Retention /
+resource monitoring — plus `/infra/:host/containers`, the read-only Docker inventory (containers grouped by compose
+project, images/volumes/networks, daemon events, a drawer with live logs / stats / details, and one-shot lifecycle
+actions — start/stop/restart/kill/pull/recreate/remove/prune, image pull/remove, volume remove — with confirmations sized to the blast radius and
+queued-when-offline semantics, plus an audited Shell tab gated on the admin role and the agent's `--docker-exec`) and `/infra/:host/agent`,
+the managed-agent tab of Docker fleet management), `/data` (Overview / Storage / **Services** — per-service footprint attribution / Retention /
 Delete), `/alerts` (the cross-signal webhook alert engine — rules over
 metrics/logs/traces/RUM, incidents, notification channels (channels are typed presets: Generic
 Webhook, Discord, Telegram), plus a "Browse templates" quick-setup on-ramp: target-first
 Apply/Customize over a frontend-only, 23-template seed catalog), `/tenants` (federation, central-side: the live
-fleet-health board plus the tenant registry), plus `/login`
+fleet-health board plus the tenant registry), `/deploy/templates` (+ `/deploy/templates/:id` — the catalog of versioned, parameterized recipes with typed
+variables, immutable versions, registries + Portainer JSON import, image-registry credentials for private pulls
+(server-held, encrypted, write-only, scoped to hosts, handed to the agent per pull over `POST /api/agent/registry-auth` —
+never a `docker login` on a host), and a four-step deploy wizard: target → typed
+variables → preflight against the host's facts with a rendered-compose diff and dangerous-construct
+acknowledgements → deploy; also the upgrade path for a template stack), `/deploy/rollouts` (+ `/deploy/rollouts/:id` — staged rollouts of a template version to hosts, a Site, or a label
+match: canary → explicit gate → the rest, per-target status where pending is neutral, a failure threshold that pauses
+the stage, and rollback as an ordinary re-apply of the previous immutable version), `/deploy/stacks` (+ `/deploy/stacks/:id` — the Deploy world: compose projects under desired state, one per host,
+with a lint-as-you-type editor whose dangerous constructs need explicit acknowledgement, deploy options, sized
+confirmations for apply/restart/redeploy/down/destroy, drift shown desired-beside-observed with reconcile as a
+deliberate act, adopt-existing, and links to the APM services a stack produced), `/audit` (the audit log of every change Photon made to a host;
+see [`docs/subsystems/deploy.md`](docs/subsystems/deploy.md) — roles `viewer`/`operator`/`admin` gate the
+mutating buttons through `lib/core/auth.ts`'s `can()` and `components/deploy/GatedButton.vue`, which disables
+rather than hides), `/settings/users` (`/settings` redirects there — who can sign in and what each may
+change: the paged users table with an in-place role picker for an admin and a per-row key that sets a
+password (your own with the current one, anyone's as admin, via `PUT /api/users/:username/password`),
+an "Add a user" modal with inline validation and a password confirmation, and Remove/demote refusals
+explained in place; reached from the rail's gear, which replaced
+the old Settings modal; see [`docs/subsystems/auth.md`](docs/subsystems/auth.md)), plus `/login`
 and `/onboarding`, behind a `beforeEach` auth guard
 (`router/index.js`) gated on reactive flags (`lib/core/auth.ts`). The `@photon/rum` browser SDK
 (`sdk/rum/`) behind `/rum` auto-detects SPA client-side navigation (History API —
 `pushState`/`replaceState`/`popstate` — on by default; MPAs unaffected) and rotates a
 per-view identity (`view.id`/`seq`/`previous_route`) with its own Web Vitals and, with `tracing:
 true`, its own backend trace per route; the exported `trackView(route?)` is a manual escape hatch
-for routers that prefer to drive the boundary themselves. `NavRail` groups these into ownership
-**worlds** (Home; Frontend → `/rum`, Backend → `/services`, Infrastructure — headed "Infra", since
-rail headings have ~10 characters of room — → **Hosts** `/infra` +
-**Ops** `/uptime`), an **Explore** section (Logs/Traces/Metrics), and **Manage** (Data, Alerts, Tenants), with
-`AppShell` deriving the highlighted group from the route. Cross-view correlation (log→trace, span/trace→logs,
+for routers that prefer to drive the boundary themselves. `NavRail` groups these by what the
+operator is trying to do — four verb-named groups under an ungrouped Home, each item drawn with its own
+two-tone icon (`components/common/nav-icons/`: neutral strokes + a Photon Cyan accent shaped after the
+item's function): **Monitor** (the health of what you run, outside-in: Frontend → `/rum`, Backend →
+`/services`, Hosts → `/infra`, Uptime → `/uptime`), **Explore** (Logs/Traces/Metrics, the raw signals),
+**Deploy** (Templates → `/deploy/templates`, Stacks → `/deploy/stacks`, Rollouts → `/deploy/rollouts`) and
+**Manage** (Photon itself: Alerts, Data, Tenants, Audit), with the gear below the groups opening
+`/settings/users` and `AppShell` deriving the highlighted item from the route. Cross-view correlation (log→trace, span/trace→logs,
 and a "Related ▾" menu) flows through `router.push` via `lib/core/useCorrelate.ts`'s `correlate()`, which
 always carries the active time+tenant. Components are grouped by signal under `src/components/`
-(`logs/`, `traces/`, `services/`, `metrics/`, `rum/`, `uptime/`, `data/`, `alerts/`, `charts/`,
+(`logs/`, `traces/`, `services/`, `metrics/`, `rum/`, `uptime/`, `data/`, `alerts/`, `docker/`, `deploy/`, `charts/`,
 `common/`, `ui/`). Data flows through one **Ky** client (`lib/core/api.ts` — keeps a mock-fallback: tries `/api`,
 falls back to in-browser mocks on a network failure while surfacing real 400/404s) wrapped by
 **TanStack Query** composables (`lib/*Queries.ts`) keyed off URL/filter state. Tables/waterfalls are
@@ -303,10 +329,26 @@ photon-server   the binary: config load, wiring, background-task supervision (3 
                 four): RUM bypasses the OTLP tee, so the module's `TeeingRumSink` wraps the local
                 RumSink and, per beacon after a successful local write, synthesizes OTLP
                 (vitals→/v1/metrics, errors→/v1/logs) for the same forwarder.
+photon-deploy   Docker fleet management, the pure domain (depends only on photon-core): the
+                model every deploy route serializes, the agent sync wire types (`proto`, compiled
+                into photon-agent with default features off), compose lint/render/drift/preflight/
+                rollout planning, Portainer import, and the `DeployStore` trait (+ `MemStore`).
+                photon-api/src/deploy/ is the HTTP layer (session+role routes, the agent-token
+                control channel, the in-memory hub, the supervisor tick); photon-server/src/deploy/
+                the SQLite store, the AES-GCM secrets cipher and the SSH bootstrapper. See
+                docs/subsystems/deploy.md.
 photon-loadgen  dev-only OTLP/HTTP logs+traces+metrics load generator (its own binary).
-photon-agent    standalone host/GPU resource-metrics agent (its own binary, like photon-loadgen):
-                samples host (sysinfo) + NVIDIA GPU (nvml-wrapper, default-on `gpu` feature), POSTs
-                OTLP system.*/system.gpu.* metrics tagged host.name/host.id/os.type to /v1/metrics.
+photon-agent    standalone host agent (its own binary, like photon-loadgen): samples host
+                (sysinfo) + NVIDIA GPU (nvml-wrapper, default-on `gpu` feature), POSTs OTLP
+                system.*/system.gpu.* metrics tagged host.name/host.id/os.type to /v1/metrics; and,
+                with `--server` + `--token` (the per-host `ak_` agent token), the Docker fleet
+                control channel (default-on `docker` feature: bollard + the `docker compose` CLI) —
+                one long-polled `POST /api/agent/sync`, capabilities opt-in per flag
+                (`--docker-read/-lifecycle/-apply/-exec`), `install`/`uninstall` subcommands.
+                `install` checks for root first; a missing `--token` is PROMPTED for (echo off,
+                `prompt.rs`) at a terminal so the UI's install snippet never carries it. The
+                Dockerfile builds the shipped agent on bullseye (glibc 2.31) because it runs on
+                customers' hosts, not in the image.
 ```
 
 **Signal isolation by duplication:** logs, spans, and metrics each get their **own** WAL, Arrow
@@ -437,10 +479,12 @@ See [`docs/conventions.md`](docs/conventions.md) for the full list. The load-bea
 - **`PhotonError`** (`photon-core/src/lib.rs`) is one enum with a variant pre-declared for *every*
   crate's domain. Downstream crates never edit it (that would race under parallel development) — they
   use the variant that fits.
-- **Three independent auth systems, never conflated:** OTLP **ingest** = shared service **bearer
+- **Four independent auth systems, never conflated:** OTLP **ingest** = shared service **bearer
   token** (`[ingest].token`); human **UI** users = **argon2 password + signed session cookie**
-  (`[auth]`); the RUM public **beacon** (`POST /api/rum`) = per-app public key + Origin allowlist (the
-  only CORS-enabled, unauthenticated route). The beacon is always-mounted now — apps are UI-managed
+  (`[auth]`) carrying a **role** (`viewer`/`operator`/`admin`; `CurrentUser` extractor, 403 gate);
+  the RUM public **beacon** (`POST /api/rum`) = per-app public key + Origin allowlist (the only
+  CORS-enabled, unauthenticated route); the managed-host **agent token** (`ak_…`, sha256 stored,
+  `/api/agent/*` only) — never `[ingest].token`. The beacon is always-mounted now — apps are UI-managed
   in the `rum_apps` SQLite table (server-minted `pk_live_…` key, rotatable), not `[[rum.apps]]`
   config, and a beacon for an unregistered app now gets a **403** (there's no "RUM disabled" state
   left to 404 from).

@@ -16,7 +16,9 @@ export default defineConfig({
   server: {
     proxy: {
       // Backend target; override with PHOTON_API_PROXY when :8080 is taken (default matches process-compose).
-      '/api': process.env.PHOTON_API_PROXY || 'http://127.0.0.1:8080',
+      // `changeOrigin` rewrites the Host header to the backend's, so a server that derives its
+      // own URL from the request (the agent install snippet) says :8080, not this dev server.
+      '/api': { target: process.env.PHOTON_API_PROXY || 'http://127.0.0.1:8080', changeOrigin: true },
     },
   },
   build: {

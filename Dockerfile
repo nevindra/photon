@@ -30,9 +30,23 @@ RUN cargo build --release -p photon-server
 # Hand an empty, correctly-owned data dir to the runtime image (fresh named volumes inherit it).
 RUN mkdir -p /var/lib/photon
 
+# ---- Stage 2b: the agent, on the OLDEST glibc we can build against --------------------------
+# The agent ships INSIDE the server image: `GET /api/agent/download` and the SSH bootstrap serve
+# the `photon-agent` beside `photon-server` (docs/subsystems/deploy.md), so an air-gapped site
+# never needs the internet to install it. But that binary runs on the CUSTOMER's hosts, not in
+# this image — and a glibc binary needs the glibc it was built against or newer. Bookworm's 2.36
+# fails on Ubuntu 22.04 (2.35) with "GLIBC_2.36 not found"; bullseye's 2.31 runs on Ubuntu
+# 20.04+, Debian 11+, RHEL 9+. Dynamic glibc is deliberate — GPU sampling dlopen()s NVML, which a
+# static musl build cannot do — so the baseline is the lever, and it lives here.
+FROM rust:1-bullseye AS agent-builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release -p photon-agent && strip target/release/photon-agent
+
 # ---- Stage 3: runtime (distroless glibc, non-root) -----------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 COPY --from=builder /app/target/release/photon-server /usr/local/bin/photon-server
+COPY --from=agent-builder /app/target/release/photon-agent /usr/local/bin/photon-agent
 COPY --from=builder --chown=65532:65532 /var/lib/photon /var/lib/photon
 ENV PHOTON_STORAGE_HOT_DIR=/var/lib/photon/hot \
     PHOTON_STORAGE_DB_PATH=/var/lib/photon/photon.db \

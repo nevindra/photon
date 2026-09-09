@@ -38,7 +38,7 @@ const { subjects, rollups, unattributed, totalWatched, showSites, loading, atten
 // The roll-up cards ARE the filter — click one to narrow the list and the vital signs, click it
 // again to release. Kept in the URL so a narrowed board is shareable.
 const worldParam = ref<string | null>(null)
-useUrlParam('world', worldParam, { valid: (v) => boardWorlds({ sites: true }).some((w) => w.key === v) })
+useUrlParam('world', worldParam, { valid: (v) => boardWorlds({ sites: true, deploy: true }).some((w) => w.key === v) })
 
 // A world this install does not show (`?world=sites` on a non-federated install, or `?world=ops`
 // under a tenant lens) filters to nothing — fall back to the whole board rather than an empty page.

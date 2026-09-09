@@ -73,6 +73,13 @@ import {
   mockTestAlertChannel,
   mockAlertIncidents,
 } from '@/lib/core/mock'
+// The Docker fleet-management mock corpus is loaded lazily: it is ~2,300 lines that a real
+// install with the backend never needs, so it stays out of the main chunk (see `deployRead`).
+type DeployMocks = typeof import('@/lib/core/mockDeploy')
+const deployMocks = (): Promise<DeployMocks> => import('@/lib/core/mockDeploy')
+import type { Role } from '@/lib/deploy/roles'
+export type { Role }
+import { DeployUnavailableError, DEPLOY_UNAVAILABLE_MESSAGE, deployDemoFlag } from '@/lib/deploy/availability'
 
 // ---------------------------------------------------------------------------
 // Types — request params and resolved response payloads for every `api.*` method.
@@ -105,10 +112,14 @@ export interface SessionInfo {
   authenticated: boolean
   username: string | null
   needs_setup: boolean
+  // Absent on a backend that predates roles: the single implicit role of that era could do
+  // everything the UI offered, so `auth.ts` reads a missing role as `admin`, not `viewer`.
+  role?: Role
 }
 export interface UserInfo {
   username: string
   created_at: number
+  role?: Role
 }
 export interface UsersResult {
   users: UserInfo[]
@@ -1282,12 +1293,777 @@ function withQ(searchParams: Record<string, string>, q?: string): Record<string,
   return searchParams
 }
 
-let mockUsers: UserInfo[] = [{ username: 'demo', created_at: Date.now() }]
+let mockUsers: UserInfo[] = [
+  { username: 'demo', created_at: Date.now() - 90 * 86_400_000, role: 'admin' },
+  { username: 'rina', created_at: Date.now() - 30 * 86_400_000, role: 'operator' },
+  { username: 'bayu', created_at: Date.now() - 12 * 86_400_000, role: 'viewer' },
+]
 
 // Local mutable copy of `mockRetention` (imported `let` bindings from another ES module are
 // live-read but not reassignable from here, so — like `mockUsers` above — the mutable state
 // lives in this module and is only seeded from the mock.js default).
 let mockRetentionState: Retention = { ...mockRetention }
+
+// --- Docker fleet management: managed agents, enrollment, audit ---
+// Field names mirror the control-plane tables in docs/subsystems/deploy.md. Timestamps here are
+// epoch MILLISECONDS (control-plane rows, like alerts/deployments), not the telemetry ns strings.
+export type AgentCapability = 'read' | 'lifecycle' | 'apply' | 'exec'
+export type AgentStatus = 'online' | 'offline' | 'pending'
+export interface DockerDisk {
+  images_bytes: number
+  volumes_bytes: number
+  build_cache_bytes: number
+  reclaimable_bytes: number
+  total_bytes: number | null
+  used_bytes: number | null
+}
+export interface DockerFacts {
+  version: string
+  api_version: string
+  storage_driver: string
+  os: string
+  arch: string
+  containers_running: number
+  containers_total: number
+  images: number
+  disk: DockerDisk
+}
+export interface ManagedHost {
+  id: string
+  host: string
+  site: string | null
+  status: AgentStatus
+  agent_version: string | null
+  latest_agent_version: string | null
+  // What the agent ADMITS to, reported on every sync — never assigned from here.
+  capabilities: AgentCapability[]
+  poll_secs: number
+  last_seen_ms: number | null
+  enrolled_ms: number
+  docker: DockerFacts | null
+  labels: Record<string, string>
+}
+export interface ManagedHostsResult {
+  hosts: ManagedHost[]
+}
+export interface EnrollInput {
+  host: string
+  site?: string | null
+  capabilities: AgentCapability[]
+  poll_secs?: number
+  labels?: Record<string, string>
+}
+// What comes back with a freshly minted or rotated agent token — everything the install
+// snippet needs so the UI never guesses it from its own origin (a Vite dev server on :5173 is
+// not where the sync endpoint lives; neither is a reverse proxy's internal name).
+export interface TokenIssue {
+  // The per-host agent token, minted server-side and shown ONCE.
+  token?: string
+  // The URL the host should dial: `[deploy].server_origin`, else derived from the request.
+  server_url?: string
+  // Architectures `GET /api/agent/download` can serve right now; empty = the download would 404.
+  agent_archs?: string[]
+}
+export interface EnrollResult extends MutationResult, TokenIssue {
+  host?: ManagedHost
+}
+export interface AgentPatch {
+  poll_secs?: number
+  labels?: Record<string, string>
+  site?: string | null
+}
+export type SshAuth = { type: 'password'; password: string } | { type: 'key'; private_key: string; passphrase?: string }
+export interface SshBootstrapInput {
+  addresses: string[]
+  port: number
+  username: string
+  auth: SshAuth
+  host_name?: string | null
+  site?: string | null
+  capabilities: AgentCapability[]
+  poll_secs?: number
+  labels?: Record<string, string>
+  // Off by default: credentials are used once and discarded (R1.9.1).
+  remember_credentials?: boolean
+}
+export type BootstrapStepKey = 'connect' | 'detect' | 'push' | 'configure' | 'start' | 'sync'
+export interface BootstrapStep {
+  key: BootstrapStepKey
+  label: string
+  status: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  detail?: string
+}
+export interface BootstrapHostProgress {
+  address: string
+  host: string | null
+  status: 'running' | 'done' | 'failed'
+  steps: BootstrapStep[]
+  error: string | null
+}
+export interface BootstrapJob {
+  id: string
+  status: 'running' | 'done' | 'failed'
+  started_ms: number
+  credentials_kept: boolean
+  hosts: BootstrapHostProgress[]
+}
+export interface BootstrapStartResult extends MutationResult {
+  job?: BootstrapJob
+}
+export type AuditResultKind = 'ok' | 'failed' | 'denied' | 'pending'
+export interface AuditTarget {
+  host?: string
+  container?: string
+  image?: string
+  volume?: string
+  stack?: string
+  rollout?: string
+  template?: string
+  version?: string
+  registry?: string
+  user?: string
+}
+export interface AuditEntry {
+  id: string
+  ts_ms: number
+  actor: string
+  role: Role
+  // Dotted `noun.verb` — `container.restart`, `stack.apply`, `agent.enroll`, `rollout.promote`.
+  action: string
+  target: AuditTarget
+  result: AuditResultKind
+  detail: string | null
+  // Digest of the rendered payload; the payload itself is never in the log (secrets, R5.9).
+  payload_digest: string | null
+}
+export interface AuditFilter {
+  since_ms?: number
+  actor?: string
+  action?: string
+  host?: string
+  result?: AuditResultKind
+  q?: string
+  limit?: number
+}
+export interface AuditResult {
+  entries: AuditEntry[]
+  total: number
+}
+
+// --- Docker fleet management: per-host inventory (read-only Docker) ---
+export type ContainerState = 'running' | 'exited' | 'paused' | 'restarting' | 'created' | 'dead' | 'removing'
+export type ContainerHealth = 'healthy' | 'unhealthy' | 'starting' | 'none'
+export interface ContainerPort {
+  host_ip: string | null
+  host_port: number | null
+  container_port: number
+  protocol: 'tcp' | 'udp'
+}
+export interface ContainerMount {
+  type: 'volume' | 'bind' | 'tmpfs'
+  source: string
+  destination: string
+  rw: boolean
+}
+export interface Container {
+  id: string
+  name: string
+  image: string
+  image_id: string
+  command: string
+  state: ContainerState
+  health: ContainerHealth
+  // Docker's own words ("Up 3 days (healthy)", "Exited (1) 2 hours ago") — shown verbatim.
+  status_text: string
+  created_ms: number
+  started_ms: number | null
+  finished_ms: number | null
+  exit_code: number | null
+  restart_count: number
+  restart_policy: string
+  ports: ContainerPort[]
+  mounts: ContainerMount[]
+  networks: string[]
+  labels: Record<string, string>
+  // Names only — values may be secrets and never leave the host.
+  env_keys: string[]
+  // Values as the AGENT reports them: anything secret-looking is masked before it leaves the host.
+  env: Record<string, string>
+  // From `com.docker.compose.project` / `.service`, so a stack Photon deployed and one somebody
+  // deployed by hand group the same way.
+  compose_project: string | null
+  compose_service: string | null
+  managed_stack_id: string | null
+  cpu_pct: number | null
+  mem_bytes: number | null
+  mem_limit_bytes: number | null
+  net_rx_bps: number | null
+  net_tx_bps: number | null
+  block_read_bps: number | null
+  block_write_bps: number | null
+}
+export interface ImageInfo {
+  id: string
+  repo_tags: string[]
+  size_bytes: number
+  created_ms: number
+  used_by: number
+  dangling: boolean
+}
+export interface VolumeInfo {
+  name: string
+  driver: string
+  mountpoint: string
+  size_bytes: number | null
+  used_by: string[]
+  created_ms: number
+}
+export interface NetworkInfo {
+  id: string
+  name: string
+  driver: string
+  scope: string
+  internal: boolean
+  containers: number
+  subnet: string | null
+}
+export interface HostInventory {
+  host: string
+  agent_status: AgentStatus
+  // When the agent last reported this. `stale` = older than two poll intervals (offline host).
+  fetched_ms: number
+  stale: boolean
+  containers: Container[]
+  images: ImageInfo[]
+  volumes: VolumeInfo[]
+  networks: NetworkInfo[]
+  facts: DockerFacts | null
+}
+export interface ContainerLogLine {
+  ts_ms: number
+  stream: 'stdout' | 'stderr'
+  text: string
+}
+export interface ContainerLogsQuery {
+  tail?: number
+  since_ms?: number
+}
+export interface ContainerLogsResult {
+  lines: ContainerLogLine[]
+  truncated: boolean
+}
+export interface ContainerStatPoint {
+  t: number
+  v: number | null
+}
+export interface ContainerStats {
+  cpu_pct: ContainerStatPoint[]
+  mem_bytes: ContainerStatPoint[]
+  net_rx_bps: ContainerStatPoint[]
+  net_tx_bps: ContainerStatPoint[]
+  block_read_bps: ContainerStatPoint[]
+  block_write_bps: ContainerStatPoint[]
+  mem_limit_bytes: number | null
+}
+export interface DockerEvent {
+  id: string
+  ts_ms: number
+  type: 'container' | 'image' | 'volume' | 'network'
+  action: string
+  actor: string
+  attributes: Record<string, string>
+}
+export interface DockerEventsResult {
+  events: DockerEvent[]
+}
+
+// --- Docker fleet management: one-shot Actions (lifecycle) ---
+export type ActionKind = 'start' | 'stop' | 'restart' | 'kill' | 'pull' | 'recreate' | 'remove' | 'prune' | 'image_pull' | 'image_remove' | 'volume_remove'
+export type ActionStatus = 'queued' | 'running' | 'done' | 'failed' | 'expired'
+export interface ActionArgs {
+  // remove: also delete anonymous volumes; recreate: pull first
+  remove_volumes?: boolean
+  pull?: boolean
+  // prune: which categories
+  images?: boolean
+  containers?: boolean
+  volumes?: boolean
+  build_cache?: boolean
+}
+export interface ActionInput {
+  kind: ActionKind
+  container_id?: string
+  // image_pull / image_remove: the image id or `repo:tag`.
+  image?: string
+  // volume_remove: the volume's name.
+  volume?: string
+  args?: ActionArgs
+}
+export interface ActionRecord {
+  id: string
+  host: string
+  kind: ActionKind
+  container_id: string | null
+  container_name: string | null
+  image: string | null
+  volume?: string | null
+  args: ActionArgs
+  status: ActionStatus
+  actor: string
+  created_ms: number
+  started_ms: number | null
+  finished_ms: number | null
+  // The lease: an action nobody picked up by then expires instead of firing late.
+  expires_ms: number
+  result: string | null
+}
+export interface ActionResult extends MutationResult {
+  action?: ActionRecord
+}
+export interface ActionsResult {
+  actions: ActionRecord[]
+}
+export interface PruneCategory {
+  count: number
+  bytes: number
+}
+export interface PrunePreview {
+  host: string
+  images: PruneCategory
+  containers: PruneCategory
+  volumes: PruneCategory
+  build_cache: PruneCategory
+}
+
+// --- Docker fleet management: Stacks (compose projects under desired state) ---
+export type StackStatus = 'declared' | 'rendered' | 'pending' | 'applying' | 'running' | 'drifted' | 'failed' | 'destroying' | 'gone'
+export type StackSource = 'template' | 'compose' | 'adopted'
+export interface StackFile {
+  path: string
+  content: string
+}
+export interface StackServiceState {
+  name: string
+  image: string
+  containers: { id: string; name: string; state: ContainerState; health: ContainerHealth }[]
+}
+export interface DriftItem {
+  kind: 'container_missing' | 'extra_container' | 'image_changed' | 'config_changed' | 'state_changed' | 'env_changed'
+  service: string | null
+  field: string | null
+  desired: string | null
+  observed: string | null
+  since_ms: number
+}
+export interface DeployOptions {
+  pull: 'missing' | 'always' | 'never'
+  force_recreate: boolean
+  recreate_volumes: boolean
+}
+export interface ComposeWarning {
+  // Stable across edits of the same construct, so an acknowledgement sticks.
+  id: string
+  kind: 'privileged' | 'docker_sock' | 'host_network' | 'host_pid' | 'bind_mount_outside' | 'cap_add'
+  severity: 'error' | 'warning'
+  service: string | null
+  line: number | null
+  detail: string
+}
+export interface Stack {
+  id: string
+  name: string
+  host: string
+  site: string | null
+  source: StackSource
+  template_id: string | null
+  template_name: string | null
+  template_version: string | null
+  status: StackStatus
+  desired_generation: number
+  applied_generation: number | null
+  files: StackFile[]
+  // Resolved non-secret variables; secret NAMES only.
+  variables: Record<string, string>
+  secrets: string[]
+  deploy_options: DeployOptions
+  services: StackServiceState[]
+  drift: DriftItem[]
+  // APM services this stack produced (service.name), for the observability tie-in.
+  apm_services: string[]
+  acknowledged_warnings: string[]
+  last_error: string | null
+  created_by: string
+  created_ms: number
+  updated_ms: number
+  last_applied_ms: number | null
+}
+export interface StacksResult {
+  stacks: Stack[]
+}
+export interface StackInput {
+  name: string
+  host: string
+  files: StackFile[]
+  deploy_options: DeployOptions
+  acknowledged_warnings: string[]
+  // Create and apply in one go (default), or just save.
+  apply?: boolean
+}
+export interface StackResult extends MutationResult {
+  stack?: Stack
+}
+// `accept` = take what runs as the new desired state (the deliberate alternative to reconcile).
+export type StackActionKind = 'up' | 'down' | 'restart' | 'redeploy' | 'destroy' | 'reconcile' | 'accept'
+export interface StackActionArgs {
+  pull?: boolean
+  volumes?: boolean
+}
+export interface StackValidation {
+  ok: boolean
+  warnings: ComposeWarning[]
+  services: string[]
+  missing_variables: string[]
+  error: string | null
+}
+export interface DiscoveredProject {
+  host: string
+  name: string
+  services: string[]
+  containers: number
+  running: number
+  compose_file: string | null
+  working_dir: string | null
+}
+export interface DiscoveredProjectsResult {
+  projects: DiscoveredProject[]
+}
+
+// --- Docker fleet management: Templates (versioned, parameterized recipes) ---
+export type VariableType = 'string' | 'number' | 'bool' | 'select' | 'port' | 'path' | 'secret' | 'generated'
+export interface TemplateVariable {
+  name: string
+  label: string
+  description?: string | null
+  type: VariableType
+  required: boolean
+  default?: string | null
+  // Fixed by the template author; shown, not editable (Portainer's `preset`).
+  preset?: boolean
+  options?: string[]
+  pattern?: string | null
+  group?: string | null
+}
+export interface TemplateRequires {
+  arch?: string[]
+  min_docker?: string | null
+  min_ram_bytes?: number | null
+  min_disk_bytes?: number | null
+}
+export interface TemplatePort {
+  name: string
+  container: number
+  default_host: number
+  protocol: 'tcp' | 'udp'
+  description?: string | null
+}
+export interface TemplateVolume {
+  name: string
+  path: string
+  description?: string | null
+}
+export interface TemplateHealth {
+  kind: 'container_healthy' | 'uptime_monitor' | 'slo_burn'
+  detail: string
+  grace_secs: number
+}
+// The Photon block (R5.8): what the render injects into the deployed services.
+export interface TemplateObservability {
+  otlp_endpoint: boolean
+  ingest_token: boolean
+  service_name: string | null
+  environment: boolean
+}
+export interface TemplateManifest {
+  id: string
+  version: string
+  name: string
+  description: string
+  icon: string
+  categories: string[]
+  variables: TemplateVariable[]
+  requires: TemplateRequires
+  ports: TemplatePort[]
+  volumes: TemplateVolume[]
+  health: TemplateHealth | null
+  observability: TemplateObservability
+}
+export interface TemplateVersionRef {
+  id: string
+  version: string
+  created_ms: number
+  created_by: string
+  notes: string | null
+  deployed_count: number
+}
+export interface TemplateVersion extends TemplateVersionRef {
+  template_id: string
+  manifest: TemplateManifest
+  compose_text: string
+}
+export type TemplateSource = 'local' | 'registry' | 'portainer'
+export interface Template {
+  id: string
+  name: string
+  description: string
+  icon: string
+  categories: string[]
+  source: TemplateSource
+  registry_id: string | null
+  latest_version: string
+  versions: TemplateVersionRef[]
+  updated_ms: number
+  // Stacks deployed from any version of this template.
+  stacks: number
+}
+export interface TemplatesResult {
+  templates: Template[]
+}
+export interface TemplateVersionInput {
+  template_id: string | null
+  manifest: TemplateManifest
+  compose_text: string
+  notes?: string | null
+}
+export interface TemplateVersionResult extends MutationResult {
+  version?: TemplateVersion
+  template?: Template
+}
+export interface Registry {
+  id: string
+  name: string
+  url: string
+  kind: 'photon' | 'portainer_v2' | 'portainer_v3'
+  last_sync_ms: number | null
+  template_count: number
+  status: 'ok' | 'error' | 'syncing'
+  error: string | null
+}
+export interface RegistriesResult {
+  registries: Registry[]
+}
+export interface RegistryInput {
+  name: string
+  url: string
+  kind: Registry['kind']
+}
+export interface RegistryResult extends MutationResult {
+  registry?: Registry
+}
+// A pull credential for a private image registry (a GitLab deploy token, a GHCR PAT, a Hub
+// login). The token is write-only: never in this view. Distinct from `Registry`, a TEMPLATE
+// catalog.
+export interface RegistryCredential {
+  id: string
+  // The registry host as an image reference names it: `registry.gitlab.com`, `ghcr.io`, `docker.io`.
+  server: string
+  username: string
+  label: string | null
+  // `null` = every managed host.
+  scope: TargetSelector | null
+  created_ms: number
+  created_by: string
+  updated_ms: number
+}
+export interface RegistryCredentialsResult {
+  credentials: RegistryCredential[]
+}
+// `secret` is required on create; on update, absent keeps the stored token and `scope: null`
+// widens to every host.
+export interface RegistryCredentialInput {
+  server?: string
+  username?: string
+  secret?: string
+  label?: string | null
+  scope?: TargetSelector | null
+}
+export interface RegistryCredentialResult extends MutationResult {
+  credential?: RegistryCredential
+}
+export interface ImportResult extends MutationResult {
+  imported?: number
+  skipped?: number
+}
+export interface PreflightCheck {
+  key: string
+  label: string
+  status: 'pass' | 'warn' | 'fail' | 'skip'
+  detail: string
+}
+export interface TemplateDeployInput {
+  template_version_id: string
+  host: string
+  name: string
+  variables: Record<string, string>
+  // Secret values, sent once, never read back.
+  secrets?: Record<string, string>
+  deploy_options: DeployOptions
+  acknowledged_warnings: string[]
+  // Upgrade an existing stack in place (its id) rather than create one.
+  stack_id?: string | null
+}
+export interface DryRunResult {
+  ok: boolean
+  host: string
+  checks: PreflightCheck[]
+  compose: string
+  env: string
+  // The compose the host runs now, when upgrading an existing stack — for the diff.
+  previous_compose: string | null
+  warnings: ComposeWarning[]
+  secrets: string[]
+  generated: string[]
+  error: string | null
+}
+
+// --- Docker fleet management: Rollouts (staged application of a template version) ---
+export type TargetSelector = { kind: 'hosts'; hosts: string[] } | { kind: 'site'; sites: string[] } | { kind: 'labels'; labels: Record<string, string> }
+export interface RolloutStrategy {
+  canary: number
+  canary_is_percent: boolean
+  // Stage pauses when this many targets in it have failed (R6.4).
+  failure_threshold: number
+  prepull: boolean
+  // Automatic promotion past the gate — MAY, later; the UI carries the switch, off by default.
+  auto_promote: boolean
+  health_grace_secs: number
+}
+export type RolloutState = 'draft' | 'running' | 'paused_gate' | 'paused_threshold' | 'completed' | 'aborted' | 'rolled_back'
+// `queued` = its stage has not been reached; `pending` = its stage is live but the host is not
+// answering. Two facts, two words (the mistake `idle` once made on the Backend world).
+export type TargetStatus = 'queued' | 'pending' | 'prepulling' | 'applying' | 'healthy' | 'failed' | 'drifted' | 'skipped'
+export interface RolloutTarget {
+  host: string
+  site: string | null
+  // 0 = not eligible (skipped at planning); 1 = canary; 2 = the rest.
+  stage: number
+  status: TargetStatus
+  attempts: number
+  last_error: string | null
+  stack_id: string | null
+  previous_version: string | null
+  agent_status: AgentStatus
+  updated_ms: number
+}
+export interface Rollout {
+  id: string
+  name: string
+  template_id: string
+  template_name: string
+  template_version_id: string
+  template_version: string
+  previous_version: string | null
+  stack_name: string
+  selector: TargetSelector
+  strategy: RolloutStrategy
+  state: RolloutState
+  stage: number
+  stages: number
+  targets: RolloutTarget[]
+  variables: Record<string, string>
+  created_by: string
+  created_ms: number
+  updated_ms: number
+  started_ms: number | null
+  finished_ms: number | null
+}
+export interface RolloutsResult {
+  rollouts: Rollout[]
+}
+export interface RolloutInput {
+  name: string
+  template_version_id: string
+  stack_name: string
+  selector: TargetSelector
+  strategy: RolloutStrategy
+  variables: Record<string, string>
+  secrets?: Record<string, string>
+  deploy_options: DeployOptions
+  // Every dangerous construct in the version's compose, acknowledged before it ships (R8.4).
+  acknowledged_warnings: string[]
+  start?: boolean
+}
+export interface RolloutResult extends MutationResult {
+  rollout?: Rollout
+}
+export type RolloutActionKind = 'start' | 'promote' | 'pause' | 'resume' | 'abort' | 'rollback' | 'retry'
+
+// --- Docker fleet management: exec (shell into a container; R3.4, admin + agent `exec`) ---
+export interface ExecSession {
+  id: string
+  host: string
+  container_id: string
+  container_name: string
+  shell: string
+  opened_ms: number
+}
+export interface ExecSessionResult extends MutationResult {
+  session?: ExecSession
+}
+export interface ExecOutput {
+  lines: string[]
+  exit_code: number | null
+  // The session ended (an `exit`, or the agent closed it).
+  closed: boolean
+  // Output arrived after the line this call sent (a poll: during its wait). `lines` without it
+  // are a previous command's late output; the answer is still coming.
+  answered?: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Docker fleet management: availability. The subsystem's routes do not exist on a backend that
+// predates it, and that backend answers an EMPTY 404 for them. Two honest outcomes exist for
+// that, and which one applies is a deliberate switch, never a guess:
+//   - demo mode (a dev build, `localStorage['photon-deploy-demo'] = '1'`, or no backend at all):
+//     the mock corpus stands in, and the shell's "demo data" dot says so;
+//   - otherwise: the request throws `DeployUnavailableError`, queries carry it as their error,
+//     and the Deploy screens say the subsystem is not enabled — instead of painting a fake
+//     Critical stack on a real install's landing page.
+// A JSON-bodied 404 (`{ error }`) is always a real answer from a backend that HAS the subsystem.
+// ---------------------------------------------------------------------------
+export { DeployUnavailableError, isDeployUnavailable, setDeployDemo, DEPLOY_DEMO_KEY, DEPLOY_UNAVAILABLE_MESSAGE } from '@/lib/deploy/availability'
+
+/** Demo data is in play when there is no backend at all, or the operator opted in. */
+export function deployDemoEnabled(): boolean {
+  return mockState.value || deployDemoFlag()
+}
+
+function emptyNotFound(e: ApiError): boolean {
+  return e.status === 404 && !e.body?.error
+}
+
+// A deploy READ that failed: 400 is the caller's bug (throw); an empty 404 is the subsystem
+// missing (demo → mock, else unavailable); any other answered status is a real failure (throw);
+// no status at all is no backend (mock).
+async function deployRead<T>(e: ApiError, mock: (m: DeployMocks) => T): Promise<T> {
+  if (e.status === 400) throw e
+  if (emptyNotFound(e)) {
+    if (!deployDemoEnabled()) throw new DeployUnavailableError()
+  } else if (e.status != null && e.status !== 401) throw e
+  mockState.value = true
+  return mock(await deployMocks())
+}
+
+// A deploy MUTATION that failed: refusals surface as `{ ok: false, error }`; an empty 404 is the
+// subsystem missing; any other answered status is a real failure with its message; no status is
+// no backend (mock).
+async function deployMutation<T extends MutationResult>(e: ApiError, mock: (m: DeployMocks) => T): Promise<T> {
+  if (isRefusal(e)) return { ok: false, error: roleError(e) } as T
+  if (emptyNotFound(e)) {
+    if (!deployDemoEnabled()) return { ok: false, error: DEPLOY_UNAVAILABLE_MESSAGE } as T
+  } else if (e.status != null && e.status !== 401) return { ok: false, error: e.body?.error ?? `The server answered ${e.status}` } as T
+  mockState.value = true
+  return mock(await deployMocks())
+}
 
 export const api = {
   // Reactive degraded-mode indicator. Getter/setter over `mockState` so the ~22 `api.mock = true`
@@ -1300,10 +2076,19 @@ export const api = {
     mockState.value = v
   },
 
-  async login(username: string, password: string, opts: RequestOpts = {}): Promise<{ ok: boolean }> {
+  // Returns the signed-in role when the server sends one (a backend with roles answers login with
+  // the session shape); a backend without roles sends none, and `auth.ts` reads that as admin.
+  async login(username: string, password: string, opts: RequestOpts = {}): Promise<{ ok: boolean; role?: Role }> {
     try {
-      await http.post('login', { json: { username, password }, signal: opts.signal })
-      return { ok: true }
+      const text = await http.post('login', { json: { username, password }, signal: opts.signal }).text()
+      let role: Role | undefined
+      try {
+        const body = text ? (JSON.parse(text) as { role?: Role }) : {}
+        role = body.role
+      } catch {
+        /* empty or non-JSON body — no role */
+      }
+      return { ok: true, role }
     } catch (e: any) {
       // In mock mode any credentials sign in — there is no server to check against.
       if (e.status === 401) return { ok: false }
@@ -1328,7 +2113,7 @@ export const api = {
     } catch {
       // No backend (pure-frontend dev): behave as an already-onboarded, authenticated demo.
       api.mock = true
-      return { authenticated: true, username: 'demo', needs_setup: false }
+      return { authenticated: true, username: 'demo', needs_setup: false, role: 'admin' }
     }
   },
 
@@ -1354,14 +2139,46 @@ export const api = {
   },
 
   // Returns { ok, error? } — 400/409 are surfaced (not mocked); a network failure mocks success.
-  async createUser(username: string, password: string, opts: RequestOpts = {}): Promise<MutationResult> {
+  async createUser(username: string, password: string, role: Role = 'viewer', opts: RequestOpts = {}): Promise<MutationResult> {
     try {
-      await http.post('users', { json: { username, password }, signal: opts.signal })
+      await http.post('users', { json: { username, password, role }, signal: opts.signal })
       return { ok: true }
     } catch (e: any) {
       if (e.status === 400 || e.status === 409) return { ok: false, error: e.body?.error }
       api.mock = true
-      mockUsers = [...mockUsers, { username, created_at: Date.now() }]
+      mockUsers = [...mockUsers, { username, created_at: Date.now(), role }]
+      return { ok: true }
+    }
+  },
+
+  // Change a user's role. 403 = the caller is not an admin; surfaced, never mocked over.
+  async updateUserRole(username: string, role: Role, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.patch(`users/${encodeURIComponent(username)}`, { json: { role }, signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      if (e.status === 405) return { ok: false, error: 'This server does not support roles yet' }
+      if (e.status === 400 || e.status === 403 || e.status === 404) return { ok: false, error: e.body?.error ?? (e.status === 403 ? 'Only an admin can change roles' : undefined) }
+      api.mock = true
+      mockUsers = mockUsers.map((u) => (u.username === username ? { ...u, role } : u))
+      return { ok: true }
+    }
+  },
+
+  // Set a password. Your own needs `currentPassword`; someone else's needs the admin role. The
+  // 400 (wrong current password / too short), 403 and 404 are surfaced, never mocked over.
+  async changePassword(username: string, password: string, currentPassword?: string, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.put(`users/${encodeURIComponent(username)}/password`, {
+        json: { password, current_password: currentPassword ?? null },
+        signal: opts.signal,
+      })
+      return { ok: true }
+    } catch (e: any) {
+      if (e.status === 400 || e.status === 403 || e.status === 404) {
+        return { ok: false, error: e.body?.error ?? (e.status === 403 ? "Only an admin can change someone else's password" : undefined) }
+      }
+      api.mock = true
       return { ok: true }
     }
   },
@@ -2454,4 +3271,463 @@ export const api = {
       return mockAlertIncidents(filters) as AlertIncident[]
     }
   },
+
+  // --- Docker fleet management: managed agents, enrollment, audit ---
+  // Reads fall back to the deploy mock corpus on anything but a 400 (the same rule the infra
+  // methods use, so a backend that predates this subsystem — which 404s these routes — still gets
+  // a working UI over demo data). Mutations surface 400/403/404/409 as `{ ok: false, error }`;
+  // a 403 means the caller's ROLE was refused, and the message says so.
+
+  async agents(opts: RequestOpts = {}): Promise<ManagedHostsResult> {
+    try {
+      return await http.get('agents', { signal: opts.signal }).json<ManagedHostsResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockManagedHosts())
+    }
+  },
+
+  // `null` = this host has no managed agent (the /infra/:host Agent tab's enroll prompt).
+  async agent(host: string, opts: RequestOpts = {}): Promise<ManagedHost | null> {
+    try {
+      return await http.get(`agents/${encodeURIComponent(host)}`, { signal: opts.signal }).json<ManagedHost>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      // A backend WITH the subsystem answers an unenrolled host with a JSON 404 (`{ error }`); a
+      // backend WITHOUT it 404s the route with an empty body. Only the first is a real "not
+      // enrolled" — the second falls through to the demo corpus like every other read here.
+      if (e.status === 404 && e.body?.error) return null
+      return deployRead(e, (m) => m.mockManagedHost(host))
+    }
+  },
+
+  async enrollAgent(input: EnrollInput, opts: RequestOpts = {}): Promise<EnrollResult> {
+    try {
+      return await http.post('agents', { json: input, signal: opts.signal }).json<EnrollResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockEnrollHost(input))
+    }
+  },
+
+  async updateAgent(host: string, patch: AgentPatch, opts: RequestOpts = {}): Promise<MutationResult & { host?: ManagedHost }> {
+    try {
+      return await http.patch(`agents/${encodeURIComponent(host)}`, { json: patch, signal: opts.signal }).json<MutationResult & { host?: ManagedHost }>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockUpdateAgent(host, patch))
+    }
+  },
+
+  async rotateAgentToken(host: string, opts: RequestOpts = {}): Promise<MutationResult & TokenIssue> {
+    try {
+      return await http.post(`agents/${encodeURIComponent(host)}/rotate-key`, { signal: opts.signal }).json<MutationResult & TokenIssue>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockRotateAgentToken(host))
+    }
+  },
+
+  async deleteAgent(host: string, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.delete(`agents/${encodeURIComponent(host)}`, { signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockDeleteAgent(host))
+    }
+  },
+
+  // Ask the server to advertise its latest agent version to this host on its next sync (R1.10).
+  async requestAgentUpgrade(host: string, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.post(`agents/${encodeURIComponent(host)}/upgrade`, { signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockRequestAgentUpgrade(host))
+    }
+  },
+
+  async startBootstrap(input: SshBootstrapInput, opts: RequestOpts = {}): Promise<BootstrapStartResult> {
+    try {
+      return await http.post('agents/bootstrap', { json: input, signal: opts.signal }).json<BootstrapStartResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockStartBootstrap(input))
+    }
+  },
+
+  async bootstrapJob(id: string, opts: RequestOpts = {}): Promise<BootstrapJob | null> {
+    try {
+      return await http.get(`agents/bootstrap/${encodeURIComponent(id)}`, { signal: opts.signal }).json<BootstrapJob>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockBootstrapJob(id))
+    }
+  },
+
+  async audit(filter: AuditFilter = {}, opts: RequestOpts = {}): Promise<AuditResult> {
+    const searchParams: Record<string, string | number> = {}
+    if (filter.since_ms != null) searchParams.since = filter.since_ms
+    if (filter.actor) searchParams.actor = filter.actor
+    if (filter.action) searchParams.action = filter.action
+    if (filter.host) searchParams.host = filter.host
+    if (filter.result) searchParams.result = filter.result
+    if (filter.q) searchParams.q = filter.q
+    if (filter.limit) searchParams.limit = filter.limit
+    try {
+      return await http.get('audit', { searchParams, signal: opts.signal }).json<AuditResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockAudit(filter))
+    }
+  },
+
+  // --- Docker fleet management: read-only inventory ---
+
+  async hostInventory(host: string, opts: RequestOpts = {}): Promise<HostInventory | null> {
+    try {
+      return await http.get(`agents/${encodeURIComponent(host)}/inventory`, { signal: opts.signal }).json<HostInventory>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      if (e.status === 404 && e.body?.error) return null
+      return deployRead(e, (m) => m.mockHostInventoryWithActions(host))
+    }
+  },
+
+  async containerLogs(host: string, id: string, q: ContainerLogsQuery = {}, opts: RequestOpts = {}): Promise<ContainerLogsResult> {
+    const searchParams: Record<string, string | number> = {}
+    if (q.tail != null) searchParams.tail = q.tail
+    if (q.since_ms != null) searchParams.since = q.since_ms
+    try {
+      return await http
+        .get(`agents/${encodeURIComponent(host)}/containers/${encodeURIComponent(id)}/logs`, { searchParams, signal: opts.signal })
+        .json<ContainerLogsResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockContainerLogs(host, id, q))
+    }
+  },
+
+  async containerStats(host: string, id: string, startNs: string, endNs: string, opts: RequestOpts = {}): Promise<ContainerStats> {
+    try {
+      return await http
+        .get(`agents/${encodeURIComponent(host)}/containers/${encodeURIComponent(id)}/stats`, { searchParams: { start: startNs, end: endNs }, signal: opts.signal })
+        .json<ContainerStats>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockContainerStats(host, id, startNs, endNs))
+    }
+  },
+
+  async dockerEvents(host: string, limit = 50, opts: RequestOpts = {}): Promise<DockerEventsResult> {
+    try {
+      return await http.get(`agents/${encodeURIComponent(host)}/events`, { searchParams: { limit }, signal: opts.signal }).json<DockerEventsResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockDockerEvents(host, limit))
+    }
+  },
+
+  // --- Docker fleet management: one-shot actions ---
+
+  async createAction(host: string, input: ActionInput, opts: RequestOpts = {}): Promise<ActionResult> {
+    try {
+      return await http.post(`agents/${encodeURIComponent(host)}/actions`, { json: input, signal: opts.signal }).json<ActionResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockCreateAction(host, input))
+    }
+  },
+
+  async hostActions(host: string, limit = 20, opts: RequestOpts = {}): Promise<ActionsResult> {
+    try {
+      return await http.get(`agents/${encodeURIComponent(host)}/actions`, { searchParams: { limit }, signal: opts.signal }).json<ActionsResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockHostActions(host, limit))
+    }
+  },
+
+  async prunePreview(host: string, opts: RequestOpts = {}): Promise<PrunePreview> {
+    try {
+      return await http.get(`agents/${encodeURIComponent(host)}/prune/preview`, { signal: opts.signal }).json<PrunePreview>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockPrunePreview(host))
+    }
+  },
+
+  // --- Docker fleet management: Stacks ---
+
+  async stacks(opts: RequestOpts = {}): Promise<StacksResult> {
+    try {
+      return await http.get('stacks', { signal: opts.signal }).json<StacksResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockStacks())
+    }
+  },
+
+  async stack(id: string, opts: RequestOpts = {}): Promise<Stack | null> {
+    try {
+      return await http.get(`stacks/${encodeURIComponent(id)}`, { signal: opts.signal }).json<Stack>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      if (e.status === 404 && e.body?.error) return null
+      return deployRead(e, (m) => m.mockStack(id))
+    }
+  },
+
+  async createStack(input: StackInput, opts: RequestOpts = {}): Promise<StackResult> {
+    try {
+      return await http.post('stacks', { json: input, signal: opts.signal }).json<StackResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockCreateStack(input))
+    }
+  },
+
+  // Save edited files as a new desired generation (does not apply by itself).
+  async updateStackFiles(id: string, files: StackFile[], acknowledged: string[], deployOptions?: DeployOptions, opts: RequestOpts = {}): Promise<StackResult> {
+    try {
+      return await http.patch(`stacks/${encodeURIComponent(id)}`, { json: { files, acknowledged_warnings: acknowledged, deploy_options: deployOptions }, signal: opts.signal }).json<StackResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockUpdateStackFiles(id, files, acknowledged, deployOptions))
+    }
+  },
+
+  async stackAction(id: string, kind: StackActionKind, args: StackActionArgs = {}, opts: RequestOpts = {}): Promise<StackResult> {
+    try {
+      return await http.post(`stacks/${encodeURIComponent(id)}/${kind}`, { json: args, signal: opts.signal }).json<StackResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockStackAction(id, kind, args))
+    }
+  },
+
+  // Server-side render + validate without applying (R5.6 for a plain compose stack).
+  async validateCompose(files: StackFile[], opts: RequestOpts = {}): Promise<StackValidation> {
+    try {
+      return await http.post('stacks/validate', { json: { files }, signal: opts.signal }).json<StackValidation>()
+    } catch (e: any) {
+      if (e.status === 400 && e.body?.error) return { ok: false, warnings: [], services: [], missing_variables: [], error: e.body.error }
+      return deployRead(e, (m) => m.mockValidateCompose(files))
+    }
+  },
+
+  async discoverProjects(host: string, opts: RequestOpts = {}): Promise<DiscoveredProjectsResult> {
+    try {
+      return await http.get(`agents/${encodeURIComponent(host)}/compose-projects`, { signal: opts.signal }).json<DiscoveredProjectsResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockDiscoverProjects(host))
+    }
+  },
+
+  async adoptProject(host: string, project: string, opts: RequestOpts = {}): Promise<StackResult> {
+    try {
+      return await http.post('stacks/adopt', { json: { host, project }, signal: opts.signal }).json<StackResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockAdoptProject(host, project))
+    }
+  },
+
+  // --- Docker fleet management: Templates & registries ---
+
+  async templates(opts: RequestOpts = {}): Promise<TemplatesResult> {
+    try {
+      return await http.get('templates', { signal: opts.signal }).json<TemplatesResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockTemplates())
+    }
+  },
+
+  async template(id: string, opts: RequestOpts = {}): Promise<Template | null> {
+    try {
+      return await http.get(`templates/${encodeURIComponent(id)}`, { signal: opts.signal }).json<Template>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      if (e.status === 404 && e.body?.error) return null
+      return deployRead(e, (m) => m.mockTemplate(id))
+    }
+  },
+
+  async templateVersion(id: string, opts: RequestOpts = {}): Promise<TemplateVersion | null> {
+    try {
+      return await http.get(`templates/versions/${encodeURIComponent(id)}`, { signal: opts.signal }).json<TemplateVersion>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      if (e.status === 404 && e.body?.error) return null
+      return deployRead(e, (m) => m.mockTemplateVersion(id))
+    }
+  },
+
+  // Publishing is always a NEW immutable version (R5.4); there is no edit-in-place route.
+  async publishTemplateVersion(input: TemplateVersionInput, opts: RequestOpts = {}): Promise<TemplateVersionResult> {
+    try {
+      return await http.post('templates/versions', { json: input, signal: opts.signal }).json<TemplateVersionResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockPublishTemplateVersion(input))
+    }
+  },
+
+  async registries(opts: RequestOpts = {}): Promise<RegistriesResult> {
+    try {
+      return await http.get('registries', { signal: opts.signal }).json<RegistriesResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockRegistries())
+    }
+  },
+
+  async addRegistry(input: RegistryInput, opts: RequestOpts = {}): Promise<RegistryResult> {
+    try {
+      return await http.post('registries', { json: input, signal: opts.signal }).json<RegistryResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockAddRegistry(input))
+    }
+  },
+
+  async syncRegistry(id: string, opts: RequestOpts = {}): Promise<RegistryResult> {
+    try {
+      return await http.post(`registries/${encodeURIComponent(id)}/sync`, { signal: opts.signal }).json<RegistryResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockSyncRegistry(id))
+    }
+  },
+
+  async deleteRegistry(id: string, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.delete(`registries/${encodeURIComponent(id)}`, { signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockDeleteRegistry(id))
+    }
+  },
+
+  // Image registry credentials: what a host pulls private images with.
+  async imageRegistries(opts: RequestOpts = {}): Promise<RegistryCredentialsResult> {
+    try {
+      return await http.get('image-registries', { signal: opts.signal }).json<RegistryCredentialsResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockImageRegistries())
+    }
+  },
+
+  async addImageRegistry(input: RegistryCredentialInput, opts: RequestOpts = {}): Promise<RegistryCredentialResult> {
+    try {
+      return await http.post('image-registries', { json: input, signal: opts.signal }).json<RegistryCredentialResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockAddImageRegistry(input))
+    }
+  },
+
+  async updateImageRegistry(id: string, input: RegistryCredentialInput, opts: RequestOpts = {}): Promise<RegistryCredentialResult> {
+    try {
+      return await http.patch(`image-registries/${encodeURIComponent(id)}`, { json: input, signal: opts.signal }).json<RegistryCredentialResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockUpdateImageRegistry(id, input))
+    }
+  },
+
+  async deleteImageRegistry(id: string, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.delete(`image-registries/${encodeURIComponent(id)}`, { signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockDeleteImageRegistry(id))
+    }
+  },
+
+  // Portainer v2/v3 app-template JSON → local templates (R5.7).
+  async importPortainer(json: string, sourceName: string, opts: RequestOpts = {}): Promise<ImportResult> {
+    try {
+      return await http.post('templates/import', { json: { format: 'portainer', source: sourceName, json }, signal: opts.signal }).json<ImportResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockImportPortainer(json, sourceName))
+    }
+  },
+
+  // Render + validate against the target host's facts, without applying (R5.6).
+  async dryRun(input: TemplateDeployInput, opts: RequestOpts = {}): Promise<DryRunResult> {
+    try {
+      return await http.post('templates/dry-run', { json: input, signal: opts.signal }).json<DryRunResult>()
+    } catch (e: any) {
+      if (e.status === 400 && e.body?.error) return { ok: false, host: input.host, checks: [], compose: '', env: '', previous_compose: null, warnings: [], secrets: [], generated: [], error: e.body.error }
+      return deployRead(e, (m) => m.mockDryRun(input))
+    }
+  },
+
+  async deployTemplate(input: TemplateDeployInput, opts: RequestOpts = {}): Promise<StackResult> {
+    try {
+      return await http.post('templates/deploy', { json: input, signal: opts.signal }).json<StackResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockDeployTemplate(input))
+    }
+  },
+
+  // --- Docker fleet management: Rollouts ---
+
+  async rollouts(opts: RequestOpts = {}): Promise<RolloutsResult> {
+    try {
+      return await http.get('rollouts', { signal: opts.signal }).json<RolloutsResult>()
+    } catch (e: any) {
+      return deployRead(e, (m) => m.mockRollouts())
+    }
+  },
+
+  async rollout(id: string, opts: RequestOpts = {}): Promise<Rollout | null> {
+    try {
+      return await http.get(`rollouts/${encodeURIComponent(id)}`, { signal: opts.signal }).json<Rollout>()
+    } catch (e: any) {
+      if (e.status === 400) throw e
+      if (e.status === 404 && e.body?.error) return null
+      return deployRead(e, (m) => m.mockRollout(id))
+    }
+  },
+
+  async createRollout(input: RolloutInput, opts: RequestOpts = {}): Promise<RolloutResult> {
+    try {
+      return await http.post('rollouts', { json: input, signal: opts.signal }).json<RolloutResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockCreateRollout(input))
+    }
+  },
+
+  async rolloutAction(id: string, kind: RolloutActionKind, opts: RequestOpts = {}): Promise<RolloutResult> {
+    try {
+      return await http.post(`rollouts/${encodeURIComponent(id)}/${kind}`, { signal: opts.signal }).json<RolloutResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockRolloutAction(id, kind))
+    }
+  },
+
+  // --- Docker fleet management: exec sessions ---
+  // The agent opens `POST /api/agent/stream/:session` outbound; the UI only ever talks to the
+  // server. Every session is audited (who, which container, how long, how many commands).
+
+  async openExec(host: string, containerId: string, opts: RequestOpts = {}): Promise<ExecSessionResult> {
+    try {
+      return await http.post(`agents/${encodeURIComponent(host)}/containers/${encodeURIComponent(containerId)}/exec`, { signal: opts.signal }).json<ExecSessionResult>()
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockOpenExec(host, containerId))
+    }
+  },
+
+  async execSend(sessionId: string, line: string, opts: RequestOpts = {}): Promise<ExecOutput> {
+    try {
+      return await http.post(`exec/${encodeURIComponent(sessionId)}/input`, { json: { line }, signal: opts.signal }).json<ExecOutput>()
+    } catch (e: any) {
+      // A JSON-bodied 400/404 is the server closing the session; an empty 404 is a backend without
+      // the route yet (mock).
+      if ((e.status === 400 || e.status === 404) && e.body?.error) return { lines: [e.body.error], exit_code: null, closed: true }
+      return deployRead(e, (m) => m.mockExecSend(sessionId, line))
+    }
+  },
+
+  async closeExec(sessionId: string, opts: RequestOpts = {}): Promise<MutationResult> {
+    try {
+      await http.delete(`exec/${encodeURIComponent(sessionId)}`, { signal: opts.signal })
+      return { ok: true }
+    } catch (e: any) {
+      return deployMutation(e, (m) => m.mockCloseExec(sessionId))
+    }
+  },
+}
+
+// Did the backend REFUSE this mutation (as opposed to not having the route at all)? 400/403/409
+// are always real; a 404 is real only when it carries a JSON `error` body — an axum fallback for a
+// route that does not exist answers with an empty 404, and that is the "no subsystem yet" case
+// the mock corpus stands in for.
+function isRefusal(e: ApiError): boolean {
+  return e.status === 400 || e.status === 403 || e.status === 409 || (e.status === 404 && !!e.body?.error)
+}
+
+// The `{ ok: false, error }` message for a refused mutation. A 403 is the role check saying no,
+// and the UI should say that in those words rather than echo an empty body.
+function roleError(e: ApiError): string | undefined {
+  if (e.status === 403) return e.body?.error ?? 'Your role is not allowed to do this'
+  return e.body?.error
 }

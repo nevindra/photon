@@ -59,8 +59,8 @@ describe('UptimeDashboard', () => {
     expect(w.text()).toContain('Alpha')
     expect(w.text()).toContain('Bravo')
     expect(w.find('table').exists()).toBe(true)
-    // Migrated onto the global ContextBar (Task 9): the Ops crumb renders.
-    expect(w.text()).toContain('Ops')
+    // Migrated onto the global ContextBar (Task 9): the Uptime crumb renders.
+    expect(w.text()).toContain('Uptime')
   })
 
   it('switches to the cards layout via the view toggle', async () => {

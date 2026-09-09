@@ -28,6 +28,9 @@ pub struct Config {
     pub query: QueryConfig,
     #[serde(default)]
     pub federation: Option<FederationConfig>,
+    /// `[deploy]` — Docker fleet management (managed agents, stacks, templates, rollouts).
+    #[serde(default)]
+    pub deploy: DeployConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -276,6 +279,55 @@ impl AlertsConfig {
         16
     }
 }
+/// `[deploy]` — Docker fleet management. Always on; the section tunes where the secret key and
+/// the agent binaries live and which origin agents should dial.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployConfig {
+    /// Set `false` to mount none of the `/api/agents|stacks|templates|rollouts|audit` routes.
+    #[serde(default = "DeployConfig::default_enabled")]
+    pub enabled: bool,
+    /// AES-256 key file for secret variables at rest (R8.5). Generated on first start when
+    /// absent. Default: `deploy.key` beside `[storage].db_path`.
+    #[serde(default)]
+    pub secret_key_file: Option<String>,
+    /// Directory of `photon-agent-<arch>` binaries served by `GET /api/agent/download` and pushed
+    /// by the SSH bootstrap. Default: `agents/` beside `[storage].db_path`. A `photon-agent`
+    /// beside the `photon-server` binary is also found for the server's own architecture.
+    #[serde(default)]
+    pub agent_binaries_dir: Option<String>,
+    /// The URL agents dial (this Photon as the customer LAN sees it), e.g.
+    /// `https://photon.example`. Default: derived from each request's Host header.
+    #[serde(default)]
+    pub server_origin: Option<String>,
+    /// The OTLP/HTTP origin the sync response hands agents for their metrics, e.g.
+    /// `http://photon.example:4318`. Default: `server_origin` with the port of `[ingest].http_addr`.
+    #[serde(default)]
+    pub ingest_origin: Option<String>,
+    /// Enable the SSH bootstrap installer (`POST /api/agents/bootstrap`).
+    #[serde(default = "DeployConfig::default_enabled")]
+    pub ssh_bootstrap: bool,
+}
+
+impl DeployConfig {
+    fn default_enabled() -> bool {
+        true
+    }
+}
+
+impl Default for DeployConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            secret_key_file: None,
+            agent_binaries_dir: None,
+            server_origin: None,
+            ingest_origin: None,
+            ssh_bootstrap: true,
+        }
+    }
+}
+
 impl Default for AlertsConfig {
     fn default() -> Self {
         Self {
@@ -510,6 +562,16 @@ pub enum FederationMode {
     Full,
 }
 
+fn parse_bool_env(name: &str, v: &str) -> Result<bool, PhotonError> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(PhotonError::Config(format!(
+            "{name}: expected true/false, got '{other}'"
+        ))),
+    }
+}
+
 impl Config {
     /// Parse TOML into a `Config` **without** running semantic validation. Used by the
     /// layered `load` path, which parses a base document, overlays env vars, and validates
@@ -566,6 +628,24 @@ impl Config {
         if let Some(v) = get("PHOTON_INGEST_MAX_ATTRIBUTE_VALUE_BYTES") {
             self.ingest.max_attribute_value_bytes =
                 parse_var("PHOTON_INGEST_MAX_ATTRIBUTE_VALUE_BYTES", &v)?;
+        }
+        if let Some(v) = get("PHOTON_DEPLOY_ENABLED") {
+            self.deploy.enabled = parse_bool_env("PHOTON_DEPLOY_ENABLED", &v)?;
+        }
+        if let Some(v) = get("PHOTON_DEPLOY_SERVER_ORIGIN") {
+            self.deploy.server_origin = Some(v).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = get("PHOTON_DEPLOY_INGEST_ORIGIN") {
+            self.deploy.ingest_origin = Some(v).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = get("PHOTON_DEPLOY_SECRET_KEY_FILE") {
+            self.deploy.secret_key_file = Some(v).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = get("PHOTON_DEPLOY_AGENT_BINARIES_DIR") {
+            self.deploy.agent_binaries_dir = Some(v).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = get("PHOTON_DEPLOY_SSH_BOOTSTRAP") {
+            self.deploy.ssh_bootstrap = parse_bool_env("PHOTON_DEPLOY_SSH_BOOTSTRAP", &v)?;
         }
         if let Some(v) = get("PHOTON_SESSION_SECRET") {
             self.auth.session_secret = v;

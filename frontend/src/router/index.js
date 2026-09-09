@@ -111,6 +111,27 @@ const routes = [
   // before the dynamic `/infra/:host` for the same reason as the RUM sub-routes above.
   { path: "/infra", name: "infra", component: InfraHostsView },
   { path: "/infra/:host", name: "infra-host", component: InfraHostDetailView },
+  // Docker is a capability of a Host, not a new noun: the agent (and, later, containers) live as
+  // sub-routes of the host page, each owning its own queries like the /services tabs.
+  {
+    path: "/infra/:host/containers",
+    name: "infra-host-containers",
+    component: () => import("../views/InfraHostContainersView.vue"),
+  },
+  {
+    path: "/infra/:host/agent",
+    name: "infra-host-agent",
+    component: () => import("../views/InfraHostAgentView.vue"),
+  },
+  // Deploy world (Docker fleet management): stacks (compose projects under desired state), then
+  // templates and rollouts as they ship. Lazy — the subtree (editor, dialogs) is sizeable.
+  { path: "/deploy", redirect: "/deploy/templates" },
+  { path: "/deploy/templates", name: "templates", component: () => import("../views/TemplatesView.vue") },
+  { path: "/deploy/templates/:id", name: "template-detail", component: () => import("../views/TemplateDetailView.vue") },
+  { path: "/deploy/stacks", name: "stacks", component: () => import("../views/StacksView.vue") },
+  { path: "/deploy/stacks/:id", name: "stack-detail", component: () => import("../views/StackDetailView.vue") },
+  { path: "/deploy/rollouts", name: "rollouts", component: () => import("../views/RolloutsView.vue") },
+  { path: "/deploy/rollouts/:id", name: "rollout-detail", component: () => import("../views/RolloutDetailView.vue") },
   { path: "/data", name: "data", component: DataView },
   // Tenants (federation tenant registry, Manage group): lazy — only federated installs visit it.
   {
@@ -126,6 +147,20 @@ const routes = [
     path: "/alerts",
     name: "alerts",
     component: () => import("../views/AlertsView.vue"),
+  },
+  // Audit log (Manage group): every mutation Photon made to a host. Lazy like the other Manage pages.
+  {
+    path: "/audit",
+    name: "audit",
+    component: () => import("../views/AuditView.vue"),
+  },
+  // Settings: the people who can sign in. A page, not the modal it replaced — reached from the
+  // rail's gear. `/settings` redirects to its only section today; more sections would join here.
+  { path: "/settings", redirect: "/settings/users" },
+  {
+    path: "/settings/users",
+    name: "settings-users",
+    component: () => import("../views/UsersView.vue"),
   },
   { path: "/:pathMatch(.*)*", redirect: "/home" },
 ];
