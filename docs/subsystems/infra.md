@@ -201,8 +201,9 @@ convention as the RUM sub-routes).
   `ok`, then by name), so the count on the page is the count in the list. Row click navigates to
   `/infra/:host`. Empty state ("No hosts yet") when neither source has anything.
   - **`HostFleetSummary.vue`** — the fleet in one line, and the line is the filter: "3 hosts · 1
-    critical · 1 warning · 1 waiting for first sync" as clickable counts (`?status=`, a level with
-    zero hosts is not offered except OK), then the readings that describe the fleet rather than
+    critical · 1 warning · 1 waiting for first sync" as a `ui/segmented` control (`?status=`, a
+    level with zero hosts is not offered except OK; clicking the active segment clears it), then
+    the readings that describe the fleet rather than
     judge it — avg CPU over the hosts that report one, GPU hosts, containers running / total over
     the managed hosts (`fleetSummary`). It replaced five `StatTile`s that said the same things
     without being clickable and cost a fifth of the screen.
